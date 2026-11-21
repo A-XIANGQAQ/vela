@@ -32,7 +32,7 @@ the QAIRT SDK (section 2) and a checkout of fsr4vk at the commit in section 1.1.
 git clone https://github.com/dvj5411/fsr4vk && git -C fsr4vk checkout 391f62bd198ac9a289aba8ee0d4396db2104f3a2
 # 2. the SDK: download v2.47.0.260601.zip from Qualcomm (link and sha256 in section 2) and unpack it
 unzip v2.47.0.260601.zip -d qairt-sdk        # gives qairt-sdk/qairt/2.47.0.260601
-# 3. the build image (the SDK is mounted, not copied in)
+# 3. the build image (the SDK is mounted, not copied in); a --no-cache build of it gives the files of section 5
 docker build -t vela-qnn npu/graphs
 # 4. build: all 17 graphs, or name some (first column of npu/graphs/graphs.txt)
 QAIRT_DIR=$PWD/qairt-sdk/qairt/2.47.0.260601 FSR4VK_DIR=$PWD/fsr4vk OUT_DIR=$PWD/out npu/graphs/build.sh all
@@ -55,13 +55,45 @@ What is in `npu/graphs/`:
 | `flags/performance.txt`, `flags/ultraperf.txt`, `flags/exact.txt` | the flag strings of section 1.2 step 3 |
 | `gen/` | the graph generators (section 1.2 step 2); `gen/performance/gen_nf.py` and `gen/ultraperf/gen_nf.py` differ in the Ultra Performance pass-07 and pass-23 constants |
 | `params/performance/`, `params/ultraperf/` | layer parameters read from the shaders: `params_n1.pkl` (passes 03-25), `p13_w.npz` (pass 13), `k1_w.npz` (pass 27), `p07_sh.npy` (Ultra Performance pass-07 store shift); sha256 in `params/SHA256SUMS` |
-| `regen/parse_p13.py` | the pass-13 parser that wrote `p13_w.npz` |
+| `regen/` | rebuilds `params/` from the fsr4vk shaders (section "Regenerating the parameter files"): `Dockerfile` (SPIR-V tools image), `regen.sh` (host side), `decompile.sh` (spirv-cross and the SPIR-V transform), `shader_params.py` (`params_n1.pkl`, `p07_sh.npy`), `parse_p13.py` (`p13_w.npz`), `parse_k1.py` (`k1_w.npz`), `check.py` (compares with `params/`) |
 | `Dockerfile` | the build image |
 | `compare.py`, `expected.sha256` | the check against section 5 |
 
 The generators read their inputs from fixed absolute paths inside the container (`/vt`, `/ht`, `/ht3`, `/n`, `/gn`, `/nf`,
 `/k1h`, `/nsz`, `/b`); `build_graph.sh` copies the files there. The work folder of a graph must be `/v/<file>`, as
 `build.sh` mounts it.
+
+### Regenerating the parameter files
+
+`npu/graphs/params/` is made from the fsr4vk shaders. To rebuild it and compare with the committed files:
+
+```sh
+docker build -t vela-spv npu/graphs/regen
+FSR4VK_DIR=$PWD/fsr4vk OUT_DIR=$PWD/params-new npu/graphs/regen/regen.sh      # both presets, about 2 minutes each
+python3 npu/graphs/regen/check.py params-new                                  # exit 1 if a file differs
+```
+
+Per preset, `regen.sh` runs one container (`--cpus 4 -m 8g`) that:
+
+1. decompiles `pass-03` … `pass-27` of `general/1080/<preset>/` with `spirv-cross --vulkan-semantics` into
+   `<preset>/dec/o/pNN.comp`. Passes 15, 17, 19 and 27 are also transformed and decompiled again into
+   `<preset>/dec/t/qNN.comp`: `spirv-dis` → `provider/spirv-sources/tools/sudot.py` (each OpSDot becomes OpSUDot plus a
+   correction term, exact modulo 2^32) → `provider/spirv-sources/tools/zconst.py` (reads of the z invocation id become 0;
+   fsr4vk dispatches one workgroup in z) → `Unroll` on every loop → `spirv-as` → `spirv-val` → `spirv-cross`. The
+   transform keeps the math and gives straight-line code the parsers can read (`regen/decompile.sh`).
+2. `shader_params.py` writes `params_n1.pkl` (passes 03-25 except 13) and, for Ultra Performance, `p07_sh.npy`. It
+   evaluates the address expressions of the GLSL at invocation 0 and reads the weight words from `initializers.bin`.
+3. `parse_p13.py` writes `p13_w.npz`.
+4. `parse_k1.py` writes `k1_w.npz`. It runs the K1 part of the q27 GLSL in numpy, finds the weights with impulse inputs,
+   and checks on random inputs that a plain conv with those weights gives the same bytes as the GLSL code (0 differ).
+
+The parsers match the exact text this SPIRV-Cross commit writes (variable names, expression form), so the image pins it:
+Ubuntu 24.04.5 by digest, SPIRV-Cross `57e4efcc84112abcd426dc5ec248b5339bee04f2`, SPIRV-Tools
+`2025.1~rc1-1~ubuntu0.24.04.2`, Python 3.12.3, numpy 2.5.3. Another SPIRV-Cross version can rename variables; the
+parsers then stop at an assert instead of writing other numbers.
+
+Result on 2026-11-22 (image built with `--no-cache`): `params_n1.pkl` byte for byte for both presets; `p13_w.npz`,
+`k1_w.npz` and `p07_sh.npy` array for array (an `.npz` holds file times, so its bytes always differ).
 
 ## 1. Inputs
 
@@ -86,8 +118,8 @@ There is no ONNX export from AMD. Our chain builds the graph from scratch:
 1. **Read the layer parameters from the shaders.** For each pass, a parser reads the decompiled shader and pulls out the
    packed int8 weights, the shift `sh` of each layer and the residual factors. It writes one parameter file per weight
    set. Biases are read from `initializers.bin`. Pass 13 (2x2 stride-2 conv, 32→64, `sh 8`) has its own parser, and so
-   does the K1 block (pass 27). The outputs are in `npu/graphs/params/`; the pass-13 parser is
-   `npu/graphs/regen/parse_p13.py`. The other parsers are not published (section 9).
+   does the K1 block (pass 27). The outputs are in `npu/graphs/params/`; the parsers are in `npu/graphs/regen/`, and
+   `regen/regen.sh` rebuilds every file from fsr4vk (section "Regenerating the parameter files").
 2. **Write the int8 graph** (`gen_n1.py` → `gen_nf.py` → `gen_nf2.py` → `gen_ht.py` → `gen_k1h.py`, then the shipped
    builder `gen_bp.py`, which applies the patches in `gen_ht3.py`; `gen_n7.py` for 720p; `gen_nsz.py` + `gen_n9.py` for
    the other sizes). All are in `npu/graphs/gen/`. Rules the graph follows:
@@ -166,7 +198,7 @@ Notes:
 |---|---|---|
 | Qualcomm AI Engine Direct SDK (QAIRT) | **2.47.0.260601**. Download from Qualcomm: `https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.47.0.260601/v2.47.0.260601.zip`. The file we used has sha256 `d3497e110eae82c35a9152a93c0a18bbede402aaf9faa7a97c8079eb0f522b01`. | mounted read-only into the container at `/qairt`; `QNN_SDK_ROOT=/qairt` |
 | host | Windows 11 PC with Docker Desktop. All build steps run inside an x86_64 Linux container. | |
-| container | `FROM ubuntu:22.04`; apt: `python3 python3-pip python3-venv python3-yaml unzip make clang-14 libc++-14-dev libc++abi-14-dev g++ file`; pip: `numpy==1.26.4 onnx==1.16.2 onnxruntime==1.18.1 protobuf==7.36.2 pandas==2.3.3 packaging==26.3 typing-extensions==4.16.0` (`npu/graphs/Dockerfile`, below) | |
+| container | `FROM ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956`; apt: `python3 python3-pip python3-venv python3-yaml unzip make clang-14 libc++-14-dev libc++abi-14-dev g++ file`; pip: `numpy==1.26.4 onnx==1.16.2 onnxruntime==1.18.1 protobuf==7.36.2 pandas==2.3.3 packaging==26.3 typing-extensions==4.16.0` (`npu/graphs/Dockerfile`, below) | |
 | Python | 3.10.12 (Ubuntu 22.04.5) | |
 | C++ compiler for the model library | `clang++-14`, linked as `clang++` on `PATH` (the SDK Makefile calls `clang++`) | |
 | `onnxsim` | **not installed.** The converter logs "Onnx model simplification failed due to: No module named 'onnxsim'" and goes on. We have not tested whether a build with `onnxsim` installed gives the same files, so leave it out. | |
@@ -175,9 +207,11 @@ Notes:
 # QAIRT host tools (x86_64 Linux): ONNX converter, model-library generator, context-binary generator.
 # The SDK is not in the image: download QAIRT 2.47.0.260601 from Qualcomm; build.sh mounts it at /qairt.
 #   docker build -t vela-qnn .
-# Pinned versions are those of the image the package-14 graphs were built with
-# (Ubuntu 22.04.5, Python 3.10.12, clang 14.0.0, PyYAML 5.4.1 from Ubuntu).
-FROM ubuntu:22.04
+# Pinned: the Ubuntu 22.04.5 base image by digest and the pip packages; the Ubuntu packages (Python 3.10.12, clang 14.0.0,
+# PyYAML 5.4.1) come from the 22.04 archive. Built with --no-cache on 2026-11-22, this image rebuilt nf4_exact and
+# nf4up_k1h_452 for v73 and v79 with the sha256 of expected.sha256. Against the package-14 image only patch releases
+# differ (glibc 2.35-0ubuntu3.18 vs 3.15, perl, ca-certificates, linux-libc-dev); the pip packages are the same.
+FROM ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq >/dev/null && apt-get install -y -qq python3 python3-pip python3-venv python3-yaml unzip make clang-14 libc++-14-dev libc++abi-14-dev g++ file >/dev/null \
  && pip3 install -q "numpy==1.26.4" "onnx==1.16.2" "onnxruntime==1.18.1" "protobuf==7.36.2" "pandas==2.3.3" "packaging==26.3" "typing-extensions==4.16.0"
@@ -443,15 +477,13 @@ Another hash only prints a warning: an SM8750 device has its own copies, and tho
 
 ## 9. What is not published
 
-- **The shader parsers for `params_n1.pkl` and `k1_w.npz`.** The parameter files are published (`npu/graphs/params/`),
-  and the graphs build from them. The parsers that wrote them read decompiled shader text: plain `spirv-cross
-  --vulkan-semantics` output of the fsr4vk passes, and for passes 15, 17, 19 and 27 the decompile of a mechanically
-  transformed SPIR-V. That transform chain is not published, so these two files cannot be regenerated from this
-  repository. `p13_w.npz` (Performance) can: `regen/parse_p13.py <spirv-cross text of pass-13.spv> <initializers.bin>
-  p13_w.npz` gives the published file array for array. The Ultra Performance files were made the same way from the
-  `ultraperf` passes; `p07_sh.npy` is the per-channel store shift of the Ultra Performance pass 07.
 - **The simulator input frames and the numpy reference** of section 4.1 are lost; the fidelity check needs new GPU dumps.
   The byte-for-byte check (section 5) and the fixed-input check (section 6) do not need them.
 - **The ONNX files and model libraries** are not published; `build.sh` writes them into `out/work/<file>/`.
-- `npu/graphs/Dockerfile` pins the versions of the image we built with, but an image built from it today was not
-  compared with ours. **[unknown: whether a fresh image gives the same files]**
+- **The Ubuntu packages of the build images are not pinned** (only the base images by digest and the pip packages):
+  the Ubuntu archive drops old patch releases. An image built from `npu/graphs/Dockerfile` with `--no-cache` on
+  2026-11-22 had newer glibc, perl, ca-certificates and linux-libc-dev patch releases than ours and rebuilt
+  `nf4_exact` and `nf4up_k1h_452` for v73 and v79 with the sha256 of section 5. The other 15 graphs were not rebuilt
+  with that image. **[unknown: whether a later Ubuntu update changes a file]**
+- Everything else is reproducible from public inputs: the parameter files from fsr4vk (section "Regenerating the
+  parameter files"), the graphs from those files and the QAIRT SDK (section "Rebuild").
