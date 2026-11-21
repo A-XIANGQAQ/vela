@@ -1,0 +1,11 @@
+*.py text eol=lf
+*.sh text eol=lf
+*.txt text eol=lf
+*.tsv text eol=lf
+*.md text eol=lf
+*.sha256 text eol=lf
+SHA256SUMS text eol=lf
+Dockerfile text eol=lf
+*.pkl binary
+*.npz binary
+*.npy binary

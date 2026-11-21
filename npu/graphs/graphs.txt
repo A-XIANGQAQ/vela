@@ -1,0 +1,20 @@
+# The 17 graphs of package 14. Columns: file  kind  preset  graph-name  [NSZ_W NSZ_HN NSZ_HR NSZ_WR]
+# kind: ht = no K1 block (gen_bp.py), k1h = 1080p (gen_bp.py), n7 = 720p (gen_bp.py + gen_n7.py), n9 = sized (gen_nsz.py + gen_n9.py)
+# NSZ_W = grid width (px/2), NSZ_HN = grid rows, NSZ_HR = real rows, NSZ_WR = real width
+nf4_exact      ht   performance ht_t2s7p13
+nf4_k1h        k1h  performance k1h_a
+nf4up_k1h      k1h  ultraperf   k1h_a
+nf4_k1h_360    n7   performance k1h_a
+nf4up_k1h_360  n7   ultraperf   k1h_a
+nf4_k1h_452    n9   performance k1h_a 800 452 452 800
+nf4up_k1h_452  n9   ultraperf   k1h_a 800 452 452 800
+nf4_k1h_450    n9   performance k1h_a 800 452 450 800
+nf4up_k1h_450  n9   ultraperf   k1h_a 800 452 450 800
+nf4_k1h_405    n9   performance k1h_a 720 408 405 720
+nf4up_k1h_405  n9   ultraperf   k1h_a 720 408 405 720
+nf4_k1h_400    n9   performance k1h_a 640 400 400 640
+nf4up_k1h_400  n9   ultraperf   k1h_a 640 400 400 640
+nf4_k1h_324    n9   performance k1h_a 576 324 324 576
+nf4up_k1h_324  n9   ultraperf   k1h_a 576 324 324 576
+nf4_k1h_270    n9   performance k1h_a 480 272 270 480
+nf4up_k1h_270  n9   ultraperf   k1h_a 480 272 270 480

@@ -43,6 +43,8 @@ Package 14 has FSR 4 networks for these output sizes: 1920x1080, 1600x900 and 12
 | `/var/lib/extensions/armada-vela-npu-qnn/` (root:root) | directory extension (name kept from the first installer): DSP shell `fastrpc_shell_unsigned_3`, `libc++.so.1`, `libc++abi.so.1` read from the device's own `dsp` partition | the device |
 | `/etc/systemd/system/vela-npu-boot.service` | starts the NPU service `vela-npu.service` after the extension merge at every boot | written by the installer |
 
+How the 34 graph files are built and how to rebuild them byte for byte: [docs/npu-graphs.md](../docs/npu-graphs.md) (scripts in [`graphs/`](graphs/)).
+
 The numbers in the main README were measured with an earlier NPU package. Package 14 measured the same on the Retroid Pocket 6
 in the games checked (Control 8.32 ms on the NPU). The extension says `ID=armada VERSION_ID=44`; after an armadaOS update with another VERSION_ID,
 systemd-sysext stops loading it and the installer must be run again (it refuses other versions unless `--force`).
