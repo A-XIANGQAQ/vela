@@ -50,8 +50,12 @@ b5084469a693b05e372eedf8861e29e92c6e012c1cf543144c894f6141a5348f usr/lib/rfsa/ad
 e8b7712f1df3e05e08b61f1d9ebde5b966cca0f598c55fd96c85d6bf37c41dcc usr/lib64/vela-npu/libQnnHtpV79Stub.so lib/aarch64-oe-linux-gcc11.2/libQnnHtpV79Stub.so
 dd8987c17928e53877e51ce5739c550d3e74393bd5b1b5ccf311326eddb08612 usr/lib/rfsa/adsp/libQnnHtpV79Skel.so lib/hexagon-v79/unsigned/libQnnHtpV79Skel.so
 bea936b4ab0d5d8a3d172a634cbeaba38ab6b59c103c23b4580191f95717707c usr/lib/rfsa/adsp/libQairtHtpV79Skel.so lib/hexagon-v79/unsigned/libQairtHtpV79Skel.so
-998a3f868c906db88969b11a328ef9adefa4269017f5216b33780574f06d2e0c usr/lib/rfsa/adsp/libQnnHtpV79.so lib/hexagon-v79/unsigned/libQnnHtpV79.so"
-QNN_NAMES="libQnnHtp.so libQnnHtpV73Stub.so libQnnSystem.so libQnnHtpV73Skel.so libQairtHtpV73Skel.so libQnnHtpV73.so libQnnHtpV79Stub.so libQnnHtpV79Skel.so libQairtHtpV79Skel.so libQnnHtpV79.so"
+998a3f868c906db88969b11a328ef9adefa4269017f5216b33780574f06d2e0c usr/lib/rfsa/adsp/libQnnHtpV79.so lib/hexagon-v79/unsigned/libQnnHtpV79.so
+6b83dc2f78f809f469aee92d4d12473dd69db6095602f37061906e9081cc915f usr/lib64/vela-npu/libQnnHtpV75Stub.so lib/aarch64-oe-linux-gcc11.2/libQnnHtpV75Stub.so
+607be3d7ec64df053f019438ad6eea59dd3eea5d5f985001709d52d5663479ba usr/lib/rfsa/adsp/libQnnHtpV75Skel.so lib/hexagon-v75/unsigned/libQnnHtpV75Skel.so
+1229177eb5bc53220ddb5c77bb25e4025209e4c8ea0a46712aedd92e4f4e705e usr/lib/rfsa/adsp/libQairtHtpV75Skel.so lib/hexagon-v75/unsigned/libQairtHtpV75Skel.so
+14efadf5fdbac6116767d797394cb60454d252748895b284e24d2540b0560449 usr/lib/rfsa/adsp/libQnnHtpV75.so lib/hexagon-v75/unsigned/libQnnHtpV75.so"
+QNN_NAMES="libQnnHtp.so libQnnHtpV73Stub.so libQnnSystem.so libQnnHtpV73Skel.so libQairtHtpV73Skel.so libQnnHtpV73.so libQnnHtpV79Stub.so libQnnHtpV79Skel.so libQairtHtpV79Skel.so libQnnHtpV79.so libQnnHtpV75Stub.so libQnnHtpV75Skel.so libQairtHtpV75Skel.so libQnnHtpV75.so"
 G79=${GRAPHS_V79:?}; DROPIN=$P
 T=$(mktemp -d /tmp/velapub.XXXXXX); chmod 0755 $T
 L=$T$SYSLIB; D=$T/usr/share/licenses/armada-vela-npu
