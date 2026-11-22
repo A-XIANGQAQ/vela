@@ -1,0 +1,35 @@
+vela-launch: kit on: /var/home/armada/.local/share/Steam/steamapps/common/Game/Binaries/Win64 (5 entries), env [...]
+pressure-vessel-wrap[2211]: W: Unable to set up VKD3D_SHADER_CACHE_PATH
+0124:fixme:ntdll:NtQuerySystemInformation info_class SYSTEM_PERFORMANCE_INFORMATION
+0124:err:dxgi:dxgi_adapter_QueryVideoMemoryInfo Unhandled segment group 0x1.
+wine: Unhandled page fault on read access to 0000000000000010 at address 00006FFFFF4123AB (thread 0130), starting debugger...
+Unhandled exception: page fault on read access to 0x0000000000000010 in 64-bit code (0x00006fffff4123ab).
+Register dump:
+ rip:00006fffff4123ab rsp:000000000011f6c0 rbp:000000000011f7a0 eflags:00010246 (  R- --  I  Z- -P- )
+ rax:0000000000000000 rbx:0000000000000001 rcx:000000000011f720 rdx:0000000000000000
+Stack dump:
+0x000000000011f6c0:  0000000000000000 00006fffff40d2c1
+0x000000000011f6d0:  000000000011f7a0 00000001400a1b2c
+Backtrace:
+=>0 0x00006fffff4123ab in dxgi (+0x123ab) (0x000000000011f7a0)
+  1 0x00000001400a1b2c in game-win64-shipping (+0xa1b2c) (0x000000000011f800)
+  2 0x00006fffffc6a1e4 in kernel32 (+0x1a1e4) (0x000000000011f830)
+  3 0x00006fffffdc4c2b in ntdll (+0x24c2b) (0x000000000011f880)
+0x00006fffff4123ab dxgi+0x123ab: movq 0x10(%rax),%rcx
+Modules:
+Module	Address					Debug info	Name (6 modules)
+PE	       140000000-       14a52f000	Deferred        game-win64-shipping
+PE	    6fffff400000-    6fffff4b2000	Deferred        dxgi
+PE	    6fffffc50000-    6fffffc8e000	Deferred        kernel32
+PE	    6fffffda0000-    6fffffe2c000	Deferred        ntdll
+ELF	    7f1234000000-    7f1234100000	Deferred        libvklayer_vela_npu.so
+Threads:
+process  tid      prio    name (all IDs are in hex)
+00000120 game-win64-shipping.exe
+	00000130    0 *
+System information:
+    Wine build: wine-10.0 (Proton-11.0-100)
+    Platform: arm64 (guest: x86_64)
+    Version: Windows 10
+    Host system: Linux
+    Host version: 6.11.0

@@ -20,11 +20,11 @@ import presets  # noqa: E402
 import upscale  # noqa: E402
 
 # ---- presets
-assert presets.MODELS == ("fsr4", "fsr4fast", "fsr3", "sgsr2")  # 0.8.16: + FSR 4 Fast
+assert presets.MODELS == ("fsr4", "fsr4fast", "fsr3", "dittosr", "sgsr2")  # 0.8.16: + FSR 4 Fast; DITTO: + DittoSR
 assert presets.legacy_model(True) == "fsr4" and presets.legacy_model(False) == "sgsr2"
-assert presets.models_for("fsr4") == [("fsr4", True), ("fsr4fast", True), ("fsr3", True), ("sgsr2", True)]
+assert presets.models_for("fsr4") == [("fsr4", True), ("fsr4fast", True), ("fsr3", True), ("dittosr", True), ("sgsr2", True)]
 assert presets.models_for("static", fsr4=True, fsr3=False)[2] == ("fsr3", False)
-assert presets.models_for("sgsr2") == [("sgsr2", True)]  # DX11: OptiScaler's Dx11Upscaler is SGSR 2
+assert presets.models_for("sgsr2") == []  # DX11FSR: no kind sgsr2; a DX11 game is kind fsr4 (tests/test_dx11fsr.py)
 assert presets.models_for("none") == [] and presets.models_for("any") == []
 NPU_ON = {"layer_found": True, "service": {"installed": True, "k1h_running": True, "k1h360_running": True}}
 NPU_NONE = {"layer_found": True, "service": {"installed": False}}
@@ -35,7 +35,7 @@ assert presets.live_wanted("sgsr2", NPU_ON) == {"model": "sgsr2", "npu": None, "
 assert presets.plan("fsr4", {"model": "fsr4", "npu": 2}) == {"kind": "fsr4", "model": "fsr4", "npu": True}
 assert presets.plan("static", {"model": "fsr4lite"})["model"] == "fsr4"
 assert presets.plan("static", {"model": "ai"})["model"] == "fsr4" and presets.plan("fsr4", {"model": "sr"})["model"] == "sgsr2"
-assert presets.plan("sgsr2", {"model": "fsr4"})["model"] == "sgsr2"
+assert presets.plan("fsr4", {"model": "fsr4"})["model"] == "fsr4"
 assert presets.is_ultra("640x360", "1920x1080") and not presets.is_ultra("1280x720", "1920x1080") and not presets.is_ultra(None, "x")
 f = presets.plan("fsr4", {"model": "fsr4", "npu": 2})
 assert presets.hint(f, {"npu": NPU_NONE}) == {"id": "npu_install"}
@@ -94,7 +94,7 @@ gamecheck.CHUNK = old_chunk
 base = {"install_dir": "/g", "exe_dir": "/g/bin", "exe": "g.exe", "inputs": ["DLSS"], "anticheat": []}
 V = gamecheck.verdict
 assert V(base, {"dx12", "dx11"})["kind"] == "fsr4"
-assert V(base, {"dx11"})["kind"] == "sgsr2"
+assert V(base, {"dx11"})["kind"] == "fsr4" and V(base, {"dx11"})["dx11_only"] and not V(base, {"dx12", "dx11"})["dx11_only"]
 assert V(base, set())["kind"] == "fsr4"  # nothing read: DX12 assumed, the first run tells
 assert V(base, {"opengl"}) == {**V(base, {"opengl"}), "kind": "none", "reason": "opengl"}
 assert V({**base, "anticheat": ["EasyAntiCheat"]}, {"dx12"})["reason"] == "anticheat"
@@ -184,7 +184,9 @@ exe_dir = os.path.join(groot, "ITD/Binaries/Win64")
 write(os.path.join(exe_dir, "OptiScaler.log"), "a log of the game's own OptiScaler from before Vela\n")
 gs = P._game_state(A)
 assert gs["check"]["kind"] == "fsr4" and gs["model"] == "off" and gs["hint"] is None and not gs["window_fix"], gs
-assert [m["id"] for m in gs["models"]] == ["fsr4", "fsr4fast", "fsr3", "sgsr2"] and all(m["ok"] for m in gs["models"])
+# DITTO: + DittoSR (offered as the plugin's assets allow: tests/test_dittosr.py checks that part)
+assert [m["id"] for m in gs["models"]] == ["fsr4", "fsr4fast", "fsr3", "dittosr", "sgsr2"] and \
+    all(m["ok"] for m in gs["models"] if m["id"] != "dittosr")
 for gone in ("steps", "post", "modes", "mode", "captures"):
     assert gone not in gs, gone
 

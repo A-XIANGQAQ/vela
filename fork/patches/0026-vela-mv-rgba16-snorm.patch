@@ -1,0 +1,27 @@
+From 02ee924c505b901fb61e5b9b51a6e39404d691be Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 18:08:04 +0100
+Subject: [PATCH] 0026-vela-mv-rgba16-snorm: the MV pass takes
+ R16G16B16A16_SNORM motion vectors (REFramework TemporalUpscaler on RE Engine
+ games; github zrprod9-cmyk/vela#1 by LanMath1: VkFormat 92 refused -> SGSR 2)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h b/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h
+index 9e62e61..df54a39 100644
+--- a/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h
++++ b/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h
+@@ -929,6 +929,7 @@ class Fsr4VkBridge
+         case VK_FORMAT_R16G16B16A16_SFLOAT:
+         case VK_FORMAT_R32G32B32A32_SFLOAT:
+         case VK_FORMAT_R16G16_SNORM:
++        case VK_FORMAT_R16G16B16A16_SNORM:  // 0026: REFramework TemporalUpscaler (vela#1, LanMath1): SNORM reads as float like the 2-channel case
+         case VK_FORMAT_R8G8_SNORM:
+             break;
+         default:
+-- 
+2.54.0.windows.1
+

@@ -22,6 +22,8 @@ import os
 import stat
 import re
 
+import launchers
+
 
 def key_rx(key):
     return re.compile(r'("%s"\s*:\s*)(-?[0-9.]+|true|false)' % re.escape(key))
@@ -143,7 +145,11 @@ class GameCfg:
             pass
 
     def _resolve(self, appid, install_dir, e):
-        root = prefix_user(install_dir, appid, getattr(self, "home", None)) if e.get("root") == "prefix" else install_dir
+        if e.get("root") != "prefix":
+            return os.path.join(install_dir, e["file"])
+        # NONSTEAM: a launcher's game (Heroic, Lutris) keeps its prefix where the launcher made it (sgsr3.scan "prefix")
+        pfx = self.prefix_of(appid) if getattr(self, "prefix_of", None) else None
+        root = launchers.prefix_user(pfx) if pfx else prefix_user(install_dir, appid, getattr(self, "home", None))
         return os.path.join(root, e["file"])
 
     @staticmethod

@@ -1,0 +1,17 @@
+[03:38:15.002122] [I] InitInternal Initializing SGSR3 960x540 -> 1920x1080
+[03:38:15.135436] [I] Poll Vela live (Z:\tmp\vela-live\1771300.ini): model fsr4 ratio -1 amax -1 alphak -1 mk -1 fresh -1 sq -1 ncap -1 disocc -1 lossy 1 npu 2
+[03:38:15.135472] [I] CreatePipelines SGSR3: Vela live model fsr4
+[03:38:15.135499] [I] Init Vela FSR 4 VK: vkd3d device extensions: descriptor_buffer true, synchronization2 false
+[03:38:15.158747] [I] Init Vela FSR 4 VK: FSR 4.1.1 VK INT8 context 960x540 -> 1920x1080 (hdr true, network every 1 frames)
+[03:38:15.158801] [I] CreatePipelines SGSR3: kernels v0 / v1b (bits 0x3dc0, scale 2.000), upscale DXIL SM 6.2, min16float, pixel-shader pipelines true/true, mode student, history RGBA16F; device: MinPrecisionSupport 2 Native16BitShaderOps 1 shader model 0x66
+[03:38:15.167696] [I] Init SGSR3 student: device Adreno (TM) 830, vkd3d device features: shaderFloat16 on, dynamicRendering on, shaderIntegerDotProduct on, shaderStorageImageExtendedFormats on
+[03:38:15.445638] [I] BuildRecipe SGSR3 student: 9 passes + resolve (image by imageStore), 26 tensors in 24 images, levels 480x272 / 240x136 / 120x68, history layout 1
+[03:38:15.445694] [I] Init SGSR3 student: model S4s4P2b, device Adreno (TM) 830, vkd3d device features: shaderFloat16 on, dynamicRendering on, shaderIntegerDotProduct on, shaderStorageImageExtendedFormats on
+[03:38:15.739482] [I] UpdateSharedConstants SGSR3 constants: MV_Scale=(960, 540) lowResMV=true -> mvToUv=(1, 1); depthInverted=true preExposure=1 fovHor=1.0264004
+[03:38:15.739547] [I] EvaluateInternal SGSR3 inputs: color 960x540 fmt 10, mv 960x540 fmt 34 (sampled as 960x540), depth 44, reactive false, T&C false, output fmt 10 UAV true RT true, flags 0x33
+[03:38:15.739595] [E] Unsupported Vela FSR 4 VK: depth format VkFormat 129 is not one the provider takes
+[03:38:15.739607] [E] EvaluateFsr4 SGSR3: FSR 4 VK frame failed; SGSR 2 from the next frame
+[03:38:15.758978] [E] EvaluateInternal SGSR3: the student failed; v1f from the next frame
+[03:38:15.833723] [W] TryEvaluateOptiFeature Vela live: fsr4 cannot run in this game; SGSR 2 instead
+[03:38:15.833804] [I] TryEvaluateOptiFeature Vela live: handle 1000000 model fsr4 -> SGSR 2 (the game draws 960x540)
+[03:38:15.908190] [I] InitInternal Initializing SGSR2 960x540 -> 1920x1080

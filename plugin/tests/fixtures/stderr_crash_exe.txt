@@ -1,0 +1,21 @@
+0128:err:module:import_dll Library steam_api64.dll not loaded yet
+wine: Unhandled page fault on write access to 0000000000000000 at address 0000000141F3E07C (thread 0128), starting debugger...
+Unhandled exception: page fault on write access to 0x0000000000000000 in 64-bit code (0x0000000141f3e07c).
+Register dump:
+ rip:0000000141f3e07c rsp:000000000021f9d0 rbp:000000000021fa50 eflags:00010202 (  R- --  I   - - - )
+Stack dump:
+0x000000000021f9d0:  0000000000000001 0000000000000000
+Backtrace:
+=>0 0x0000000141f3e07c in game (+0x1f3e07c) (0x000000000021fa50)
+  1 0x0000000141f3a112 in game (+0x1f3a112) (0x000000000021faf0)
+  2 0x00006fffff4211c0 in dxgi (+0x211c0) (0x000000000021fb40)
+  3 0x00006fffffc6a1e4 in kernel32 (+0x1a1e4) (0x000000000021fb90)
+0x0000000141f3e07c game+0x1f3e07c: movl %eax,(%rcx)
+Modules:
+Module	Address					Debug info	Name (4 modules)
+PE	       140000000-       14a52f000	Export          game
+PE	    6fffff400000-    6fffff4b2000	Deferred        dxgi
+PE	    6fffffc50000-    6fffffc8e000	Deferred        kernel32
+PE	    6fffffda0000-    6fffffe2c000	Deferred        ntdll
+Threads:
+process  tid      prio    name (all IDs are in hex)

@@ -1,6 +1,6 @@
 """Vela 0.8.13: the panel's model choice -- the player picks the upscaler by hand (no modes), and the ONE thing the player still has to do, if any.
 
-The model is the live key model= the DLLs read (/tmp/vela-live/<appid>.ini, live.py): fsr4, fsr3, sgsr2. 0.8.15: FSR 4 Lite
+The model is the live key model= the DLLs read (/tmp/vela-live/<appid>.ini, live.py): fsr4, fsr3, dittosr (0.8.23), sgsr2. 0.8.15: FSR 4 Lite
 is out (a saved fsr4lite becomes fsr4, RETIRED_MODELS). 0.8.15: the NPU switch is gone (on by default), there is no second upscale, and the performance level is
 chosen through the game; the plugin only lets the model change in game, in real time:
   window  always the full screen, 1920x1080 (Steam's per-app resolution override "Default"); no window pick, no Gamescope stretch
@@ -13,7 +13,9 @@ Pure functions; main.py applies them.
 # 0.8.16: fsr4fast = "FSR 4 Fast" -- the same FSR 4 provider in its fast mode (q3kb prepass + rha K2, slim NPU frames;
 # measured: RE4 720p P 1.74 -> 0.92 ms, 1080p UP 3.67 -> 1.90); the provider reads model=fsr4fast at FSR 4 context create,
 # the fork / the RE4 interceptor run it like fsr4 and re-create the context on fsr4 <-> fsr4fast. Same NPU graphs as fsr4.
-MODELS = ("fsr4", "fsr4fast", "fsr3", "sgsr2")
+# DITTO (0.8.23, owner 2026-11-22): dittosr = DittoSR 0.5.4 (MIT), a FidelityFX-API upscaler without a neural network, loaded
+# by the fork's FFX backend like FSR 3 (FSR 3 is its fallback); OptiScaler games only (the RE4 interceptor has no DittoSR)
+MODELS = ("fsr4", "fsr4fast", "fsr3", "dittosr", "sgsr2")
 FSR4_MODELS = ("fsr4", "fsr4fast")  # the NPU, exact mode
 # 0.8.15: a model the panel no longer has -> the one that replaces it (stored settings, a stale panel's pick); never written again
 RETIRED_MODELS = {"fsr4lite": "fsr4"}
@@ -26,7 +28,8 @@ OUT_900 = "1600x900"
 # 0.8.21: outputs with graphs from NPU package 14 on (npu.SIZE_SOCKETS, npu.UP_SOCKETS)
 SIZE_OUTPUTS = ("1600x904", "1440x810", "1280x800", "1152x648", "960x540")
 # the game kinds (gamecheck.verdict) the panel can set up
-KINDS = ("fsr4", "sgsr2", "static")
+# DX11FSR (0.8.23): a DirectX 11 game is kind fsr4 too (gamecheck dx11_only); the 0.8.22 kind sgsr2 is gone
+KINDS = ("fsr4", "static")
 
 
 def legacy_model(static):
@@ -38,23 +41,25 @@ def default_model(kind, fsr4=True, npu_state=None):
     """0.8.16: the model a
     game gets when nobody picked one (the panel's apply_model "auto"): FSR 4 when the plugin carries it -- on the NPU when it is
     ready, else FSR 4 Fast (the GPU path at about half the ms: RE4 720p P 1.74 -> 0.92, 1080p UP 3.67 -> 1.90);
-    DX11 (kind sgsr2) and a build without FSR 4: SGSR 2; None for a game Vela cannot set up."""
+    a build without FSR 4: SGSR 2; None for a game Vela cannot set up. DX11 games the same (DX11FSR)."""
     if kind not in KINDS:
         return None
-    if kind == "sgsr2" or not fsr4:
+    if not fsr4:
         return "sgsr2"
     return "fsr4" if npu_ready(npu_state) else "fsr4fast"
 
 
-def models_for(kind, fsr4=True, fsr3=True):
-    """[(model, offered)] for a game of this kind, in the panel's order. DX11 (kind sgsr2): OptiScaler's Dx11Upscaler is
-    SGSR 2 whatever the live model says. fsr4 / fsr3: the plugin carries what the model needs (sgsr3.py fsr4_available,
-    fsr3_available)."""
+def models_for(kind, fsr4=True, fsr3=True, dittosr=True):
+    """[(model, offered)] for a game of this kind, in the panel's order; DX11 games the same as DX12 (DX11FSR: the fork
+    runs every model over the D3D11 -> D3D12 bridge). fsr4 / fsr3 / dittosr: the plugin carries what the model needs (sgsr3.py
+    fsr4_available, fsr3_available, dittosr_available). DITTO: DittoSR only where FSR 3 is offered, and not in a static
+    (FSR 2 inside the exe) game: the interceptor has no DittoSR."""
     if kind not in KINDS:
         return []
-    if kind == "sgsr2":
-        return [("sgsr2", True)]
-    return [("fsr4", bool(fsr4)), ("fsr4fast", bool(fsr4)), ("fsr3", bool(fsr3)), ("sgsr2", True)]
+    out = [("fsr4", bool(fsr4)), ("fsr4fast", bool(fsr4)), ("fsr3", bool(fsr3))]
+    if kind != "static":
+        out.append(("dittosr", bool(fsr3) and bool(dittosr)))
+    return out + [("sgsr2", True)]
 
 
 def is_ultra(render, output):
@@ -144,8 +149,6 @@ def plan(kind, live):
     model = RETIRED_MODELS.get(model, model)
     if model not in MODELS:
         model = legacy_model(kind == "static")
-    if kind == "sgsr2":
-        model = "sgsr2"
     return {"kind": kind, "model": model, "npu": bool(live.get("npu")) and model in FSR4_MODELS}
 
 
@@ -169,7 +172,8 @@ def hint(p, st):
     dx11_run = log.get("sgsr3") and log.get("mode") == "sgsr2" and p["model"] != "sgsr2"
     # 0.8.20: the last run was DirectX 11 (OptiScaler's lines): the game's DX12 entry when Steam offers one, else its setting.
     # No -dx12 is added here: Vela adds it only for Unreal games without their own API entries (sgsr3.launch_build)
-    if p["kind"] != "static" and log.get("api") == "dx11":
+    # PANELWHY: a DirectX 11 game (st dx11_only) runs in DX11: a DX11 run there is no reason to switch to DX12
+    if p["kind"] != "static" and not st.get("dx11_only") and log.get("api") == "dx11":
         return {"id": "dx12_choice"} if st.get("dx12_choice") else {"id": "dx11_run"}
     if p["kind"] != "static" and st.get("dx12_choice") and (not log.get("sgsr3") or dx11_run):
         return {"id": "dx12_choice"}

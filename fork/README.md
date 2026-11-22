@@ -4,8 +4,8 @@ Base: [justradical/Sloptiscaler](https://github.com/justradical/Sloptiscaler) co
 = ARM64EC build of [OptiScaler](https://github.com/optiscaler/OptiScaler) 10.0.0.1 with an SGSR 2 backend.
 Our changes are the patches in `patches/`, applied in number order. License: GPL-3.0 (`LICENSE`, OptiScaler's).
 
-The `OptiScaler.dll` in Vela 0.8.22 (md5 `cc76b47269c20214a665c4a618d8a4ff`, 18 499 584 bytes) was built from the base +
-**0001–0008, 0010–0021, 0023, 0024 and 0024b–0024d** (patch 0009 and the experimental upstream-sync patch 0000 are not part of this build and are not
+The `OptiScaler.dll` in Vela 0.8.23 (md5 `f2ff97d36751a40eb20fe8479bd207b4`, 18 775 552 bytes) was built from the base +
+**0001–0008, 0010–0021, 0023, 0024, 0024b–0024d and 0025–0036** (patch 0009 and the experimental upstream-sync patch 0000 are not part of this build and are not
 included). Checksums of the patch files: `patches.md5`.
 
 | patch | what |
@@ -24,6 +24,18 @@ included). Checksums of the patch files: `patches.md5`.
 | 0023 | a DLSS context that comes without a depth buffer is handled per handle; the game's other contexts keep FSR 4 |
 | 0024 | looks for the depth buffer under another NGX parameter name before giving up; `OPTI_VELA_NODEPTH=1` forces the no-depth path (tests) |
 | 0024b–0024d | a context without depth gets FSR 1 (EASU) of the colour, without history, inside a reversible tonemap that compiles under vkd3d-shader (stopgap, see the 0.8.22 known issues) |
+| 0025 | depth buffers in D24S8 or D16 are copied to a 32-bit float image so FSR 4 can read them (Kingdom Come: Deliverance II); `VELA_DEPTH_COPY=1` forces the copy |
+| 0026 | motion vectors in R16G16B16A16_SNORM are accepted |
+| 0027 | DirectX 11 games: `Dx11Upscaler=sgsr3_12` runs SGSR 3 (FSR 4 VK provider, FSR 4 Fast, the NPU path) over the DX11 -> DX12 bridge; the Vela live file switches DX11 handles like DX12 (fsr4 / fsr4fast -> `sgsr3_12`, fsr3 -> `ffx_12` FSR 3.1, sgsr2 -> `sgsr2_12`, same `Vela live: handle N model X -> ...` lines); a DX11 backend that fails goes to SGSR 2 on Adreno |
+| 0028 | an FSR 2 context OptiScaler does not adopt is passed to the game's own FSR 2 (upstream 19e61cf, 299f835; fixes the Bright Memory: Infinite DX11 crash) |
+| 0029 | DX11 FSR 2 contexts created on a game D3D11 device are adopted |
+| 0030 | the D3D11 context is flushed before the DX12 side reads shared images; `VELA_DX11_NOFLUSH=1` skips it |
+| 0031 | `VELA_DX11_PROBE` readback diagnostics of the DX11 -> DX12 shared images |
+| 0032 | every DX11 -> DX12 shared image also gets the render-target bind flag: without it DXVK and vkd3d-proton chose different memory layouts and the other side read garbage (black or white picture); `VELA_DX11_SHARED_RT=0` = old |
+| 0033 | Unreal's FSR 2 plugin in DX11 (RHI backend: no native textures at the FFX API) is found at the D3D11 compute dispatches of its passes and replaced by OptiScaler's DX11 path; `VELA_UEFSR2=0` = left to the game |
+| 0034 | 0033 takes the inputs and output at the shader slots the FFX pipeline gave them |
+| 0035 | once adopted, the game's own FSR 2 passes are skipped; `VELA_UEFSR2_SKIP=0` runs them as well |
+| 0036 | live model `dittosr`: DittoSR (github.com/Vancete/DittoSR) as the FFX upscaler, loaded from `dittosr/` next to OptiScaler, FSR 3 when it cannot run |
 
 ## Build
 
@@ -47,9 +59,9 @@ Pinned inputs:
 
 ### Reproducing the release DLL
 
-The `OptiScaler.dll` of Vela 0.8.22 (md5 `cc76b47269c20214a665c4a618d8a4ff`) is this build with
+The `OptiScaler.dll` of Vela 0.8.23 (md5 `f2ff97d36751a40eb20fe8479bd207b4`) is this build with
 
-    FORK_BUILD_DATE=2026-11-11 sh fork/build/build.sh out
+    FORK_BUILD_DATE=20261122 sh fork/build/build.sh out
 
 A rebuild from a clean clone is byte-identical to the release DLL except two timestamps: the linker's PE timestamp
 (`TimeDateStamp` in the COFF header) and the timestamp of the debug directory entry. With those two fields set to the

@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 
 import decky
 
@@ -85,6 +86,7 @@ class Plugin:
         self.ag = anygame.AnyGame(os.path.join(ASSETS, "layer"), home, settings, log=decky.logger.info)
         self.lat = latency.Latency(home, settings, log=decky.logger.info)
         self.cfg = gamecfg.GameCfg(settings, log=decky.logger.info, home=home)
+        self.cfg.prefix_of = lambda a: self.s3.scan(a).get("prefix")  # NONSTEAM: a launcher's game has its own prefix
         # 0.5.0: settings the panel changes while the game runs (the fork reads /tmp/vela-live/<appid>.ini)
         self.live = live.Live(settings, log=decky.logger.info)
         self.live.restore_all()
@@ -323,7 +325,8 @@ class Plugin:
         if isinstance(launch, str):  # V03: Steam's options as the panel read them when it opened (None: not read this time)
             self._launch_seen = {**getattr(self, "_launch_seen", {}), appid: launch}
         # V03 (audit 2026-11-09): a log older than this run's start is the previous run's: not shown as this run's state
-        s3 = self.s3.status(appid, run_since=gameutil.run_started(appid) if appid in running else None)
+        started = gameutil.run_started(appid) if appid in running else None
+        s3 = self.s3.status(appid, run_since=started)
         s3["game_cfg"] = self.cfg.status(appid)
         s3["live"] = self.live.get(appid)
         s3["npu"] = self.npu.status(appid)
@@ -355,7 +358,9 @@ class Plugin:
                 self.cfg.ensure(appid, scan.get("install_dir"), cfg, appid in running)
                 s3["game_cfg"] = self.cfg.status(appid)
         out = {"appid": appid, "running": appid in running, "scan": scan, "sgsr3": s3, "anygame": ag,
-               "latency": lat, "suggest": suggest(scan, s3, ag)}
+               "latency": lat, "suggest": suggest(scan, s3, ag),
+               # PANELWHY: how long this run has been going (None: not running / unknown); the panel's waiting card uses it
+               "run_secs": max(0, int(time.time() - started)) if started else None}
         out.update(self._model_state(appid, out, window))
         try:
             out["report"] = self.rep.panel(appid) if getattr(self, "rep", None) else None  # UPX1: this game's question only
@@ -425,13 +430,15 @@ class Plugin:
         v = self.check.check(scan, static=bool(profiles.static_fsr2(appid)),
                              s3_assets=os.path.isfile(os.path.join(ASSETS, "sgsr3", "OptiScaler.dll")),
                              ag_assets=False, appid=appid)
+        if v.get("kind") == "sgsr2":  # DX11FSR: a 0.8.22 verdict of a DirectX 11 game; its models are FSR 4's now
+            v = {**v, "kind": "fsr4", "dx11_only": True}
         if s3.get("installed") and v["kind"] not in presets.KINDS and v["reason"] != "anticheat":
             # installed by hand / an older version: keep what is in the folder
             v = {**v, "kind": "static" if s3.get("static_fsr2") else "fsr4", "reason": None}
         return v
 
     def _models(self, kind, s3):
-        models = presets.models_for(kind, s3.get("fsr4_available"), s3.get("fsr3_available"))
+        models = presets.models_for(kind, s3.get("fsr4_available"), s3.get("fsr3_available"), s3.get("dittosr_available"))
         chip = getattr(self, "chip", None)
         if chip is not None and not chip["fsr4fast"]:  # 0.8.16: FSR 4 Fast is tuned for the A740 + v73 NPU
             models = [(m, ok and m != "fsr4fast") for m, ok in models]
@@ -472,6 +479,8 @@ class Plugin:
                "not_in_launch": self._not_in_launch(appid, s3, bool(gs.get("running")))}
         if not gs["running"]:
             self._win_restart.discard(appid)
+        # PANELWHY: a DirectX 11 game: whether its own Steam launch entries offer DX12 (the panel's hint)
+        out["dx12_choice"] = bool(v.get("dx11_only")) and sgsr3.has_dx12_entry(self.s3.api_args(appid))
         if on and v["kind"] in presets.KINDS:
             lv = self._live_migrate(appid, v["kind"], s3, npu_st)
             p = presets.plan(v["kind"], lv)
@@ -479,7 +488,8 @@ class Plugin:
             out["window_fix"] = win is not None and win != presets.SCREEN
             st = {"running": gs["running"], "log": s3.get("log"), "npu": npu_st,
                   "window_restart": appid in self._win_restart,
-                  "dx12_choice": sgsr3.has_dx12_entry(self.s3.api_args(appid))}
+                  "dx12_choice": sgsr3.has_dx12_entry(self.s3.api_args(appid)), "dx11_only": bool(v.get("dx11_only"))}
+            out["dx12_choice"] = st["dx12_choice"]
             out.update({"model": p["model"], "plan": p, "hint": presets.hint(p, st)})
             chip = getattr(self, "chip", None)
             if chip is not None and not chip["npu"] and p["model"] in presets.FSR4_MODELS and                     (out["hint"] is None or str(out["hint"].get("id", "")).startswith("npu_")):
@@ -745,7 +755,7 @@ class Plugin:
         return res
 
     def _apply_model_opts(self, appid, model, launch_options, resolution, mode=None):
-        """The model picked by hand: fsr4, fsr3, sgsr2 or "off". The first pick puts the files in (resolution =
+        """The model picked by hand: fsr4, fsr3, dittosr, sgsr2 or "off". The first pick puts the files in (resolution =
         Steam's override as it is, for the undo); a change in a game that is on is live (model=) plus the NPU layer in
         the launch options. FSR 4 gets the NPU when it is ready (picking it again keeps the choice);
         FSR 3 / SGSR 2 keep the layer's tokens (0.8.15: the live key alone turns the NPU off). Returns the launch options for the frontend to set and Steam's override (None =

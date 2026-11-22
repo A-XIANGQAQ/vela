@@ -245,6 +245,165 @@ def vela_in_cmd(cmd):
     return any(m in cmd for m in VELA_MARKS)
 
 
+# ---- CRASHREP: where the game crashed (its stderr, kept by vela-launch) -----------------------------------------------
+
+STDERR_RX = re.compile(r"^stderr-(\d{8})-(\d{6})\.log$")  # vela-launch's per-run file in the kit folder (the run's start)
+STDERR_HEAD, STDERR_TAIL = 256 << 10, (2 << 20) - (256 << 10)
+# before / after the run's recorded start: vela-launch starts the game right when Steam does (the plugin may see it later)
+STDERR_BEFORE, STDERR_AFTER = 120, 60
+# winedbg: "Unhandled exception: page fault on read access to 0x0000000000000010 in 64-bit code (0x00006fffff4123ab)."
+_RX_DBG_EXC = re.compile(r"Unhandled exception: (?P<kind>.+?) in (?:16|32|64)-bit code \((?P<addr>0x[0-9A-Fa-f]+)\)")
+# ntdll before the debugger: "wine: Unhandled page fault on read access to 0000000000000010 at address 00006FFFFF4123AB (thread 0130)"
+_RX_NT_EXC = re.compile(r"wine: Unhandled (?P<kind>.+?) at address (?P<addr>(?:0x)?[0-9A-Fa-f]+)")
+_RX_NT_EXC2 = re.compile(r"wine: Unhandled exception (?P<code>0x[0-9A-Fa-f]+) in thread [0-9A-Fa-f]+ at address (?P<addr>(?:0x)?[0-9A-Fa-f]+)")
+_RX_UNIMPL = re.compile(r"wine: Call from (?P<addr>(?:0x)?[0-9A-Fa-f]+) to unimplemented function (?P<fn>\S+?), aborting")
+_RX_NODLL = re.compile(r"err:module:import_dll (?:Library|Loading library) (?P<lib>\S+) \(which is needed by L?\"(?P<by>[^\"]+)\"\)"
+                       r" (?:not found|failed)")
+_RX_INITFAIL = re.compile(r"err:module:\w+ \"?L?\"?(?P<dll>[^\"\s]+\.(?:dll|exe|asi))\"? failed to initialize", re.I)
+# a backtrace frame: "=>0 0x00006fffff4123ab in dxgi (+0x123ab) (0x...)", "  1 0x7bc54f9e RtlRaiseException+0x2e() in ntdll (0x...)",
+# "=>0 0x0000000140001234 main+0x14(argc=1) [C:\src\game.c:10] in game (0x...)"
+_RX_FRAME = re.compile(r"^\s*(?:=>)?\s*(?P<n>\d+)\s+(?P<pc>0x[0-9A-Fa-f]+)\s+(?:.*?\s)?in\s+(?P<mod>[^\s()]+)"
+                       r"(?:\s+\(\+(?P<off>0x[0-9A-Fa-f]+)\))?", re.M)
+# "Modules:" list: "PE\t       140000000-       14a52f000\tDeferred        game", "ELF\t7f12...-7f12...\tExport  libfoo.so", "  \-PE ..."
+_RX_MODULE = re.compile(r"^\s*(?:\\-)?(?:PE|ELF|PE-Wine|Mach-O|DBG)\s+(?P<lo>[0-9A-Fa-f]+)\s*-\s*(?P<hi>[0-9A-Fa-f]+)\s+\S+\s+(?P<name>\S+)\s*$",
+                        re.M)
+_RX_SEGV = re.compile(r"Segmentation fault|Aborted \(core dumped\)|Bus error|Illegal instruction \(core dumped\)")
+# the files Vela puts in front of the game (kit / NPU layer): a crash in one of them is ours to fix
+OURS = {"dxgi": "OptiScaler, the dxgi.dll of Vela's kit", "optiscaler": "OptiScaler", "optipatcher": "OptiPatcher",
+        "amdxcffx64": "the AMD FidelityFX driver library of Vela's kit", "libvklayer_vela_npu": "the Vela NPU layer",
+        "libqnnhtp": "the QNN runtime of the Vela NPU layer"}
+OURS_PREFIX = {"amd_fidelityfx_": "a FidelityFX / FSR provider DLL (Vela's kit, or the game's own copy)"}
+SYSTEM = {"ntdll", "kernelbase", "kernel32", "ucrtbase", "msvcrt", "vcruntime140", "vcruntime140_1", "msvcp140", "user32",
+          "win32u", "wow64", "wow64cpu", "wow64win", "xtajit", "xtajit64", "libc.so.6", "libpthread.so.0", "ld-linux-aarch64.so.1",
+          "ld-linux-x86-64.so.2"}
+
+
+def module_stem(name):
+    """dxgi.dll / dxgi / C:\\x\\DXGI.DLL -> dxgi; libVkLayer_VELA_npu.so -> libvklayer_vela_npu (for the lists above)."""
+    n = re.split(r"[/\\]", str(name or ""))[-1].lower()
+    n = re.sub(r"\.so(?:\.\d+)*$", "", n)
+    return re.sub(r"\.(?:dll|exe|asi|drv|sys)$", "", n)
+
+
+def ours_label(name, vela_run=None):
+    """What of Vela's a module is (OURS), None when it is not ours. dxgi.dll is OptiScaler only in a run with Vela's kit
+    (vela_run False: the run had no kit, the dxgi is Wine's / DXVK's)."""
+    stem = module_stem(name)
+    if stem == "dxgi" and vela_run is False:
+        return None
+    if stem in OURS:
+        return OURS[stem]
+    for pre, label in OURS_PREFIX.items():
+        if stem.startswith(pre):
+            return label
+    return None
+
+
+def _addr(text):
+    try:
+        return int(text, 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def crash_info(text, vela_run=None):
+    """CRASHREP: where a run crashed, from the game's stderr (Wine's crash output). {} when the text names no crash. Keys:
+    kind (page fault on read access to 0x..., unimplemented function, missing DLL ...), addr (the faulting code address),
+    module (the module that address is in: the Modules list, else backtrace frame 0, else the line itself), offset,
+    frames (the backtrace's modules, in order), app_module (the first frame outside Wine's own libraries, when the fault is in
+    one: a C++ throw / abort raised in KERNELBASE), ours (the module, or app_module when the fault is in Wine, is Vela's),
+    ours_what (which of ours), ours_in_stack (any frame is ours), line (the stderr line that said it)."""
+    text = text or ""
+    out = {}
+    m = _RX_DBG_EXC.search(text)
+    nt = _RX_NT_EXC2.search(text) or _RX_NT_EXC.search(text)
+    if m:
+        out.update(kind=m.group("kind").strip(), addr=m.group("addr").lower(), line=m.group(0))
+    elif nt:
+        kind = f"exception {nt.group('code')}" if "code" in nt.groupdict() else nt.group("kind").strip()
+        kind = re.sub(r"\s*\(thread [0-9A-Fa-f]+\).*$", "", kind)
+        out.update(kind=kind, addr="0x" + nt.group("addr").lower().replace("0x", "").lstrip("0").rjust(1, "0"), line=nt.group(0))
+    u = _RX_UNIMPL.search(text)
+    if u and not out:
+        out.update(kind=f"unimplemented function {u.group('fn')}", addr="0x" + u.group("addr").lower().replace("0x", "").lstrip("0"),
+                   line=u.group(0))
+    frames = []
+    bt = text.find("Backtrace:", text.find(out["line"]) if out.get("line") else 0)
+    if bt >= 0:
+        for fm in _RX_FRAME.finditer(text, bt):
+            if fm.start() > bt + 20000:
+                break
+            frames.append((int(fm.group("n")), fm.group("mod"), fm.group("off"), fm.group("pc")))
+            if len(frames) >= 32:
+                break
+        # only the first backtrace (frame numbers rise from 0)
+        cut = next((i for i in range(1, len(frames)) if frames[i][0] <= frames[i - 1][0]), len(frames))
+        frames = frames[:cut]
+    mods = [(int(x.group("lo"), 16), int(x.group("hi"), 16), x.group("name")) for x in _RX_MODULE.finditer(text)]
+    a = _addr(out.get("addr"))
+    module = offset = None
+    if a is not None:
+        hit = [x for x in mods if x[0] <= a < x[1]]
+        if hit:
+            lo, _, module = min(hit, key=lambda x: x[1] - x[0])
+            offset = hex(a - lo)
+    if module is None and frames:
+        module, offset = frames[0][1], frames[0][2]
+    if not out:
+        nd = _RX_NODLL.search(text)
+        fi = _RX_INITFAIL.search(text)
+        if nd:
+            out.update(kind=f"missing DLL {nd.group('lib')}", line=nd.group(0),
+                       needed_by=re.split(r"[/\\]+", nd.group("by"))[-1])
+            module = nd.group("lib")
+        elif fi:
+            out.update(kind="DLL failed to initialize", line=fi.group(0))
+            module = fi.group("dll")
+        elif frames:
+            out.update(kind="backtrace", line="Backtrace:")
+        else:
+            sg = _RX_SEGV.search(text)
+            if sg:
+                out.update(kind=sg.group(0), line=sg.group(0))
+    if not out:
+        return {}
+    out["module"] = module
+    out["offset"] = offset
+    out["frames"] = []
+    for _, mod, _, _ in frames:
+        if mod not in out["frames"]:
+            out["frames"].append(mod)
+        if len(out["frames"]) >= 8:
+            break
+    app = module
+    if module and frames and module_stem(module) in SYSTEM:
+        app = next((f[1] for f in frames if module_stem(f[1]) not in SYSTEM), None)
+        out["app_module"] = app
+    what = ours_label(module, vela_run) or (ours_label(app, vela_run) if app and app != module else None)
+    out["ours"] = bool(what) if module else None
+    out["ours_what"] = what
+    out["ours_in_stack"] = any(ours_label(f[1], vela_run) for f in frames)
+    out["line"] = (out.get("line") or "")[:240]
+    out["kind"] = re.sub(r"0x0+(?=[0-9A-Fa-f])", "0x", out["kind"])[:160]
+    if out.get("addr") is not None:
+        a = _addr(out["addr"])
+        out["addr"] = hex(a) if a is not None else None
+    return out
+
+
+def crash_summary(ci):
+    """One line for meta.json: 'page fault on read access to 0x10 in dxgi (+0x123ab) at 0x6fffff4123ab: ours (OptiScaler ...)'."""
+    if not ci:
+        return None
+    if ci.get("needed_by"):
+        return f"{ci['kind']} (needed by {ci['needed_by']})"[:300]
+    where = f" in {ci['module']}" + (f" (+{ci['offset']})" if ci.get("offset") else "") if ci.get("module") else " (module not named)"
+    via = f", called from {ci['app_module']}" if ci.get("app_module") else ""
+    at = f" at {ci['addr']}" if ci.get("addr") else ""
+    who = (f": ours, {ci['ours_what']}" if ci.get("ours") else ": not one of Vela's files" if ci.get("ours") is False else "")
+    return f"{ci['kind']}{where}{via}{at}{who}"[:300]
+
+
 def log_duration(text):
     """Seconds from the first to the last [HH:MM:SS] line (OptiScaler.log and the interceptor's log), None without two."""
     ts = _RX_TS.findall(text or "")
@@ -276,6 +435,7 @@ def assess(log_text, summary=None, kernel=None, npu_layer=None, intercept=False,
         "fsr4_fallback": bool(s.get("fsr4_fallback")),
         "sgsr2_instead": s.get("sgsr2_instead") or None,
         "fsr3_fallback": bool(s.get("fsr3_fallback")),
+        "dittosr_fallback": bool(s.get("dittosr_fallback")),
         "npu_fallback": (n.get("reason") or "fallback") if n.get("state") == "fallback" else None,
         "npu_fallbacks": n.get("fallbacks") or 0,
         "npu_errors": (layer.get("errors") or 0) + (layer.get("timeouts") or 0),
@@ -287,7 +447,7 @@ def assess(log_text, summary=None, kernel=None, npu_layer=None, intercept=False,
     }
     # 0.8.21: an output with no NPU graph is no failure: the GPU path runs and the panel's hint tells it (VELA-QG5PE2).
     # The flag stays for a report the player sends himself.
-    why = [k for k in ("gpu_hang", "gpu_faults", "fsr4_fallback", "sgsr2_instead", "fsr3_fallback", "npu_fallback",
+    why = [k for k in ("gpu_hang", "gpu_faults", "fsr4_fallback", "sgsr2_instead", "fsr3_fallback", "dittosr_fallback", "npu_fallback",
                        "npu_fallbacks", "npu_errors", "short_run")
            if flags[k] and not (k == "npu_fallback" and flags[k] == "size")]
     # RPT3 (2026-11-11, VELA-9F3B4B): ONE NPU timeout with no NPU error is a recovered job (that frame on the GPU path, "on, exact"
@@ -470,6 +630,41 @@ class Reporter:
             if start <= at <= end:
                 out.append(ln)
         return out
+
+    def stderr_runs(self, appid):
+        """CRASHREP: vela-launch's per-run stderr files of the game [(start epoch, path)], oldest first."""
+        root = getattr(self.s3, "kit_root", None) if self.s3 else None
+        try:
+            d = root(appid) if root else None
+            names = os.listdir(d) if d else []
+        except Exception:
+            return []
+        out = []
+        for n in names:
+            m = STDERR_RX.match(n)
+            if not m:
+                continue
+            try:
+                out.append((time.mktime(time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")), os.path.join(d, n)))
+            except (ValueError, OverflowError):
+                continue
+        return sorted(out)
+
+    def stderr_file(self, appid, rec, start, end, running=False):
+        """CRASHREP: the stderr file of the reported run: the one started closest to the run's recorded start (from
+        STDERR_BEFORE before it to STDERR_AFTER after it, and not after the run's end); without a record, the newest inside the
+        run window; a running game without a record: its newest. None: vela-launch kept none for that run."""
+        runs = self.stderr_runs(appid)
+        if not runs:
+            return None
+        if rec:
+            hi = min(rec["at"] + STDERR_AFTER, rec.get("end") or (rec["at"] + STDERR_AFTER))
+            near = [x for x in runs if rec["at"] - STDERR_BEFORE <= x[0] <= hi]
+            return min(near, key=lambda x: abs(x[0] - rec["at"]))[1] if near else None
+        if running:
+            return runs[-1][1]
+        inside = [x for x in runs if start <= x[0] <= end]
+        return inside[-1][1] if inside else None
 
     # -- settings / state files
 
@@ -670,14 +865,16 @@ class Reporter:
             v["optiscaler"] = None
         v["md5"] = {rel: file_md5(os.path.join(a, rel)) for rel in (
             "sgsr3/OptiScaler.dll", "sgsr3/amd_fidelityfx_upscaler_vk.dll", "sgsr3/amd_fidelityfx_dx12.dll",
-            "sgsr3/OptiPatcher.asi", "staticfsr/dxgi.dll", "npu/libVkLayer_VELA_npu.so")}
+            "sgsr3/OptiPatcher.asi", "sgsr3/dittosr/amd_fidelityfx_upscaler_dx12.dll", "sgsr3/dittosr/dittosr.ini",
+            "staticfsr/dxgi.dll", "npu/libVkLayer_VELA_npu.so")}
         # what is in the game folder now (ours, an older build of ours, or the game's own)
         if self.s3:
             try:
                 d = self._kit_dir(appid)  # V21: where Vela's files for the game are (the kit in an overlay setup)
                 if d:
                     v["game_md5"] = {n: file_md5(os.path.join(d, n)) for n in (
-                        "dxgi.dll", "amd_fidelityfx_upscaler_vk.dll", "amd_fidelityfx_dx12.dll", "OptiScaler.ini")}
+                        "dxgi.dll", "amd_fidelityfx_upscaler_vk.dll", "amd_fidelityfx_dx12.dll",
+                        "dittosr/amd_fidelityfx_upscaler_dx12.dll", "dittosr/dittosr.ini", "OptiScaler.ini")}
                     is_kit = getattr(self.s3, "_is_kit", None)
                     v["game_md5_dir"] = "kit" if is_kit and is_kit(d) else "game folder"
             except Exception as e:
@@ -842,6 +1039,30 @@ class Reporter:
         else:
             lo.append("at the run's start: not recorded (the plugin did not see this run start)")
         lo.append("at Send (Steam's launch options now): " + A(launch if isinstance(launch, str) else "(not read)"))
+        # CRASHREP: the game's stderr of this run (Wine's crash lines name the module) + where it crashed
+        se_path = None
+        try:
+            se_path = self.stderr_file(appid, rec, start, end, running)
+        except Exception as e:
+            errors.append(f"game stderr: {e}")
+        se_text = read_text(se_path, STDERR_HEAD, STDERR_TAIL) if se_path else None
+        crash = {}
+        if se_text is not None:
+            se_text = A(se_text)
+            files["game_stderr.txt"] = (f"# the game's stderr of the run that started "
+                                        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.stderr_runs_start(se_path)))}"
+                                        f" ({os.path.basename(se_path)}, kept by vela-launch)\n" + se_text)
+            meta["stderr"] = os.path.basename(se_path)
+            crash = crash_info(se_text, vela_run)
+        else:
+            meta["stderr"] = ("none: vela-launch kept no stderr of this run (the kit was off, the launcher is older than 0.8.23, "
+                              "or the game did not start through it)")
+        meta["flags"].update({"crash_module": crash.get("module"), "crash_addr": crash.get("addr"),
+                              "crash_ours": crash.get("ours"), "crash_kind": crash.get("kind")})
+        meta["crash"] = crash_summary(crash) if crash else (None if se_text is None else "no crash in the game's stderr")
+        if crash:
+            meta["crash_detail"] = {k: crash.get(k) for k in ("module", "offset", "addr", "kind", "app_module", "frames",
+                                                              "ours", "ours_what", "ours_in_stack", "needed_by", "line")}
         if kit_lines:
             lo.append("Vela's launcher in the run window:")
             lo += ["  " + A(x) for x in kit_lines[-20:]]
@@ -880,6 +1101,9 @@ class Reporter:
         if len(data) > MAX_ZIP and "optiscaler.log" in files:
             files["optiscaler.log"] = A(read_text(path, 256 << 10, 1 << 20) or "")
             data = self._zip(files)
+        if len(data) > MAX_ZIP and "game_stderr.txt" in files:
+            files["game_stderr.txt"] = A(read_text(se_path, 64 << 10, 512 << 10) or "")
+            data = self._zip(files)
         if len(data) > MAX_ZIP:
             raise RuntimeError(f"report is {len(data) // 1024} KB, more than {MAX_ZIP // 1024} KB")
         os.makedirs(self.dir, exist_ok=True)
@@ -891,6 +1115,14 @@ class Reporter:
         self._write(local_id + ".json", rec)
         self.log(f"report: {local_id} saved ({len(data) // 1024} KB, {len(files)} files, {trigger}, why {fl.get('why')})")
         return self.preview(local_id)
+
+    @staticmethod
+    def stderr_runs_start(path):
+        m = STDERR_RX.match(os.path.basename(path or ""))
+        try:
+            return time.mktime(time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")) if m else _mtime(path)
+        except (ValueError, OverflowError):
+            return _mtime(path)
 
     @staticmethod
     def _zip(files):
@@ -1041,7 +1273,8 @@ Made by the Vela Decky plugin when the player pressed «Send» (nothing is sent 
 Anonymised: home path -> ~, user / host names, Steam ids and account names, e-mails, IPs, MACs and token-like values replaced.
 Never included: saves, screenshots, .env-like files, tokens, Steam login data.
 
-meta.json          reason, the player's text, flags of the run (no clean exit, GPU hang/faults, FSR 4 fallback, NPU fallback)
+meta.json          reason, the player's text, flags of the run (no clean exit, GPU hang/faults, FSR 4 fallback, NPU fallback);
+                   crash: where the game crashed (from game_stderr.txt: module, address, whether it is one of Vela's files)
 optiscaler.log     the run's OptiScaler.log (or the interceptor's log), head + tail when large
 npu_layer.log      the Vela NPU layer's log of this game
 game_state.json    what the panel showed (scan, model, log summary)
@@ -1051,5 +1284,7 @@ versions.json      plugin / OptiScaler / provider / NPU layer versions + md5, OS
 kernel_gpu.txt     kernel lines about the GPU / display in the run window (first line: the window and how many kernel lines it held)
 gamescope.txt      gamescope journal lines in the run window
 plugin.log         Vela's own log lines about this game
+game_stderr.txt    the game's stderr of the run (Proton / Wine errors, crash backtrace), kept by vela-launch; absent when the
+                   launcher kept none for the run (meta.json "stderr" says why)
 OptiScaler.ini     OptiScaler's settings in the game folder
 """

@@ -187,7 +187,7 @@ if hasattr(P, "_launch_lost"):
     # the owner's wording (2026-11-10): one text per state, before On / Works
     import json
     en = json.load(open(os.path.join(ROOT, "src", "i18n", "en.json"), encoding="utf-8"))
-    tsx = open(os.path.join(ROOT, "src", "index.tsx"), encoding="utf-8").read()
+    tsx = open(os.path.join(ROOT, "src", "status.ts"), encoding="utf-8").read()  # PANELWHY: the status card's file
     check("6g the panel has the owner's text for each of the two states, before On / Works",
           'if (gs.not_in_launch) return { dot: YELLOW, text: t(gs.not_in_launch === "wrapped" ? "st.launchWrapped" : "st.notConnected") };' in tsx
           and tsx.index("if (gs.not_in_launch)") < tsx.index('t("st.onIdle"')

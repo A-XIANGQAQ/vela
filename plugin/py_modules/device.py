@@ -10,16 +10,16 @@ Read from the kernel, never from a name the user can change (values as the Retro
 Policy:
 - SM8550 (Adreno 740, Hexagon v73): everything as in the 0.8.16 release -- the NPU graphs are built for v73, FSR 4 Fast is tuned here.
 - SM8750 (Adreno 830, Hexagon v79): the NPU only when a v79 graph set is on the system or in the plugin
-  (V79_DIRS: a "v79" folder with at least one *.bin); without it FSR 4 runs on the GPU, FSR 3 and SGSR 2 stay, FSR 4 Fast
+  (V79_DIRS: a "v79" folder with at least one *.bin); without it FSR 4 runs on the GPU, FSR 3, DittoSR and SGSR 2 stay, FSR 4 Fast
   (tuned on the A740 + v73 NPU) is not offered, and the panel says so.
 - any other chip (e.g. the SM8250 / Adreno 650 of the Retroid Pocket 5 has no HTP, and FSR 4 on its
-  GPU alone is an estimated 50-80 ms per frame = unplayable): no NPU, no FSR 4, no FSR 4 Fast; FSR 3 and SGSR 2 stay.
+  GPU alone is an estimated 50-80 ms per frame = unplayable): no NPU, no FSR 4, no FSR 4 Fast; FSR 3, DittoSR and SGSR 2 stay.
 """
 import glob
 import os
 
 SM8550, SM8750 = "SM8550", "SM8750"
-NO_FSR4 = "FSR 4 needs the Snapdragon 8 Gen 2 or newer NPU; use FSR 3 or SGSR 2"  # = en.json model.why.chip_no_fsr4
+NO_FSR4 = "FSR 4 needs the Snapdragon 8 Gen 2 or newer NPU; use FSR 3, DittoSR or SGSR 2"  # = en.json model.why.chip_no_fsr4
 SOC_IDS = {519: SM8550, 603: SM8550, 618: SM8750}  # QCS8550 = the SM8550 die (IoT part number), same GPU and cDSP
 COMPATIBLE = {"qcom,sm8550": SM8550, "qcom,qcs8550": SM8550, "qcom,sm8750": SM8750}
 GPUS = {"43050a01": "Adreno 740", "44050000": "Adreno 830", "44050001": "Adreno 830",

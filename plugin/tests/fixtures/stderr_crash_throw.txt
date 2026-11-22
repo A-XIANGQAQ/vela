@@ -1,0 +1,15 @@
+wine: Unhandled exception 0xe06d7363 in thread 13c at address 00006FFFFFB5A2C9 (thread 013c), starting debugger...
+Unhandled exception: C++ exception(object = 0x000000000031f2f0, type = 0x00006ffffe9f1a20) in 64-bit code (0x00006fffffb5a2c9).
+Backtrace:
+=>0 0x00006fffffb5a2c9 RaiseException+0x69() in kernelbase (0x000000000031f1b0)
+  1 0x00006fffff8812a4 _CxxThrowException+0x94() in ucrtbase (0x000000000031f220)
+  2 0x00006ffffe9a3310 in amd_fidelityfx_upscaler_vk (+0x63310) (0x000000000031f2a0)
+  3 0x00006fffff40e021 in dxgi (+0xe021) (0x000000000031f300)
+  4 0x0000000140123456 in game (+0x123456) (0x000000000031f380)
+Modules:
+Module	Address					Debug info	Name (5 modules)
+PE	       140000000-       14a52f000	Deferred        game
+PE	    6ffffe940000-    6ffffea10000	Deferred        amd_fidelityfx_upscaler_vk
+PE	    6fffff400000-    6fffff4b2000	Deferred        dxgi
+PE	    6fffff870000-    6fffff8f0000	Deferred        ucrtbase
+PE	    6fffffb30000-    6fffffbf0000	Deferred        kernelbase

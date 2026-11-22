@@ -16,6 +16,9 @@ FILES = ["plugin.json", "package.json", "main.py", "LICENSE", "dist/index.js"]
 # (assets/sgsr3/VERSION.json says which); the licenses of all of them
 ASSETS = ["assets/sgsr3/OptiScaler.dll", "assets/sgsr3/OptiScaler.ini", "assets/sgsr3/OptiPatcher.asi",
           "assets/sgsr3/VERSION.json", "assets/sgsr3/amd_fidelityfx_dx12.dll",
+          # 0.8.23: DittoSR 0.5.4 (live model dittosr), its settings and licence
+          "assets/sgsr3/dittosr/amd_fidelityfx_upscaler_dx12.dll", "assets/sgsr3/dittosr/dittosr.ini",
+          "assets/licenses/dittosr/DittoSR-MIT.txt", "assets/licenses/dittosr/THIRD-PARTY-NOTICES.md",
           "assets/licenses/README.txt", "assets/licenses/OptiScaler-GPL-3.0.txt"]
 # 0.8.13: the any-game layer (Vela Any, assets/layer) left the plugin; a game that still has it is turned off by the
 # panel (anygame.py disable needs only its own state, not the .so)
@@ -34,8 +37,15 @@ def main(argv=None):
     if not os.path.exists(os.path.join(HERE, "dist", "index.js")):
         raise SystemExit("dist/index.js is missing, run `pnpm build` first")
     version = json.load(open(os.path.join(HERE, "package.json"), encoding="utf-8"))["version"]
-    if f'"{version}"'.encode() not in open(os.path.join(HERE, "dist", "index.js"), "rb").read():
-        raise SystemExit(f"dist/index.js does not carry version {version} (src/strings.ts VERSION), run `pnpm build`")
+    # 0.8.23: the panel imports no VERSION since 0.8.22 (rollup drops strings.ts VERSION from dist/index.js; 0.8.22 was packed
+    # by FT9/pkg/pack_nofg.py), so the source carries the version check and a bundle older than the source is refused
+    if f'export const VERSION = "{version}";' not in open(os.path.join(HERE, "src", "strings.ts"), encoding="utf-8").read():
+        raise SystemExit(f"src/strings.ts VERSION is not package.json's {version}")
+    built = os.path.getmtime(os.path.join(HERE, "dist", "index.js"))
+    for root, _, files in os.walk(os.path.join(HERE, "src")):
+        for f in files:
+            if os.path.getmtime(os.path.join(root, f)) > built:
+                raise SystemExit(f"dist/index.js is older than src/{f}, run `pnpm build`")
     os.makedirs(os.path.join(HERE, "out"), exist_ok=True)
     target = os.path.join(HERE, "out", f"{NAME}-nonpu.zip" if args.no_npu else f"{NAME}.zip")
     paths = list(FILES)

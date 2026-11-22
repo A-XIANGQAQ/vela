@@ -1,10 +1,10 @@
-Licenses of everything in this zip (Vela 0.8.21). Every file of the zip is listed here.
+Licenses of everything in this zip (Vela 0.8.23). Every file of the zip is listed here.
 
 upscale/plugin.json, package.json, main.py, py_modules/*.py, dist/index.js
                               the Vela plugin itself: GPL-3.0-only (../../LICENSE = Vela-plugin-GPL-3.0.txt). Started from the
                               Decky plugin template (BSD-3-Clause, notice kept in decky-plugin-template-BSD-3-Clause.txt).
-upscale/assets/sgsr3/OptiScaler.dll   our fork of OptiScaler (Sloptiscaler f80e4da3, ARM64EC build; md5 48a888ee...):
-                              GPL-3.0 (OptiScaler-GPL-3.0.txt). Changes: the patches 0001-0008 and 0010-0021 of the Vela
+upscale/assets/sgsr3/OptiScaler.dll   our fork of OptiScaler (Sloptiscaler f80e4da3, ARM64EC build; md5 f2ff97d3...):
+                              GPL-3.0 (OptiScaler-GPL-3.0.txt). Changes: the patches 0001-0008, 0010-0021, 0023-0024d and 0025-0036 of the Vela
                               repository (fork/patches); upstream https://github.com/justradical/Sloptiscaler,
                               https://github.com/optiscaler/OptiScaler. Inside it: fakenvapi (MIT, fakenvapi-MIT.txt),
                               LatencyFleX (Apache-2.0, LatencyFleX-Apache-2.0.txt), Snapdragon Game Super Resolution
@@ -19,6 +19,14 @@ upscale/assets/sgsr3/amd_fidelityfx_upscaler_vk.dll  the Vulkan FSR 4 provider (
                               shaders/weights (MIT, fsr4vk/AMD-FidelityFX-SDK-MIT.md; no FSR 4.0.2), FFX API headers (MIT,
                               fsr4vk/AMD-FidelityFX-SDK-2.0.0-MIT.md), Zstandard (BSD, fsr4vk/Zstandard-BSD.txt)
                               fsr4-shader-performance-overrides: GPL-2.0-or-later (fsr4-sr4-kernels-GPL-2.0-or-later.txt).
+upscale/assets/sgsr3/dittosr/amd_fidelityfx_upscaler_dx12.dll  DittoSR 0.5.4 (https://github.com/Vancete/DittoSR, release
+                              v0.5.4, its build/amd_fidelityfx_dx12.dll renamed, unchanged; md5 a98003a4...): MIT
+                              (dittosr/DittoSR-MIT.txt). Its third-party notice: dittosr/THIRD-PARTY-NOTICES.md; inside it:
+                              Snapdragon Game Super Resolution 2 parts (BSD-3-Clause, dittosr/SGSR2-BSD-3-Clause-Qualcomm.txt),
+                              CORTAO parts (MIT, dittosr/CORTAO-MIT.txt), AMD FidelityFX API headers and CACAO parts (MIT,
+                              dittosr/FidelityFX-API-MIT.txt), the OptiScaler plugin SDK header (MIT,
+                              dittosr/OptiScaler-plugin-SDK-MIT.txt), Vulkan headers (Apache-2.0 OR MIT).
+upscale/assets/sgsr3/dittosr/dittosr.ini  DittoSR's settings file (from the same release, unchanged): MIT, as DittoSR.
 upscale/assets/staticfsr/dxgi.dll     the Resident Evil 4 FSR 2 interceptor (ours, with Microsoft Detours, MIT): GPL-3.0-only.
 upscale/assets/npu/libVkLayer_VELA_npu.so, VkLayer_VELA_npu.json  our Vulkan layer that hands the FSR 4 network to the NPU:
                               GPL-3.0-only, as the plugin.

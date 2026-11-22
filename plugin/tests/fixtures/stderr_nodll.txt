@@ -1,0 +1,2 @@
+0024:err:module:import_dll Library VCRUNTIME140_1.dll (which is needed by L"C:\Program Files\Game\game.exe") not found
+0024:err:module:loader_init Importing dlls for L"C:\Program Files\Game\game.exe" failed, status c0000135

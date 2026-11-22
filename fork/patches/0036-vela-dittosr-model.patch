@@ -1,0 +1,457 @@
+From 10c5da71594cf6015f86e8388ab18fc757fb6200 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 00:12:52 +0100
+Subject: [PATCH] 0036-vela-dittosr-model: Vela live model dittosr = DittoSR
+ (github.com/Vancete/DittoSR 0.5.4, MIT, an FFX API provider) on the FFX
+ backend (DX12 FFX, DX11 FFX_on12); its context comes from a module of its own
+ (FfxApiProxy::InitDittoSRDx12: VELA_DITTOSR_DIR or <OptiScaler's DLL
+ folder>\dittosr\amd_fidelityfx_upscaler_dx12.dll, loaded once, never hooked),
+ so fsr3 keeps AMD's FSR 3.1 and fsr3 <-> dittosr switch live; no file, a
+ failed load or create -> FSR 3 with a "cannot run" line
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/inputs/NVNGX_DLSS_Dx11.cpp        |   5 +-
+ OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp        |   2 +-
+ OptiScaler/proxies/FfxApi_Proxy.h            | 145 +++++++++++++++++++
+ OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp |  74 +++++++++-
+ OptiScaler/upscalers/sgsr3/VelaLive.h        |  16 +-
+ 5 files changed, 229 insertions(+), 13 deletions(-)
+
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx11.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx11.cpp
+index 27faaff..bceec1c 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx11.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx11.cpp
+@@ -729,7 +729,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_GetFeatureRequirements(
+ 
+ // Vela 0027 (Vela 0.8.23): Vela live in DX11, the same rules as NVNGX_DLSS_Dx12.cpp. The panel's model re-creates the
+ // upscaler over the DX11 -> DX12 bridge: fsr4 / fsr4fast -> SGSR 3 (its FSR 4 VK bridge, the NPU path, FSR 4 Fast),
+-// fsr3 -> FFX (FSR 3.1 from amd_fidelityfx_dx12.dll, FFXFeature_Dx12.cpp), sgsr2 -> SGSR 2, no file -> the ini's (an
++// fsr3 -> FFX (FSR 3.1 from amd_fidelityfx_dx12.dll, FFXFeature_Dx12.cpp; 0036: dittosr -> the same FFX backend on
++// DittoSR's module), sgsr2 -> SGSR 2, no file -> the ini's (an
+ // ini asking for SGSR 3 alone gets SGSR 2). FSR 4 that cannot run here, or a context without depth: SGSR 2. Per handle,
+ // at most two tries of a backend per model (three when going down to SGSR 2).
+ static void VelaLiveDx11(IFeature_Dx11* feature, unsigned int handleId, NVSDK_NGX_Parameter* InParameters)
+@@ -770,7 +771,7 @@ static void VelaLiveDx11(IFeature_Dx11* feature, unsigned int handleId, NVSDK_NG
+     const bool noDepth = isFsr4 && !fsr4Down && velaDepth == nullptr;
+     const Upscaler iniUp = Config::Instance()->Dx11Upscaler.value_or_default();
+     const Upscaler want = m == VelaLive::Model::Sgsr2 || fsr4Down || noDepth ? Upscaler::SGSR2_on12
+-                          : m == VelaLive::Model::Fsr3                       ? Upscaler::FFX_on12
++                          : VelaLive::IsFfx(m)                               ? Upscaler::FFX_on12
+                           : isFsr4                                           ? Upscaler::SGSR3_on12
+                           : iniUp == Upscaler::SGSR3_on12                    ? Upscaler::SGSR2_on12
+                                                                              : iniUp;
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 84029a2..2712027 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -1169,7 +1169,7 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
+         }
+         const Upscaler iniUp = cfg.Dx12Upscaler.value_or_default();
+         const Upscaler want = m == VelaLive::Model::Sgsr2 || fsr4Down || noDepth ? Upscaler::SGSR2
+-                              : m == VelaLive::Model::Fsr3            ? Upscaler::FFX
++                              : VelaLive::IsFfx(m)                    ? Upscaler::FFX  // 0036: and dittosr
+                               : isFsr4                                ? Upscaler::SGSR3
+                               : iniUp == Upscaler::SGSR3              ? Upscaler::SGSR2
+                                                                       : iniUp;
+diff --git a/OptiScaler/proxies/FfxApi_Proxy.h b/OptiScaler/proxies/FfxApi_Proxy.h
+index e217f10..fce0fcc 100644
+--- a/OptiScaler/proxies/FfxApi_Proxy.h
++++ b/OptiScaler/proxies/FfxApi_Proxy.h
+@@ -92,6 +92,13 @@ class FfxApiProxy
+ 
+     inline static bool _skipDestroyCalls = false;
+ 
++    // Vela 0036: DittoSR, the live model dittosr (InitDittoSRDx12 below)
++    inline static FfxModule dittosr_dx12;
++    inline static bool dittosrTried = false;
++    inline static bool dittosrRoute = false;
++    inline static std::string dittosrWhy;
++    inline static ankerl::unordered_dense::set<ffxContext> dittosrContexts;
++
+     static bool IsLoader(const std::wstring& filePath)
+     {
+         auto size = std::filesystem::file_size(filePath);
+@@ -367,6 +374,10 @@ class FfxApiProxy
+ 
+         spdlog::info("");
+ 
++        // Vela 0036: DittoSR's module has the same file name; it is never the SR module and never hooked
++        if (module != nullptr && module == dittosr_dx12.dll)
++            module = nullptr;
++
+         // This is module loaded by game, need to hook it to use inputs
+         if (module != nullptr && upscaling_dx12_hooked.dll == nullptr)
+         {
+@@ -397,6 +408,12 @@ class FfxApiProxy
+                     Util::LoadProxyLibrary(dllNames[i], optiPath, overridePath, &memModule, &upscaling_dx12.dll);
+                 }
+ 
++                // Vela 0036: GetModuleHandle by the file name can answer DittoSR's module
++                if (dittosr_dx12.dll != nullptr && upscaling_dx12_hooked.dll == dittosr_dx12.dll)
++                    upscaling_dx12_hooked.dll = nullptr;
++                if (dittosr_dx12.dll != nullptr && upscaling_dx12.dll == dittosr_dx12.dll)
++                    upscaling_dx12.dll = nullptr;
++
+                 if (upscaling_dx12.dll != nullptr)
+                 {
+                     break;
+@@ -1187,6 +1204,16 @@ class FfxApiProxy
+ 
+         ffxReturnCode_t result = FFX_API_RETURN_ERROR;
+ 
++        // Vela 0036: the upscaler context of a DittoRoute goes to DittoSR's module
++        if (dittosrRoute && type == FFXStructType::Upscaling && dittosr_dx12.CreateContext != nullptr)
++        {
++            result = dittosr_dx12.CreateContext(context, desc, memCb);
++            if (result == FFX_API_RETURN_OK && *context != nullptr)
++                dittosrContexts.insert(*context);
++            LOG_DEBUG("Created with dittosr_dx12: {:X} ({})", (size_t) *context, (UINT) result);
++            return result;
++        }
++
+         if (isFg && fg_dx12.dll != nullptr)
+         {
+             LOG_DEBUG("Creating with fg_dx12");
+@@ -1250,6 +1277,14 @@ class FfxApiProxy
+         ffxReturnCode_t result = FFX_API_RETURN_ERROR;
+         auto type = FFXStructType::Unknown;
+ 
++        // Vela 0036: a context DittoSR made goes back to it
++        if (context != nullptr && dittosrContexts.contains(*context))
++        {
++            dittosrContexts.erase(*context);
++            LOG_DEBUG("Destroying with dittosr_dx12");
++            return dittosr_dx12.DestroyContext(context, memCb);
++        }
++
+         if (contextToType.contains(*context))
+         {
+             type = contextToType[*context];
+@@ -1348,6 +1383,9 @@ class FfxApiProxy
+ 
+     static ffxReturnCode_t D3D12_Configure(ffxContext* context, const ffxConfigureDescHeader* desc)
+     {
++        if (context != nullptr && dittosrContexts.contains(*context)) // Vela 0036
++            return dittosr_dx12.Configure(context, desc);
++
+         auto type = GetType(desc->type);
+ 
+         if (type == FFXStructType::General && contextToType.contains(*context))
+@@ -1390,6 +1428,11 @@ class FfxApiProxy
+     static ffxReturnCode_t D3D12_Query(ffxContext* context, ffxQueryDescHeader* desc)
+     {
+         auto type = GetIndirectType(desc);
++
++        // Vela 0036: DittoSR's contexts, and the version query of a DittoRoute
++        if ((context != nullptr && dittosrContexts.contains(*context)) ||
++            (context == nullptr && dittosrRoute && type == FFXStructType::Upscaling && dittosr_dx12.Query != nullptr))
++            return dittosr_dx12.Query(context, desc);
+         auto isFg = type == FFXStructType::FG || type == FFXStructType::SwapchainDX12;
+ 
+         if (isFg && fg_dx12.dll != nullptr)
+@@ -1426,6 +1469,9 @@ class FfxApiProxy
+ 
+     static ffxReturnCode_t D3D12_Dispatch(ffxContext* context, const ffxDispatchDescHeader* desc)
+     {
++        if (context != nullptr && dittosrContexts.contains(*context)) // Vela 0036
++            return dittosr_dx12.Dispatch(context, desc);
++
+         auto type = GetType(desc->type);
+         auto isFg = type == FFXStructType::FG || type == FFXStructType::SwapchainDX12;
+ 
+@@ -1461,6 +1507,105 @@ class FfxApiProxy
+         return FFX_API_RETURN_NO_PROVIDER;
+     }
+ 
++    // ---------------------------------------------------------------- Vela 0036: DittoSR (live model dittosr)
++    // DittoSR (github.com/Vancete/DittoSR, MIT) is an FFX API upscaler provider ("FSR 3.1.5 API"). Its
++    // amd_fidelityfx_dx12.dll, renamed amd_fidelityfx_upscaler_dx12.dll, is a module of its own: loaded once, lazily,
++    // from VELA_DITTOSR_DIR or <folder of OptiScaler's DLL>\dittosr\ (then <MainDllPath>\dittosr\), never the game's or
++    // AMD's SR module and never hooked, so fsr3 keeps AMD's FSR 3.1 and the panel switches fsr3 <-> dittosr in one
++    // session. The contexts it made go back to it (Configure / Query / Dispatch / Destroy above); the create and the
++    // version query go to it while a DittoRoute lives (FFXFeature_Dx12.cpp InitFFX).
++    struct DittoRoute
++    {
++        bool on;
++        explicit DittoRoute(bool o) : on(o)
++        {
++            if (on)
++                dittosrRoute = true;
++        }
++        ~DittoRoute()
++        {
++            if (on)
++                dittosrRoute = false;
++        }
++    };
++
++    static std::wstring DittoSRDx12_Path() { return dittosr_dx12.filePath; }
++    static const std::string& DittoSRDx12_Why() { return dittosrWhy; }
++
++    static bool InitDittoSRDx12()
++    {
++        if (dittosrTried)
++            return dittosr_dx12.CreateContext != nullptr;
++        dittosrTried = true;
++
++        const std::wstring name = L"amd_fidelityfx_upscaler_dx12.dll";
++        std::vector<std::filesystem::path> dirs;
++        if (const char* e = std::getenv("VELA_DITTOSR_DIR"); e != nullptr && e[0] != 0)
++            dirs.push_back(std::filesystem::path(string_to_wstring(e)));
++        else
++        {
++            wchar_t own[MAX_PATH] {};
++            const DWORD n = GetModuleFileNameW(dllModule, own, MAX_PATH);
++            if (n > 0 && n < MAX_PATH)
++                dirs.push_back(std::filesystem::path(own).parent_path() / L"dittosr");
++            if (Config::Instance()->MainDllPath.has_value())
++            {
++                const auto d = std::filesystem::path(Config::Instance()->MainDllPath.value()) / L"dittosr";
++                if (dirs.empty() || d.lexically_normal() != dirs[0].lexically_normal())
++                    dirs.push_back(d);
++            }
++        }
++
++        std::filesystem::path file;
++        std::error_code ec;
++        for (const auto& d : dirs)
++        {
++            file = (d / name).make_preferred();
++            if (std::filesystem::exists(file, ec))
++                break;
++        }
++        if (file.empty())
++            dittosrWhy = "no folder (VELA_DITTOSR_DIR unset and OptiScaler's DLL folder unknown)";
++        else if (!std::filesystem::exists(file, ec))
++            dittosrWhy = "no file";
++        else
++        {
++            dittosr_dx12.dll = NtdllProxy::LoadLibraryExW_Ldr(file.c_str(), NULL, 0);
++            if (dittosr_dx12.dll == nullptr)
++                dittosrWhy = "load failed (error " + std::to_string(GetLastError()) + ")";
++            else if (dittosr_dx12.dll == upscaling_dx12.dll || dittosr_dx12.dll == main_dx12.dll)
++            {
++                dittosrWhy = "the loader answered with the AMD module already loaded";
++                dittosr_dx12.dll = nullptr;
++            }
++            else
++            {
++                auto gpa = KernelBaseProxy::GetProcAddress_();
++                dittosr_dx12.Configure = (PfnFfxConfigure) gpa(dittosr_dx12.dll, "ffxConfigure");
++                dittosr_dx12.CreateContext = (PfnFfxCreateContext) gpa(dittosr_dx12.dll, "ffxCreateContext");
++                dittosr_dx12.DestroyContext = (PfnFfxDestroyContext) gpa(dittosr_dx12.dll, "ffxDestroyContext");
++                dittosr_dx12.Dispatch = (PfnFfxDispatch) gpa(dittosr_dx12.dll, "ffxDispatch");
++                dittosr_dx12.Query = (PfnFfxQuery) gpa(dittosr_dx12.dll, "ffxQuery");
++                if (dittosr_dx12.Configure == nullptr || dittosr_dx12.CreateContext == nullptr ||
++                    dittosr_dx12.DestroyContext == nullptr || dittosr_dx12.Dispatch == nullptr ||
++                    dittosr_dx12.Query == nullptr)
++                {
++                    dittosrWhy = "not an FFX API provider (an ffx* export is missing)";
++                    dittosr_dx12.CreateContext = nullptr;
++                    dittosr_dx12.Query = nullptr;
++                }
++            }
++        }
++
++        dittosr_dx12.filePath = file.wstring();
++        if (dittosr_dx12.CreateContext != nullptr)
++            LOG_INFO("Vela: DittoSR loaded from {}", wstring_to_string(dittosr_dx12.filePath));
++        else
++            LOG_WARN("Vela: DittoSR not loaded from {}: {}",
++                     file.empty() ? std::string("-") : wstring_to_string(dittosr_dx12.filePath), dittosrWhy);
++        return dittosr_dx12.CreateContext != nullptr;
++    }
++
+     static HMODULE VkModule() { return main_vk.dll; }
+     static std::wstring VkModule_Path() { return main_vk.filePath; }
+ 
+diff --git a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
+index c83462d..a585f2c 100644
+--- a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
++++ b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
+@@ -23,6 +23,10 @@ FFXFeatureDx12::FFXFeatureDx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InP
+ 
+     _moduleLoaded = FfxApiProxy::IsSRReady();
+ 
++    // Vela 0036: the live model dittosr needs only DittoSR's own module
++    if (!_moduleLoaded && VelaLive::Poll().model == VelaLive::Model::DittoSR && FfxApiProxy::InitDittoSRDx12())
++        _moduleLoaded = true;
++
+     if (_moduleLoaded)
+         LOG_INFO("amd_fidelityfx_dx12.dll methods loaded!");
+     else
+@@ -630,7 +634,18 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+ {
+     LOG_FUNC();
+ 
+-    if (!ModuleLoaded())
++    // Vela 0036: live model dittosr -- the context comes from DittoSR's own module (FfxApiProxy::InitDittoSRDx12);
++    // when it cannot load or make the context, FSR 3 (AMD) as for fsr3, with one "cannot run" line
++    const VelaLive::Model velaModel = VelaLive::Poll().model;
++    bool ditto = velaModel == VelaLive::Model::DittoSR && !IsInited();
++    if (ditto && !FfxApiProxy::InitDittoSRDx12())
++    {
++        LOG_WARN("Vela live: dittosr cannot run in this game ({}: {}); FSR 3 instead",
++                 wstring_to_string(FfxApiProxy::DittoSRDx12_Path()), FfxApiProxy::DittoSRDx12_Why());
++        ditto = false;
++    }
++
++    if (!ditto && !FfxApiProxy::IsSRReady(false))
+         return false;
+ 
+     if (IsInited())
+@@ -642,17 +657,20 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+         return false;
+     }
+ 
++    for (;;)
+     {
+         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
++        FfxApiProxy::DittoRoute dittoRoute(ditto);
+ 
+-        // Vela: the FSR SDK sees an RDNA3 adapter while it picks its model (FSR 4 INT8 forced, not AMD)
++        // Vela: the FSR SDK sees an RDNA3 adapter while it picks its model (FSR 4 INT8 forced, not AMD; not for
++        // DittoSR)
+         const auto gpu = IdentifyGpu::getPrimaryGpu();
+         struct VelaAmd
+         {
+             bool on;
+             explicit VelaAmd(bool o) : on(o) { if (on) VelaLive::AmdForFfx = true; }
+             ~VelaAmd() { if (on) VelaLive::AmdForFfx = false; }
+-        } velaAmd(gpu.vendorId != VendorId::AMD && gpu.fsr4Support == FSR4Support::INT8);
++        } velaAmd(!ditto && gpu.vendorId != VendorId::AMD && gpu.fsr4Support == FSR4Support::INT8);
+ 
+         QueryVersionsDx12(Device);
+ 
+@@ -677,9 +695,33 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+             }
+         }
+ 
++        // Vela 0036: dittosr takes DittoSR's upscaler (the version named DittoSR, else its first)
++        if (ditto)
++        {
++            auto& names = State::Instance().ffxUpscalerVersionNames;
++            int pick = names.empty() ? -1 : 0;
++            for (size_t i = 0; i < names.size(); i++)
++                if (names[i] != nullptr && std::string(names[i]).find("DittoSR") != std::string::npos)
++                {
++                    pick = (int) i;
++                    break;
++                }
++            if (pick < 0)
++            {
++                LOG_WARN("Vela live: dittosr cannot run in this game ({}: no upscaler version); FSR 3 instead",
++                         wstring_to_string(FfxApiProxy::DittoSRDx12_Path()));
++                ditto = false;
++                if (!FfxApiProxy::IsSRReady(false))
++                    return false;
++                continue;
++            }
++            Config::Instance()->FfxUpscalerIndex.set_volatile_value(pick);
++            LOG_INFO("Vela: FFX upscaler index {} ({}) for DittoSR", pick, names[pick] != nullptr ? names[pick] : "");
++        }
++
+         // Vela live model fsr3 (VelaLive.h): FSR 3.1 -- the newest 3.x upscaler the FidelityFX DLL offers (with FSR 4
+-        // INT8 forced the block above would take 4.x)
+-        if (VelaLive::Poll().model == VelaLive::Model::Fsr3)
++        // INT8 forced the block above would take 4.x); 0036: also dittosr that could not run
++        else if (VelaLive::IsFfx(velaModel))
+         {
+             auto& names = State::Instance().ffxUpscalerVersionNames;
+             int best3 = -1;
+@@ -726,6 +768,16 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+ 
+             if (ret != FFX_API_RETURN_OK)
+             {
++                if (ditto)
++                {
++                    LOG_WARN("Vela live: dittosr cannot run in this game ({}: _createContext error {}); FSR 3 instead",
++                             wstring_to_string(FfxApiProxy::DittoSRDx12_Path()), FfxApiProxy::ReturnCodeToString(ret));
++                    _context = nullptr;
++                    ditto = false;
++                    if (!FfxApiProxy::IsSRReady(false))
++                        return false;
++                    continue;
++                }
+                 LOG_ERROR("_createContext error: {0}", FfxApiProxy::ReturnCodeToString(ret));
+                 return false;
+             }
+@@ -733,8 +785,18 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+ 
+         auto version =
+             State::Instance().ffxUpscalerVersionNames[Config::Instance()->FfxUpscalerIndex.value_or_default()];
+-        _name = "FSR";
++        _name = ditto ? "DittoSR" : "FSR";
+         parse_version(version);
++        if (ditto)
++        {
++            // "DittoSR (FSR 3.1.5 API) 0.5.4" -> "0.5.4"
++            std::string v = version != nullptr ? version : "";
++            if (const size_t sp = v.find_last_of(' '); v.rfind("DittoSR", 0) == 0 && sp != std::string::npos)
++                v = v.substr(sp + 1);
++            LOG_INFO("Vela live: handle {} model dittosr -> DittoSR {} (FFX provider {})",
++                     Handle() != nullptr ? Handle()->Id : 0u, v, wstring_to_string(FfxApiProxy::DittoSRDx12_Path()));
++        }
++        break;
+     }
+ 
+     SetInit(true);
+diff --git a/OptiScaler/upscalers/sgsr3/VelaLive.h b/OptiScaler/upscalers/sgsr3/VelaLive.h
+index 154a820..17e3087 100644
+--- a/OptiScaler/upscalers/sgsr3/VelaLive.h
++++ b/OptiScaler/upscalers/sgsr3/VelaLive.h
+@@ -7,6 +7,10 @@
+ //                          Vela AI when it cannot run); fsr4lite = FSR 4.1.2 Lite on the same provider (0.7.0);
+ //                          fsr3 = FSR 3.1 (Vela 0.8.2+): OptiScaler's FFX backend with the amd_fidelityfx_dx12.dll in
+ //                          the game folder (FFXFeature_Dx12.cpp takes its newest 3.x upscaler);
++//                          dittosr = DittoSR (Vela 0036, github.com/Vancete/DittoSR, an FFX API provider, "FSR 3.1.5
++//                          API") on the same FFX backend through a module of its own (FfxApi_Proxy.h InitDittoSRDx12:
++//                          VELA_DITTOSR_DIR or <OptiScaler's DLL folder>\dittosr\amd_fidelityfx_upscaler_dx12.dll);
++//                          fsr3 when that cannot load or make its context;
+ //                          a change re-creates the upscaler (NVNGX_DLSS_Dx12.cpp)
+ //   npu=0|1|2           FSR 4.1 Lite network on the Hexagon NPU (VK_LAYER_VELA_npu): 0 off, 1 exact, 2 async (one frame
+ //                       late); absent = 0; a change re-creates the context (needs lossy=1)
+@@ -41,7 +45,8 @@ enum class Model
+     Fsr4,
+     Fsr4Lite,
+     Fsr3,
+-    Fsr4Fast  // Vela 0.8.16: "FSR 4 Fast" = fsr4 on the same provider, which reads model=fsr4fast at context create
++    Fsr4Fast, // Vela 0.8.16: "FSR 4 Fast" = fsr4 on the same provider, which reads model=fsr4fast at context create
++    DittoSR   // Vela 0036: DittoSR on the FFX backend (its own provider module), fsr3 when it cannot run
+ };
+ 
+ struct Values
+@@ -67,9 +72,11 @@ inline bool& Fsr4Failed()
+ 
+ // Vela 0.8.16: fsr4fast runs wherever fsr4 runs (the SGSR 3 feature's FSR 4 VK bridge, SGSR 2 when it cannot)
+ inline bool IsFsr4Full(Model m) { return m == Model::Fsr4 || m == Model::Fsr4Fast; }
++// Vela 0036: fsr3 and dittosr both run on the FFX backend (FFX in DX12, FFX_on12 in DX11)
++inline bool IsFfx(Model m) { return m == Model::Fsr3 || m == Model::DittoSR; }
+ inline const char* ModelName(Model m)
+ {
+-    return m == Model::Ai ? "ai" : m == Model::P2b ? "p2b" : m == Model::Sr ? "sr" : m == Model::Sgsr2 ? "sgsr2" : m == Model::Fsr4 ? "fsr4" : m == Model::Fsr4Lite ? "fsr4lite" : m == Model::Fsr3 ? "fsr3" : m == Model::Fsr4Fast ? "fsr4fast" : "-";
++    return m == Model::Ai ? "ai" : m == Model::P2b ? "p2b" : m == Model::Sr ? "sr" : m == Model::Sgsr2 ? "sgsr2" : m == Model::Fsr4 ? "fsr4" : m == Model::Fsr4Lite ? "fsr4lite" : m == Model::Fsr3 ? "fsr3" : m == Model::Fsr4Fast ? "fsr4fast" : m == Model::DittoSR ? "dittosr" : "-";
+ }
+ 
+ inline std::string Path()
+@@ -107,13 +114,14 @@ inline Values Parse(const std::string& text)
+         const std::string k = line.substr(0, eq), s = line.substr(eq + 1);
+         const float f = (float) atof(s.c_str());
+         if (k == "model")
+-            // Vela 0.8.13: the live models are fsr4, fsr4lite, fsr3 and sgsr2; the removed Vela AI / Vela SR keys
+-            // of an older live file (ai, p2b, sr, student) mean SGSR 2
++            // Vela 0.8.13: the live models are fsr4, fsr4lite, fsr3 and sgsr2 (0036: and dittosr); the removed Vela
++            // AI / Vela SR keys of an older live file (ai, p2b, sr, student) mean SGSR 2
+             v.model = s == "ai" || s == "p2b" || s == "sr" || s == "student" || s == "sgsr2" ? Model::Sgsr2
+                       : s == "fsr4"  ? Model::Fsr4
+                       : s == "fsr4fast" ? Model::Fsr4Fast
+                       : s == "fsr4lite" ? Model::Fsr4Lite
+                       : s == "fsr3"  ? Model::Fsr3
++                      : s == "dittosr" ? Model::DittoSR
+                                      : Model::Unset;
+         else if (k == "ratio")
+             v.ratio = s == "game" ? 0.0f : (f >= 1.0f && f <= 6.0f ? f : -1.0f);
+-- 
+2.54.0.windows.1
+

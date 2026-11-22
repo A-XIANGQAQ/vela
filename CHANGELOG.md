@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.23 — 2026-11-22
+
+- **DirectX 11 games get FSR 4.** FSR 4, FSR 4 Fast, FSR 3 and SGSR 2 now work in DirectX 11 games, the same as in DirectX 12, and switch while you play. Checked in Ghostrunner and Bright Memory: Infinite.
+- **Unreal games that only have their own FSR 2 in DirectX 11** (Bright Memory: Infinite with -dx11) now run Vela's upscaler instead of it.
+- **New model: DittoSR.** A sharp upscaler without a neural network, as fast as SGSR 2, offered wherever FSR 3 is (DirectX 12 and DirectX 11 games). By Vancete, github.com/Vancete/DittoSR.
+- Games with a 24-bit or 16-bit depth buffer no longer fall back to SGSR 2 when FSR 4 is picked. This was the cause in a Kingdom Come: Deliverance II report; the game itself wasn't retested here.
+- Bright Memory: Infinite no longer crashes at start in DirectX 11 with Vela on.
+- DirectX 11 games no longer show a black or white picture with FSR 4.
+- Games that send motion vectors in a signed 16-bit format are accepted.
+- Non-Steam shortcuts made by Heroic and Lutris are supported.
+- When a model can't run in a game, the panel says why and what runs instead.
+- Reports say which part of the game crashed, so crashes can be traced.
+- Known issues: Vulkan games get nothing from Vela yet; work on it has started. Some games crash early on Snapdragon 8 Elite devices (Witcher 3, Monster Hunter Rise, Tokyo Xtreme Racer, PRAGMATA); the new crash reports should show why. On some Retroid Pocket 6 units the NPU part's check fails (github.com/zrprod9-cmyk/vela/issues/2), being worked on. Clair Obscur: Expedition 33 scenes without a depth buffer still use FSR 1; picking FSR 3.1 or DLSS in the game's menu instead of XeSS may avoid it. Cyberpunk 2077 with FSR 4 Fast: black rectangles on 8 Elite, not seen on 8 Gen 2, not solved.
+
 ## 0.8.22 — 2026-11-16
 
 Mostly fixes from player reports.

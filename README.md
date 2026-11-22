@@ -16,7 +16,7 @@
 
 **Vela** is a [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) plugin for **armadaOS** on Snapdragon handhelds.
 It replaces a game's own upscaler (DLSS, FSR 2/3 or XeSS) with **FSR 4**, which runs on the handheld's **Hexagon NPU**, or with
-**FSR 4 Fast**, **FSR 3** or **SGSR 2**. You pick the model per game in the Quick Access panel.
+**FSR 4 Fast**, **FSR 3**, **DittoSR** or **SGSR 2**, in DirectX 12 and DirectX 11 games. You pick the model per game in the Quick Access panel.
 
 <p align="center">
   <a href="docs/compare.png"><img src="docs/compare.png" alt="Bright Memory: Infinite on Retroid Pocket 6, five upscalers at the same spot" width="100%"></a>
@@ -38,6 +38,7 @@ It replaces a game's own upscaler (DLSS, FSR 2/3 or XeSS) with **FSR 4**, which 
 | **FSR 4** | AMD's FSR 4 network. Runs on the NPU when the Vela NPU part is installed, otherwise on the GPU |
 | **FSR 4 Fast** | the same network in a lighter mode, faster |
 | **FSR 3** | AMD FSR 3.1 |
+| **DittoSR** | Vancete's DittoSR, a sharp upscaler without a neural network, about as fast as SGSR 2 (DirectX 12 and 11 games) |
 | **SGSR 2** | Qualcomm Snapdragon Game Super Resolution 2, the lightest |
 | **Off** | the game as it was |
 
@@ -102,7 +103,7 @@ FSR 4 runs on the NPU at 1920x1080, 1600x900 and 1280x720, and at 1600x904, 1440
    switches while you play.
 3. **In the game's settings, choose the upscaler** the panel names (for example "choose FSR 3.1 or DLSS"). For Control,
    Resident Evil 4 and Deep Rock Galactic Vela does this for you.
-4. If Steam asks DX11 or DX12, choose **DX12**.
+4. If Steam asks DX11 or DX12, choose **DX12**. DirectX 11 works too, but DX12 is the better tested path.
 
 ## How it works
 
@@ -184,6 +185,7 @@ If Vela makes your games look better, you can [buy me a coffee](https://buymeaco
 - **justradical / Sloptiscaler**, the ARM64EC OptiScaler build our fork starts from: https://github.com/justradical/Sloptiscaler
 - **AMD** for FSR 4, FSR 3 and the FidelityFX SDK; **dvj5411/fsr4vk** for the Vulkan FSR 4 provider.
 - **Qualcomm** for Snapdragon Game Super Resolution.
+- **Vancete** for DittoSR: https://github.com/Vancete/DittoSR
 - **OptiPatcher**, **fakenvapi**, **LatencyFleX** (see the notices).
 - **armadaOS / Armada developers** and **Decky Loader**.
 

@@ -21,7 +21,7 @@ assert presets.default_model("fsr4", True, NPU_ON) == "fsr4"
 assert presets.default_model("static", True, NPU_ON) == "fsr4"
 assert presets.default_model("fsr4", True, NPU_OFF) == "fsr4fast" and presets.default_model("fsr4", True, None) == "fsr4fast"
 assert presets.default_model("fsr4", False, NPU_ON) == "sgsr2"
-assert presets.default_model("sgsr2", True, NPU_ON) == "sgsr2"  # DX11: OptiScaler's Dx11Upscaler is SGSR 2
+assert presets.default_model("sgsr2", True, NPU_ON) is None  # DX11FSR: no kind sgsr2 (a DX11 game is kind fsr4)
 assert presets.default_model("none") is None and presets.default_model("any") is None
 for k in presets.KINDS:  # whatever default it picks, the panel offers it for that kind
     assert presets.default_model(k, True, NPU_ON) in dict(presets.models_for(k, True, True))

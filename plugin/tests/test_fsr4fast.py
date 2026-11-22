@@ -18,9 +18,9 @@ NPU_ON = {"layer_found": True, "service": {"installed": True, "running": True}}
 
 assert "fsr4fast" in presets.MODELS and "fsr4fast" in presets.FSR4_MODELS
 assert presets.models_for("fsr4", fsr4=False)[1] == ("fsr4fast", False)  # no provider: neither FSR 4 nor Fast
-assert presets.models_for("sgsr2") == [("sgsr2", True)]  # DX11: SGSR 2 only
+assert presets.models_for("sgsr2") == []  # DX11FSR: no kind sgsr2, a DX11 game is kind fsr4 with FSR 4 Fast too
 assert presets.plan("static", {"model": "fsr4fast", "npu": 2}) == {"kind": "static", "model": "fsr4fast", "npu": True}
-assert presets.plan("sgsr2", {"model": "fsr4fast"})["model"] == "sgsr2"
+assert presets.plan("fsr4", {"model": "fsr4fast"})["model"] == "fsr4fast"  # DX11FSR: a DX11 game (kind fsr4) keeps FSR 4 Fast
 w = presets.live_wanted("fsr4fast", NPU_ON)
 assert w["model"] == "fsr4fast" and (w["npu"], w["npuexact"]) == (presets.live_wanted("fsr4", NPU_ON)["npu"], 1), w
 assert live.clean({"model": "fsr4fast"}) == {"model": "fsr4fast"}
@@ -90,10 +90,10 @@ assert (o["mode"], o["fsr4_fallback"], o["sgsr2_instead"]) == ("sgsr2", "failed"
 
 # panel: the fourth card, name + note (English only since 0.8.16), NPU status for Fast like FSR 4
 ts = open(os.path.join(HERE, "..", "src", "strings.ts"), encoding="utf-8").read()
-assert 'MODEL_IDS: ModelId[] = ["fsr4", "fsr4fast", "fsr3", "sgsr2"];' in ts  # NOFSR (2026-11-11): FSR 4 for any game out again
+assert 'MODEL_IDS: ModelId[] = ["fsr4", "fsr4fast", "fsr3", "dittosr", "sgsr2"];' in ts  # DITTO: + DittoSR  # NOFSR (2026-11-11): FSR 4 for any game out again
 en = open(os.path.join(HERE, "..", "src", "i18n", "en.json"), encoding="utf-8").read()  # EN: English texts only
 assert 'fsr4fast: "FSR 4 Fast"' in ts and re.search(r'"model.note.fsr4fast": "AMD neural network · [^"]+"', en)
-tsx = open(os.path.join(HERE, "..", "src", "index.tsx"), encoding="utf-8").read()
+tsx = open(os.path.join(HERE, "..", "src", "status.ts"), encoding="utf-8").read()  # PANELWHY: the status card's file
 assert 'L.mode === "fsr4" || L.mode === "fsr4fast"' in tsx
 print("test_fsr4fast OK")
 assert "427567f6d2c7abe12ca170f7bf603814" in sgsr3.OLD_STATIC_DXGI  # the 0.8.15 RE4 interceptor is replaced by the Fast-aware one

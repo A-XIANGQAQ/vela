@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "py_modules"))
 import live  # noqa: E402
 import presets  # noqa: E402
 
-assert presets.MODELS == ("fsr4", "fsr4fast", "fsr3", "sgsr2") and presets.FSR4_MODELS == ("fsr4", "fsr4fast")  # 0.8.16: + FSR 4 Fast
+assert presets.MODELS == ("fsr4", "fsr4fast", "fsr3", "dittosr", "sgsr2") and presets.FSR4_MODELS == ("fsr4", "fsr4fast")  # 0.8.16: + FSR 4 Fast
 assert presets.RETIRED_MODELS == {"fsr4lite": "fsr4"}
 assert "lossy" not in live.clean({"lossy": 4, "model": "fsr4"}) and live.clean({"model": "fsr4lite"}) == {"model": "fsr4"}
 assert not hasattr(live, "LOSSY") and not hasattr(live, "LOSSY_DEFAULT")

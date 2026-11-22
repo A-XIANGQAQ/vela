@@ -7,6 +7,8 @@ instead. What is installed into the exe folder:
   OptiScaler/plugins/OptiPatcher.asi   opens the DLSS input of UE games on a non-NVIDIA GPU without spoofing
   amd_fidelityfx_dx12.dll              FidelityFX SDK 1.1.4 (MIT): FSR 3.1 (live model "fsr3"), only when the game has none
                                        of its own (V10). NOFG (2026-11-15): no longer for frame generation (SGSR-FG is out)
+  dittosr/amd_fidelityfx_upscaler_dx12.dll, dittosr/dittosr.ini
+                                       DittoSR 0.5.4 (MIT): live model "dittosr" (0.8.23), with FSR 3
 Everything that was there before is copied to <exe dir>/.upscale-sgsr3/backup first; state.json there lists what
 existed, so disable() puts the old files back and removes the ones that were not there. OptiScaler.log written
 while SGSR 3 was on is moved to the plugin's settings folder.
@@ -29,6 +31,7 @@ import re
 import shutil
 import time
 
+import launchers
 import launchopts
 import velakit
 import npu
@@ -100,10 +103,22 @@ FSR4VK = "amd_fidelityfx_upscaler_vk.dll"
 # amd_fidelityfx_dx12.dll from the exe folder and takes its newest 3.x upscaler (SDK 1.1.4: FSR 3.1.4). The live switch
 # needs the DLL there before the game starts, so with a fork that has 0014 (VERSION.json "fsr3_live") ours goes in
 # whenever the game has none of its own; a game's own copy stays (its FSR 3.1 runs)
-INSTALLED = ["dxgi.dll", "OptiScaler.ini", "OptiScaler/plugins/OptiPatcher.asi", FFX_DLL, AMDXC, FSR4VK]
-OPTIONAL = {FFX_DLL, AMDXC, FSR4VK}    # only while FSR 3 / FSR 4 needs them; otherwise what the game had stays
+# DITTO (0.8.23, owner 2026-11-22 «Дито добавляй в основу»): DittoSR 0.5.4 (github.com/Vancete/DittoSR, MIT), a FidelityFX-API
+# upscaler, is the live model "dittosr" next to FSR 3. The fork loads it from OptiScaler's own folder (the exe folder / the kit's
+# files/): dittosr/amd_fidelityfx_upscaler_dx12.dll (DittoSR's build/amd_fidelityfx_dx12.dll renamed) with its settings
+# dittosr/dittosr.ini beside it; it cannot load it -> FSR 3 runs and the log says "Vela live: dittosr cannot run ... instead".
+# Both files go in whenever FSR 3 can be a model (fsr3_available) and the plugin carries them (assets/sgsr3/dittosr/)
+DITTO_DIR = "dittosr"
+DITTO_DLL = DITTO_DIR + "/amd_fidelityfx_upscaler_dx12.dll"
+DITTO_INI = DITTO_DIR + "/dittosr.ini"
+DITTO_FILES = (DITTO_DLL, DITTO_INI)
+INSTALLED = ["dxgi.dll", "OptiScaler.ini", "OptiScaler/plugins/OptiPatcher.asi", FFX_DLL, AMDXC, FSR4VK, DITTO_DLL, DITTO_INI]
+OPTIONAL = {FFX_DLL, AMDXC, FSR4VK, DITTO_DLL, DITTO_INI}  # only while FSR 3 / FSR 4 / DittoSR needs them; otherwise what the game had stays
 RUNTIME = ["OptiScaler.log"]          # written by OptiScaler while the game runs
-ASSET_OF = {"dxgi.dll": "OptiScaler.dll", "OptiScaler/plugins/OptiPatcher.asi": "OptiPatcher.asi", FFX_DLL: FFX_DLL}
+ASSET_OF = {"dxgi.dll": "OptiScaler.dll", "OptiScaler/plugins/OptiPatcher.asi": "OptiPatcher.asi", FFX_DLL: FFX_DLL,
+            DITTO_DLL: DITTO_DLL, DITTO_INI: DITTO_INI}
+# folders Vela may create in a copy setup (removed again on Off when empty)
+OUR_DIRS = ("OptiScaler", "OptiScaler/plugins", DITTO_DIR)
 REQUIRED_ASSETS = ("OptiScaler.dll", "OptiScaler.ini", "OptiPatcher.asi")
 # 0.4.7: games whose FSR 2 is built into the exe (Resident Evil 4): our own interceptor instead of OptiScaler
 #, assets/staticfsr/dxgi.dll, no ini; profiles.py "static_fsr2". Its log next to the exe.
@@ -259,6 +274,8 @@ def static_log_summary(path, since=0.0):
             "fsr4_version": fsr4[-1][0] if mode in presets.FSR4_MODELS and fsr4 else None,
             "fsr3_version": "3.1" if mode == "fsr3" else None,
             "fsr4_fallback": "failed" if want in presets.FSR4_MODELS and mode not in presets.FSR4_MODELS and (refused or to_fsr2) else None,
+            "fsr4_why": fsr4_why(seg) if want in presets.FSR4_MODELS and mode not in presets.FSR4_MODELS and (refused or to_fsr2)
+            else None,
             "fsr3_fallback": "failed" if want == "fsr3" and mode != "fsr3" and (refused or to_fsr2) else None,
             "sgsr2_fallback": "failed" if want == "sgsr2" and mode != "sgsr2" and (refused or to_fsr2) else None,
             "not_offered": not_offered,
@@ -650,8 +667,37 @@ def shortcuts(home):
                 if not isinstance(low.get("appid"), int):
                     continue
                 out.append({"appid": str(low["appid"] & 0xFFFFFFFF), "name": str(low.get("appname") or ""),
-                            "exe": _unquote(low.get("exe")), "start_dir": _unquote(low.get("startdir"))})
+                            "exe": _unquote(low.get("exe")), "start_dir": _unquote(low.get("startdir")),
+                            "options": str(low.get("launchoptions") or "")})
     return out
+
+
+def compat_tools(home):
+    """NONSTEAM: the compatibility tool Steam runs each app with ({appid: tool name}, e.g. "proton_9", "GE-Proton9-20"),
+    from <Steam>/config/config.vdf (InstallConfigStore/Software/Valve/Steam/CompatToolMapping). A shortcut's key is its
+    unsigned appid; "0" is the default for Steam games, which shortcuts do not get."""
+    out = {}
+    for root in (os.path.join(home, ".local/share/Steam"), os.path.join(home, ".steam/steam")):
+        try:
+            with open(os.path.join(root, "config", "config.vdf"), encoding="utf-8", errors="replace") as f:
+                node = parse_vdf(f.read())
+        except OSError:
+            continue
+        for key in ("installconfigstore", "software", "valve", "steam", "compattoolmapping"):
+            node = next((v for k, v in node.items() if k.lower() == key and isinstance(v, dict)), {}) \
+                if isinstance(node, dict) else {}
+        for appid, e in node.items():
+            if isinstance(e, dict) and e.get("name") and appid not in out:
+                out[appid] = e["name"]
+    return out
+
+
+def is_pe(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except OSError:
+        return False
 
 
 def _inside(path, folder):
@@ -661,25 +707,61 @@ def _inside(path, folder):
         return False
 
 
-def shortcut_install(home, appid):
-    """(game folder, name, windows) of a non-Steam shortcut, or (None, None, False) when it is not there (a card taken out).
-    Only a shortcut to a Windows .exe is a game folder to scan: its Start In folder when the exe is inside it, else the
-    exe's folder. A shortcut to anything else (an emulator's AppImage, flatpak, a script; on armadaOS Start In may be the
-    home folder) is a Linux program: its folder is given without a scan, so another game's exe nearby is never taken."""
-    want = str(int(appid) & 0xFFFFFFFF)
-    for sc in shortcuts(home):
-        if sc["appid"] != want:
-            continue
-        exe, start = sc["exe"], sc["start_dir"]
-        exe_dir = os.path.dirname(exe) if exe else ""
-        if not exe.lower().endswith(".exe"):
-            d = exe_dir if exe_dir and os.path.isdir(exe_dir) else start if start and os.path.isdir(start) else None
-            return (d, sc["name"], False) if d else (None, None, False)
+WINDOWS_SCRIPTS = (".exe", ".bat", ".cmd", ".lnk")
+
+
+def shortcut_game(home, appid):
+    """NONSTEAM: what a non-Steam shortcut runs, or None when Steam has no such shortcut:
+    {"name", "dir", "windows", "launcher", "prefix", "compat_tool"}.
+    - A shortcut to a Windows program (an .exe, or a .bat / .lnk / PE file Steam runs through a compatibility tool): its
+      Start In folder when the exe is inside it, else the exe's folder; an Unreal *-Win64-Shipping.exe with Steam's own
+      Start In (its folder) gives the game's root, where Unreal keeps the upscaler plugins (launchers.game_root).
+    - A shortcut that starts a launcher (Heroic, Lutris; launchers.detect): the game folder from the launcher's own config
+      (launchers.game); "launcher" names it. Without a config entry dir is None: Vela cannot see the game's folder.
+    - A shortcut to anything else (an emulator's AppImage, flatpak, a script; on armadaOS Start In may be the home folder)
+      is a Linux program: its folder is given without a scan, so another game's exe nearby is never taken.
+    dir is None when the folder is not there (a card taken out)."""
+    try:
+        want = str(int(appid) & 0xFFFFFFFF)
+    except (TypeError, ValueError):
+        return None
+    sc = next((x for x in shortcuts(home) if x["appid"] == want), None)
+    if sc is None:
+        return None
+    tool = compat_tools(home).get(want, "")
+    out = {"name": sc["name"], "dir": None, "windows": False, "launcher": None, "prefix": None, "compat_tool": tool}
+    exe, start = sc["exe"], sc["start_dir"]
+    exe_dir = os.path.dirname(exe) if exe else ""
+    found = launchers.detect(exe, sc["options"])
+    if found:
+        kind, ident = found
+        g = launchers.game(home, kind, ident)
+        out["launcher"] = kind
+        if g:
+            out.update({"dir": g["dir"], "windows": g["windows"], "prefix": g["prefix"]})
+        return out
+    if exe.lower().endswith(".exe") or tool and (exe.lower().endswith(WINDOWS_SCRIPTS) or is_pe(exe)):
+        if start and os.path.normcase(os.path.normpath(start)) == os.path.normcase(os.path.normpath(exe_dir)):
+            start = launchers.game_root(exe)  # Steam's own Start In; an Unreal exe's root when it is one
         for d in ((start,) if start and _inside(exe, start) else ()) + (exe_dir,):
             if d and os.path.isdir(d):
-                return d, sc["name"], True
+                out.update({"dir": d, "windows": True})
+                break
+        if tool:
+            pfx = os.path.join(home, ".local", "share", "Steam", "steamapps", "compatdata", want, "pfx")
+            out["prefix"] = pfx if os.path.isdir(pfx) else None
+        return out
+    d = exe_dir if exe_dir and os.path.isdir(exe_dir) else start if start and os.path.isdir(start) else None
+    out["dir"] = d
+    return out
+
+
+def shortcut_install(home, appid):
+    """(game folder, name, windows) of a non-Steam shortcut (shortcut_game), or (None, None, False) when it is not there."""
+    g = shortcut_game(home, appid)
+    if not g or not g["dir"]:
         return None, None, False
-    return None, None, False
+    return g["dir"], g["name"], g["windows"]
 
 
 # ---- game folder ----------------------------------------------------------------------------------------------
@@ -688,7 +770,8 @@ def scan_dir(root, appid=""):
     """One bounded walk: where the game's exe is, which upscaler inputs it ships, anti-cheat, our own install."""
     exes, inputs, anticheat, unity_dirs = [], [], [], []
     budget = MAX_ENTRIES
-    for current, dirnames, filenames in os.walk(root):
+    errors = []  # R822 (BG3 report AKG5XB: exe null, inputs [] and no word why): what the walk could not read goes into the scan
+    for current, dirnames, filenames in os.walk(root, onerror=lambda e: errors.append(f"{type(e).__name__}: {e}"[:200])):
         rel = os.path.relpath(current, root)
         depth = 0 if rel == "." else rel.count(os.sep) + 1
         # folders by name; files only if they are binaries (game assets may be called "vanguard_tank" etc.)
@@ -716,8 +799,22 @@ def scan_dir(root, appid=""):
         engine = "Godot"
     if appid in ANTICHEAT_APPIDS and not anticheat:
         anticheat.append(ANTICHEAT_APPIDS[appid])
-    return {"engine": engine, "exe_dir": exe[0] if exe else None, "exe": exe[1] if exe else None,
-            "inputs": inputs, "anticheat": sorted(set(anticheat))[:4]}
+    out = {"engine": engine, "exe_dir": exe[0] if exe else None, "exe": exe[1] if exe else None,
+           "inputs": inputs, "anticheat": sorted(set(anticheat))[:4]}
+    if not exe:
+        # R822: no game exe found -> the report says why: the walk's errors, whether the folder is there, and the names (only
+        # names, at most 60) at its top and in bin/ (BG3 keeps bg3.exe / bg3_dx11.exe there)
+        out["scan_note"] = {"root_is_dir": os.path.isdir(root), "errors": errors[:5], "entries": MAX_ENTRIES - budget,
+                            "top": _names(root), "bin": _names(os.path.join(root, "bin"))}
+    return out
+
+
+def _names(d, cap=60):
+    """R822: up to cap names in folder d (sorted, dirs with a trailing /), [] when it cannot be read."""
+    try:
+        return sorted(n + ("/" if os.path.isdir(os.path.join(d, n)) else "") for n in os.listdir(d))[:cap]
+    except OSError:
+        return []
 
 
 GODOT_PCK_MAGIC = b"GDPC"
@@ -766,13 +863,39 @@ def pick_exe(exes, unity_dirs):
 
 # ---- OptiScaler.ini -------------------------------------------------------------------------------------------
 
+# DX11FSR (0.8.23, fork patch 0027): OptiScaler's Dx11Upscaler for the live model. DX11 runs every model over OptiScaler's
+# D3D11 -> D3D12 bridge: sgsr3_12 = SGSR 3 with the FSR 4 VK provider (FSR 4, FSR 4 Fast, the NPU), ffx_12 = FSR 3.1 from
+# amd_fidelityfx_dx12.dll (the DX12 path's FFX backend), sgsr2_12 = SGSR 2. The fork also follows the live file at run time
+# (a model change re-creates the upscaler, as in DX12); the ini only decides the first one. No model known: sgsr3_12
+# DITTO: DittoSR is the FFX backend with DittoSR's DLL (ffx_12, as FSR 3)
+DX11_UPSCALER = {"fsr4": "sgsr3_12", "fsr4fast": "sgsr3_12", "fsr3": "ffx_12", "dittosr": "ffx_12", "sgsr2": "sgsr2_12"}
+
+
+def dx11_upscaler(model):
+    """OptiScaler's Dx11Upscaler for a live model (fsr4lite: as fsr4)."""
+    return DX11_UPSCALER.get(presets.RETIRED_MODELS.get(model, model), "sgsr3_12")
+
+
+def live_model(appid, live_dir="/tmp/vela-live"):
+    """The model= line of the game's live file (live.py writes it; the fork reads it), None without one."""
+    try:
+        with open(os.path.join(live_dir, f"{appid}.ini"), encoding="utf-8") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k.strip() == "model":
+                    return v.strip() or None
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def ini_values(opts):
     """Keys we set in the template; the rest stays at OptiScaler's defaults ("auto")."""
     lowlat = bool(opts.get("latency"))
     fps = opts.get("fps", "off")
     vals = {
         ("Upscalers", "Dx12Upscaler"): "sgsr3",
-        ("Upscalers", "Dx11Upscaler"): "sgsr2_12",
+        ("Upscalers", "Dx11Upscaler"): dx11_upscaler(opts.get("live_model")),
         # Vulkan spoofing turns Adreno into "NVIDIA" inside vkd3d-proton and D3D12CreateDevice fails;
         # DXGI spoofing and OptiPatcher are what open the DLSS input
         ("Spoofing", "Dxgi"): "true",
@@ -988,6 +1111,12 @@ _RX_RECREATE = re.compile(r"Vela live: (?:handle \d+ model|the game draws)")
 # 0.8.2: FSR 3.1 through the FFX backend (patch 0014): the switch line, then the version it took
 _RX_LIVE = re.compile(r"Vela live: handle \d+ model (\w+) -> [^\n]*?(?:\(the game draws (\d+)x(\d+)\))?\r?$", re.M)
 _RX_FSR3 = re.compile(r"Vela: FFX upscaler index \d+ \(([\d.]+)\) for FSR 3")
+# DITTO (0.8.23): DittoSR runs through the same FFX backend: after the switch line "model dittosr", the backend's upscaler line
+# (labelled DittoSR, or FSR 3 by a fork that names the backend only) and no fallback line = DittoSR runs. The fork cannot load
+# dittosr/amd_fidelityfx_upscaler_dx12.dll (or DittoSR refuses): "Vela live: dittosr cannot run in this game; FSR 3 instead",
+# then FSR 3 runs (its upscaler line after that one)
+_RX_FFX_UP = re.compile(r"Vela: FFX upscaler index \d+ \(([\d.]+)\) for (?:FSR 3|DittoSR)")
+_RX_DITTO_DOWN = re.compile(r"Vela live: dittosr cannot run[^\n]*? instead")
 # 0.8.13: "Vela live: fsr4 cannot run in this game; SGSR 2 instead" (provider refused, a frame
 # failed); the handles are then re-created on SGSR 2 until the panel picks another model
 _RX_DOWN = re.compile(r"Vela live: (\w+) cannot run in this game; SGSR 2 instead")
@@ -995,8 +1124,8 @@ _RX_FSR4 = re.compile(r"Vela FSR 4 VK: FSR ([\d.]+(?: Lite)?) VK INT8 context \d
                       r"(?: \(hdr \w+(?:, network every (\d+) frames)?\))?")
 
 
-# The game's graphics API, from OptiScaler's own lines: Vela's upscalers are DX12 only (Dx11Upscaler is SGSR 2 on a
-# D3D12 bridge). The swapchain decides: games probe DLSS on D3D12 at start and then present on DX11 (Shadow of the Tomb
+# The game's graphics API, from OptiScaler's own lines (DX11FSR: Vela's models run in DX11 too, over OptiScaler's D3D11 ->
+# D3D12 bridge, Dx11Upscaler / DX11_UPSCALER; a DX11 run is told apart only when no upscaler started). The swapchain decides: games probe DLSS on D3D12 at start and then present on DX11 (Shadow of the Tomb
 # Raider in DX11 mode). DLSS initialised on D3D11 alone counts too when D3D12 was never initialised.
 _DX11_SWAPCHAIN = "creating Dx11 swapchain"
 _DX11_SIGNS = ("NVSDK_NGX_D3D11_Init",)
@@ -1004,6 +1133,32 @@ _DX12_SIGNS = ("NVSDK_NGX_D3D12_Init",)
 # FSR 4's provider refused the game's output texture (ffx error 6 = output format; R9G9B9E5 is handled by the fork since
 # patch 0021, so a line now means another format)
 _RX_OUT_FORMAT = re.compile(r"ffxDispatch failed \(6\)|provider needs[^\n]*format")
+# PANELWHY (0.8.23): why FSR 4 did not start, from the fork's own lines (Fsr4VkBridge.h Unsupported(), SGSR3 inputs):
+#   "Unsupported Vela FSR 4 VK: depth format VkFormat 129 is not one the provider takes"   (colour / depth / motion vectors
+#   [(MV pass)] / output), "SGSR3 inputs: ... depth -1, ..." (the game gave no depth buffer: the frame fails at once)
+_RX_FSR4_FMT = re.compile(r"Vela FSR 4 VK: (colour|depth|motion vectors|output)\b[^\n]*? format VkFormat -?\d+ is not one the provider takes")
+_FSR4_FMT_WHY = {"colour": "colour_format", "depth": "depth_format", "motion vectors": "mv_format", "output": "output_format"}
+_RX_NO_DEPTH = re.compile(r"SGSR3 inputs: [^\n]*?, depth -1,|SGSR3: missing inputs: [^\n]*?depth (?:false|0)\b")
+_RX_FSR4_WANT = re.compile(r"SGSR3: Vela live model fsr4")
+FSR4_WHY = ("depth_format", "mv_format", "colour_format", "output_format", "no_depth", "unknown")
+
+
+def fsr4_why(text):
+    """PANELWHY: why FSR 4 could not start in this run, one id the panel words (FSR4_WHY): the last refused input format
+    since the last time FSR 4 was asked for, else no depth buffer, else "unknown". Only meaningful when FSR 4 fell back."""
+    starts = [m.start() for m in _RX_FSR4_WANT.finditer(text)]
+    downs = [m.end() for m in _RX_DOWN.finditer(text)]
+    end = downs[-1] if downs else len(text)
+    begin = max([s for s in starts if s < end], default=0)
+    seg = text[begin:end]
+    fmts = _RX_FSR4_FMT.findall(seg)
+    if fmts:
+        return _FSR4_FMT_WHY[fmts[-1]]
+    if _RX_OUT_FORMAT.search(seg):
+        return "output_format"
+    if _RX_NO_DEPTH.search(seg):
+        return "no_depth"
+    return "unknown"
 
 
 def run_api(text, created):
@@ -1067,6 +1222,18 @@ def log_summary(path, since=0.0):
     fsr3_ok = bool(fsr3) and not any(k in seg3 for k in ("_createContext error", "can't load amd_fidelityfx_dx12"))
     if fsr3_ok:
         mode = "fsr3"
+    # DITTO: DittoSR (live dittosr), or FSR 3 after DittoSR's fallback line
+    ditto_want = bool(lives) and lives[-1].group(1) == "dittosr"
+    segd = text[lives[-1].start():] if ditto_want else ""
+    ditto_down = _RX_DITTO_DOWN.search(segd)
+    ditto_ups = _RX_FFX_UP.findall(segd[ditto_down.end():] if ditto_down else segd)
+    ditto_ok = bool(ditto_ups) and not ditto_down and "_createContext error" not in segd
+    ditto_fsr3 = bool(ditto_down) and bool(ditto_ups)  # fell back: FSR 3 runs
+    if ditto_ok:
+        mode = "dittosr"
+    elif ditto_fsr3:
+        mode = "fsr3"
+    ffx_ok = fsr3_ok or ditto_ok or ditto_fsr3
     # 0.8.13: SGSR 2 runs because the chosen FSR 4 cannot run here (no other model picked after that line)
     downs = list(_RX_DOWN.finditer(text))
     down = None
@@ -1081,16 +1248,20 @@ def log_summary(path, since=0.0):
     last = inits[-1].groups() if inits else None
     return {
         "time": st.st_mtime,
-        "sgsr3": bool(inits) or fsr3_ok,
-        "render": (f"{lives[-1].group(2)}x{lives[-1].group(3)}" if lives[-1].group(2) else None) if fsr3_ok else
+        "sgsr3": bool(inits) or ffx_ok,
+        "render": (f"{lives[-1].group(2)}x{lives[-1].group(3)}" if lives[-1].group(2) else None) if ffx_ok else
         f"{last[1]}x{last[2]}" if last else None,
         "output": f"{last[3]}x{last[4]}" if last else None,
         "mode": mode,
         "fsr4_version": fsr4[-1][0] if mode in presets.FSR4_MODELS else None,
-        "fsr3_version": fsr3[-1] if fsr3_ok else None,
+        "fsr3_version": fsr3[-1] if fsr3_ok else ditto_ups[-1] if ditto_fsr3 else None,
         "fsr3_fallback": "failed" if fsr3_want and not fsr3_ok else None,
+        # DITTO: DittoSR was asked for and did not run (FSR 3 instead, or nothing)
+        "dittosr_fallback": "failed" if ditto_want and not ditto_ok else None,
         # the live model asked for FSR 4.1 and SGSR 3 ran Vela AI instead: "failed"
         "fsr4_fallback": "failed" if fsr4_fail and want and want[-1].startswith("fsr4") else None,
+        # PANELWHY: the reason in one id (fsr4_why), only when FSR 4 fell back
+        "fsr4_why": fsr4_why(text) if fsr4_fail and want and want[-1].startswith("fsr4") else None,
         "hp": mode == "v1f" and "temporal box hp" in seg,
         "lines2": mode == "v1f" and "line threshold 2" in seg,
         "student_fallback": fallback and "SGSR3 student" in seg or "student (Vulkan interop) is not available" in seg,
@@ -1101,7 +1272,7 @@ def log_summary(path, since=0.0):
         # 0.8.0: the network on the NPU (the fork's "Vela NPU:" log lines)
         "npu": npu.parse_fork(seg),
         # 0.8.20: the run explains itself: DirectX 11 (Vela needs DX12), an output format FSR 4 cannot write
-        "api": run_api(text, bool(inits) or fsr3_ok),
+        "api": run_api(text, bool(inits) or ffx_ok),
         "out_format": bool(_RX_OUT_FORMAT.search(text)),
     }
 
@@ -1162,13 +1333,17 @@ class Sgsr3:
             return hit[1]
         root, name = find_install(self.home, appid)
         native = None
-        if not root and is_shortcut(appid):
+        game = shortcut_game(self.home, appid) if is_shortcut(appid) else None
+        if game:
             # 0.8.22: a shortcut to a Linux program (an emulator): its folder, no scan, so the check says "a Linux game"
-            d, n, windows = shortcut_install(self.home, appid)
-            native = d if d and not windows else None
-            name = n if native else name
+            native = game["dir"] if not game["windows"] else None
+            root = game["dir"] if game["windows"] else None
+            name = game["name"] if game["dir"] else name
         res = {"appid": appid, "install_dir": root or native, "name": name, "engine": "", "exe_dir": None, "exe": None,
                "inputs": [], "anticheat": [ANTICHEAT_APPIDS[appid]] if appid in ANTICHEAT_APPIDS else []}
+        if game:
+            # NONSTEAM: the launcher that starts the game (None: the shortcut runs the game itself), its Wine prefix
+            res.update({"launcher": game["launcher"], "prefix": game["prefix"], "compat_tool": game["compat_tool"]})
         if root:
             res.update(scan_dir(root, appid))
         if is_shortcut(appid):
@@ -1244,6 +1419,11 @@ class Sgsr3:
             # command; the files go into the game folder and Vela's variables in front, which works with it
             return "copy"
         sc = self.scan(appid)
+        if sc.get("launcher"):
+            # NONSTEAM: the launcher starts the game, not Steam's command: an overlay around that command cannot hold it
+            # (an AppImage launcher does not start inside bwrap, and one already open starts the game outside it; seen in
+            # indiesaudi's launcher-games PR #3, 2026-11-16). The files go into the game folder, which every launch reads
+            return "copy"
         if not sc["exe_dir"] or not self.overlay_ok(appid, sc):
             return "copy"
         if self.new_mode == "wrapper" and isinstance(launch_options, str) and \
@@ -1441,7 +1621,7 @@ class Sgsr3:
                     "src": {"dxgi.dll": os.path.join(os.path.dirname(self.assets), STATIC_ASSETS, "dxgi.dll"),
                             FSR4VK: os.path.join(self.assets, FSR4VK), FFX_DLL: os.path.join(self.assets, FFX_DLL)},
                     "log": "sgsr3intercept.log"}
-        src = {rel: os.path.join(self.assets, a) for rel, a in ASSET_OF.items()}
+        src = {rel: os.path.join(self.assets, *a.split("/")) for rel, a in ASSET_OF.items()}
         src[AMDXC] = os.path.join(self.home, AMDXC_DIR, AMDXC)
         src[FSR4VK] = os.path.join(self.assets, FSR4VK)
         return {"static": None, "installed": INSTALLED, "runtime": RUNTIME, "src": src, "log": "OptiScaler.log"}
@@ -1475,6 +1655,12 @@ class Sgsr3:
         """0.8.2: FSR 3.1 can be a live model: the fork has patch 0014 (VERSION.json "fsr3_live") and the
         FidelityFX SDK DLL is in the plugin."""
         return self.ffx_available() and bool(self.version.get("fsr3_live"))
+
+    def dittosr_available(self):
+        """DITTO (0.8.23): DittoSR can be a live model: FSR 3 can (its fallback, the same FFX backend), the fork loads DittoSR
+        (VERSION.json "dittosr_live") and the plugin carries DittoSR's DLL and its settings (assets/sgsr3/dittosr/)."""
+        return self.fsr3_available() and bool(self.version.get("dittosr_live")) and \
+            all(os.path.isfile(os.path.join(self.assets, *rel.split("/"))) for rel in DITTO_FILES)
 
     def fsr4_driver(self):
         """AMD's driver FSR 4 route (FFX backend + amdxcffx64.dll): off, see FSR4_READY."""
@@ -1695,13 +1881,15 @@ class Sgsr3:
         repair use the same list). d, sc (V10): where the setup is and the game's scan (_game_own)."""
         fsr4 = not kit["static"] and self.fsr4_driver()
         fsr3 = self.ffx_available() if kit["static"] else self.fsr3_available()
+        ditto = not kit["static"] and self.dittosr_available()  # DITTO: OptiScaler kits only (the interceptor has no DittoSR)
         out = set()
         for rel in kit["installed"]:
             if rel == "OptiScaler.ini":
                 continue
             if rel not in OPTIONAL or (rel == FFX_DLL and fsr4) or \
                     (rel == FFX_DLL and fsr3 and not self._game_own(d, st, sc, rel)) or \
-                    (rel == AMDXC and fsr4) or (rel == FSR4VK and self.fsr4_available()):
+                    (rel == AMDXC and fsr4) or (rel == FSR4VK and self.fsr4_available()) or \
+                    (rel in DITTO_FILES and ditto):
                 out.add(rel)
         return out
 
@@ -1709,7 +1897,8 @@ class Sgsr3:
         extra = {"log_file": wine_path(os.path.join(os.path.dirname(d), "OptiScaler.log"))} if self._is_kit(d) else {}
         with open(os.path.join(self.assets, "OptiScaler.ini"), encoding="utf-8", newline="") as f:
             return make_ini(f.read(), {**opts, "appid": sc["appid"], "exe": sc.get("exe"), "fsr_pattern": fsr_pattern(sc),
-                                       "fsr4_driver": self.fsr4_driver(), **extra})
+                                       "fsr4_driver": self.fsr4_driver(),
+                                       "live_model": live_model(sc["appid"]), **extra})
 
     def refresh_dll(self, appid):
         """V14 (audit 2026-11-09): the full check (_refresh_dll below), then the kit's files as they are now are remembered for
@@ -1780,6 +1969,7 @@ class Sgsr3:
             if os.path.isfile(target) and self._md5(target) == self._md5(kit["src"].get(FFX_DLL)):
                 os.remove(target)
                 fixed.append(f"{FFX_DLL} out of the kit (the game has its own)")
+        self._note_dirs(d, st, wanted)
         for rel in sorted(wanted):
             src = kit["src"].get(rel)
             want = self._md5(src) if src else None
@@ -1831,7 +2021,8 @@ class Sgsr3:
         other = bool(sc["exe_dir"]) and os.path.isfile(os.path.join(sc["exe_dir"], OTHER_OPTISCALER))
         out = {"scan": sc, "available": bool(sc["exe_dir"]) and not sc["anticheat"], "installed": st is not None,
                "opts": dict(DEFAULT_OPTS), "version": self.version.get("dll", ""), "intact": None, "log": None,
-               "fsr4_available": self.fsr4_available(), "fsr3_available": self.fsr3_available(), "other_optiscaler": other, "menu_hint": menu_hint(sc),
+               "fsr4_available": self.fsr4_available(), "fsr3_available": self.fsr3_available(),
+               "dittosr_available": self.dittosr_available(), "other_optiscaler": other, "menu_hint": menu_hint(sc),
                "profile": profiles.public(sc["appid"]),
                "kit_missing": self.kit_missing(sc["appid"]) if st is not None and self._is_kit(d) else []}  # KIT1
         out["opts"] = resolve_mode({**DEFAULT_OPTS, **profiles.defaults(sc["appid"])}, sc["appid"])
@@ -1843,6 +2034,7 @@ class Sgsr3:
             out["opts"] = {**out["opts"], "algo": "student" if kit["static"].get("algo", "ai") == "ai" else "v1f"}
             # 0.8.3-re: the interceptor's live models; FSR 3.1 needs only the SDK DLL (no fork patch)
             out["fsr3_available"] = self.ffx_available()
+            out["dittosr_available"] = False  # DITTO: the interceptor has no DittoSR
             out["live_models"] = ["fsr4", "fsr4fast", "fsr3", "sgsr2"]  # 0.8.13: no Vela AI / SR in the panel
         if st:
             opts = dict(DEFAULT_OPTS)
@@ -1953,7 +2145,9 @@ class Sgsr3:
             # "game" ratio: the fork takes amax from the real sizes itself
             amax = [f"OPTI_SGSR3_AMAX={amax_str(clean['ratio'])}"] \
                 if AMAX_BY_RATIO and clean["algo"] == "student" and clean["ratio"] != "game" else []
-            new_launch, rec = launch_build(launch_options, rec, clean["algo"], sc["engine"] == "Unreal",
+            # NONSTEAM: no -dx12 for a launcher's game: arguments after %command% go to the launcher, not to the game
+            new_launch, rec = launch_build(launch_options, rec, clean["algo"],
+                                           sc["engine"] == "Unreal" and not sc.get("launcher"),
                                            profiles.env_tokens(appid) + amax +
                                            (smooth_env(clean["smooth"]) if clean["algo"] == "v1f" else []),
                                            bool(self.api_args(appid)))
@@ -1964,6 +2158,7 @@ class Sgsr3:
             ini = self._ini_text(sc, clean, d)
         bdir = self._bdir(d)
         wanted = self._kit_wanted(kit, clean, st, d, sc)
+        self._note_dirs(d, st, wanted)
         for rel in kit["installed"]:
             target = os.path.join(d, *rel.split("/"))
             if rel == "OptiScaler.ini":
@@ -2008,6 +2203,16 @@ class Sgsr3:
         self._write_state(d, st)
         return self.status(appid)
 
+    @staticmethod
+    def _note_dirs(d, st, wanted):
+        """DITTO: a folder of ours (OUR_DIRS) a wanted file is about to create is recorded in dirs_created, so Off removes it
+        again (a setup made before 0.8.23 never listed dittosr/)."""
+        made = st.setdefault("dirs_created", [])
+        for rel in OUR_DIRS:
+            if any(w.startswith(rel + "/") for w in wanted) and rel not in made and \
+                    not os.path.isdir(os.path.join(d, *rel.split("/"))):
+                made.append(rel)
+
     def _backup_one(self, d, bdir, rel):
         src = os.path.join(d, *rel.split("/"))
         if os.path.isfile(src):
@@ -2023,7 +2228,7 @@ class Sgsr3:
         os.makedirs(bdir, exist_ok=True)
         files = {rel: self._backup_one(d, bdir, rel) for rel in kit["installed"] + kit["runtime"]}
         dirs_created = [] if kit["static"] else \
-            [rel for rel in ("OptiScaler", "OptiScaler/plugins") if not os.path.isdir(os.path.join(d, *rel.split("/")))]
+            [rel for rel in OUR_DIRS if not os.path.isdir(os.path.join(d, *rel.split("/")))]
         st = {"files": files, "dirs_created": dirs_created, "installed_at": time.time(),
               "launch_prev": launch_options, "resolution_prev": resolution, "dx12_added": False}
         if self._is_kit(d):

@@ -120,7 +120,7 @@ sys.modules["decky"] = dk
 sys.path.insert(0, ROOT)
 import main  # noqa: E402
 
-s3 = {"fsr4_available": True, "fsr3_available": True}
+s3 = {"fsr4_available": True, "fsr3_available": True, "dittosr_available": True}  # DITTO: + DittoSR
 ready = {"ready": True, "layer_found": True, "service": {"installed": True}}
 P = main.Plugin()
 offered = P._models("fsr4", s3)
@@ -133,11 +133,11 @@ for kind in ("fsr4", "sgsr2", "static"):
         assert P._default_model(kind, s3, nst) == presets.default_model(kind, True, nst), (kind, nst)
 P.dev, P.chip = d8, p8  # SM8750, no v79 graphs
 m8 = dict(P._models("fsr4", s3))
-assert m8 == {"fsr4": True, "fsr4fast": False, "fsr3": True, "sgsr2": True}, m8
+assert m8 == {"fsr4": True, "fsr4fast": False, "fsr3": True, "dittosr": True, "sgsr2": True}, m8  # DITTO: any chip
 assert P._default_model("fsr4", s3, {"ready": False}) == "fsr3"  # not fsr4fast
 assert P._default_model("fsr4", {"fsr4_available": True, "fsr3_available": False}, None) == "sgsr2"
 P.dev, P.chip = d8, p8g  # SM8750 with v79 graphs: all models
 assert all(dict(P._models("fsr4", s3)).values())
 P.dev, P.chip = du, pu  # unknown chip
-assert dict(P._models("fsr4", s3)) == {"fsr4": False, "fsr4fast": False, "fsr3": True, "sgsr2": True}  # no FSR 4
+assert dict(P._models("fsr4", s3)) == {"fsr4": False, "fsr4fast": False, "fsr3": True, "dittosr": True, "sgsr2": True}  # no FSR 4
 print("test_device: OK")

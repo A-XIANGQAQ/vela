@@ -23,3 +23,15 @@ b3654ff68ec1fc1d16b436c3a6b45f3b *0021-vela-output-pack-rgb9e5.patch
 8b5eff646d967696f7f8413504f112eb *0024b-vela-nodepth-spatial.patch
 e2efed6b09574cdf97bf8cf185e1a38b *0024c-vela-nodepth-tonemap.patch
 8be4cefba5ce987cc161d53c48f73d44 *0024d-vela-tonemap-vkd3d.patch
+b7bffe8d06065171332843969edb2a0e *0025-vela-depth-copy.patch
+7b4113f43fbcbb5474056ed4fbd43a3c *0026-vela-mv-rgba16-snorm.patch
+8c6ba57e5d04f09d7a55872b7740593f *0027-vela-dx11-sgsr3.patch
+9cc35703197a5e84ec8b2abbafdd6574 *0028-vela-fsr2-unadopted-context.patch
+0f4512a7c6fd6e241d5d2ae193f2177f *0029-vela-fsr2-dx11-adopt.patch
+39f9e592d3a3528e7eac710e82faa77c *0030-vela-dx11-flush.patch
+ce0d39e2cbfd4beeea781b6209e75883 *0031-vela-dx11-probe.patch
+37cb5812d1fb88833a4e9845580d33db *0032-vela-dx11-shared-rt.patch
+983a240c1319cad274df122b88f7d59e *0033-vela-ue-fsr2-dx11.patch
+e35aaaac27648e3107befe87a0dc1d69 *0034-vela-ue-fsr2-slots.patch
+ae3ebcb901ace81ef52b153616aec21a *0035-vela-ue-fsr2-skip-default.patch
+6d1024bedeff607d983ae747e6dfe70a *0036-vela-dittosr-model.patch

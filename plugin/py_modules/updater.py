@@ -46,10 +46,21 @@ def parse_version(s):
     return tuple(int(x) for x in m.groups()) if m else None
 
 
+_CUR = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$")
+
+
+def installed_version(s):
+    """The installed plugin's version for the compare: "0.8.22" -> (0, 8, 22, 1); a test build "0.8.22-fgtest10c" -> (0, 8, 22, 0),
+    i.e. below the release of the same number (R822 2026-11-16: 0.8.22-fgtest10c never saw 0.8.22). None for anything else."""
+    m = _CUR.match(str(s or "").strip())
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0 if m.group(4) else 1) if m else None
+
+
 def is_newer(latest, current):
-    """True when version string latest is above current, compared number by number (0.8.10 > 0.8.9)."""
-    a, b = parse_version(latest), parse_version(current)
-    return bool(a and b and a > b)
+    """True when release version latest is above the installed current, number by number (0.8.10 > 0.8.9); a test build of
+    the same number ("0.8.22-fgtest10c") is below the release. latest stays strict: a release tag has no suffix."""
+    a, b = parse_version(latest), installed_version(current)
+    return bool(a and b and a + (1,) > b)
 
 
 def parse_sum(text, kind):

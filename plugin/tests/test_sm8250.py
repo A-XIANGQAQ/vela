@@ -32,7 +32,7 @@ write(os.path.join(rp5, "proc/device-tree/soc@0/gpu@3d00000/compatible"), "qcom,
 d5 = device.detect(rp5)
 assert d5["soc"] is None and d5["machine"] == "SM8250" and d5["gpu"] == "Adreno 650" and d5["npu_arch"] is None, d5
 en = json.load(open(os.path.join(ROOT, "src", "i18n", "en.json"), encoding="utf-8"))
-NOTE = "FSR 4 needs the Snapdragon 8 Gen 2 or newer NPU; use FSR 3 or SGSR 2"
+NOTE = "FSR 4 needs the Snapdragon 8 Gen 2 or newer NPU; use FSR 3, DittoSR or SGSR 2"  # DITTO: + DittoSR
 assert device.NO_FSR4 == NOTE == en["model.why.chip_no_fsr4"]
 
 for dev, name in ((d5, "SM8250"), (device.detect(os.path.join(tmp, "none")), "unknown chip"),
@@ -58,15 +58,17 @@ sys.modules["decky"] = dk
 sys.path.insert(0, ROOT)
 import main  # noqa: E402
 
-s3 = {"fsr4_available": True, "fsr3_available": True}
+s3 = {"fsr4_available": True, "fsr3_available": True, "dittosr_available": True}  # DITTO: + DittoSR
 P = main.Plugin()
 P.dev, P.chip = d5, device.policy(d5, ())
 for kind in ("fsr4", "static"):
-    assert dict(P._models(kind, s3)) == {"fsr4": False, "fsr4fast": False, "fsr3": True, "sgsr2": True}, kind
+    # DITTO: DittoSR on any chip, not in a static (RE4 interceptor) game
+    assert dict(P._models(kind, s3)) == {"fsr4": False, "fsr4fast": False, "fsr3": True, "sgsr2": True,
+                                         **({} if kind == "static" else {"dittosr": True})}, kind
     for nst in (None, {"ready": False}, {"ready": True, "layer_found": True, "service": {"installed": True}}):
         assert P._default_model(kind, s3, nst) == "fsr3", (kind, nst)
     assert P._default_model(kind, {"fsr4_available": True, "fsr3_available": False}, None) == "sgsr2"
-assert dict(P._models("sgsr2", s3)) == {"sgsr2": True}
+assert dict(P._models("sgsr2", s3)) == {}  # DX11FSR: no kind sgsr2 (a DX11 game is kind fsr4, the loop above)
 assert P._chip_off("fsr4") == P._chip_off("fsr4fast") == "chip_no_fsr4"
 assert P._chip_off("fsr3") is None and P._chip_off("sgsr2") is None and P._chip_off("off") is None
 

@@ -25,6 +25,11 @@ assert U.is_newer("0.8.18", "0.8.17") and U.is_newer("v0.8.10", "0.8.9") and U.i
 assert U.is_newer("0.10.0", "0.9.0") and U.is_newer("0.8.100", "0.8.99")
 assert not U.is_newer("0.8.18", "0.8.18") and not U.is_newer("0.8.9", "0.8.10") and not U.is_newer("0.8.17", "0.8.18")
 assert not U.is_newer("garbage", "0.8.1") and not U.is_newer("0.8.20", "") and not U.is_newer(None, "0.8.1")
+# R822: a test build sees the release of its number and every later one, never an older one; a suffixed tag is no release
+assert U.is_newer("0.8.22", "0.8.22-fgtest10c") and U.is_newer("v0.8.23", "0.8.22-nofg-pre1") and U.is_newer("0.8.22", "0.8.21-fgtest3")
+assert not U.is_newer("0.8.21", "0.8.22-fgtest10c") and not U.is_newer("0.8.22-rc1", "0.8.21") and not U.is_newer("0.8.22", "0.8.22")
+assert U.installed_version("0.8.22-fgtest10c") == (0, 8, 22, 0) and U.installed_version("0.8.22") == (0, 8, 22, 1)
+assert U.installed_version("0.8") is None and U.installed_version("0.8.22 x") is None
 
 # ---- checksum files
 H = "ab" * 32

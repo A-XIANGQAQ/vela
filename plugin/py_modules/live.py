@@ -19,6 +19,7 @@ import profiles
 
 TMP_DIR = "/tmp/vela-live"
 # 0.8.2: "fsr3" = FSR 3.1, OptiScaler's FFX backend with amd_fidelityfx_dx12.dll (fork patch 0014)
+# 0.8.23: "dittosr" = DittoSR, the same backend with dittosr/amd_fidelityfx_upscaler_dx12.dll (FSR 3 when it cannot load)
 MODELS = presets.MODELS
 # 0.8.15: keys of FSR 4 Lite that are gone; a stored one is dropped (get). The fork / interceptor keep their Lite code dormant.
 # 0.8.15: ratio (render size: the game's DLSS / FSR preset now)

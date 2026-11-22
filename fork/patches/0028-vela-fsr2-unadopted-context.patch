@@ -1,0 +1,281 @@
+From b18852035007331af6e7a524b4983d22da65caad Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 20:07:05 +0100
+Subject: [PATCH] 0028-vela-fsr2-unadopted-context: a game's own FSR 2 / FSR 3
+ context that OptiScaler did not adopt goes to the game's FSR (DX11 crash fix)
+
+Bright Memory: Infinite -dx11 (UE4 4.26, FSR 2 plugin, exe exports ffxFsr2ContextCreate/Dispatch) crashed on
+entering the main menu: ffxFsr2ContextDispatch_Dx12 read _nvParams[context] (null, the create hook found no
+D3D12 device and did not register the context) and called params->Set (dxgi.dll+0x29f030, ldr x8,[x20]).
+
+- dispatch hooks (FSR2 Dx12 2.1/2.0/Tiny/pattern, FSR2 Dx11, FSR2 Vk, FSR3 Dx12 + pattern): a context not
+  in _nvParams runs the original (upstream optiscaler/OptiScaler 19e61cf84b); the FSR 2.0 pass-through falls
+  back to the 2.1 original when the 2.0 export is missing; the FSR3 pattern hooks call their own originals
+- a context without init params is refused instead of created half-way (upstream 299f835bc6)
+- FSR2 Dx12 create hooks: in a game with a D3D11 swapchain a context whose device is not a known D3D12
+  device is left to the game, not given the last D3D12 device (vkd3d probe / 11on12 device)
+- null check before the FSR 2.0 width hack
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/inputs/FSR2_Dx11.cpp |  6 ++--
+ OptiScaler/inputs/FSR2_Dx12.cpp | 61 ++++++++++++++++++++++++---------
+ OptiScaler/inputs/FSR2_Vk.cpp   |  6 ++--
+ OptiScaler/inputs/FSR3_Dx12.cpp | 16 ++++-----
+ 4 files changed, 58 insertions(+), 31 deletions(-)
+
+diff --git a/OptiScaler/inputs/FSR2_Dx11.cpp b/OptiScaler/inputs/FSR2_Dx11.cpp
+index 104cb6e..2224b82 100644
+--- a/OptiScaler/inputs/FSR2_Dx11.cpp
++++ b/OptiScaler/inputs/FSR2_Dx11.cpp
+@@ -254,7 +254,7 @@ static FfxErrorCode ffxFsr2ContextDispatch_Dx11(FfxFsr2Context* context,
+     LOG_DEBUG("");
+ 
+     // Skip OptiScaler stuff
+-    if (!Config::Instance()->UseFsr2Inputs.value_or_default())
++    if (!Config::Instance()->UseFsr2Inputs.value_or_default() || !_nvParams.contains(context))
+     {
+         _skipDispatch = true;
+         LOG_DEBUG("UseFsr2Inputs not enabled, skipping");
+@@ -267,8 +267,8 @@ static FfxErrorCode ffxFsr2ContextDispatch_Dx11(FfxFsr2Context* context,
+         return FFX_ERROR_INVALID_ARGUMENT;
+ 
+     // If not in contexts list create and add context
+-    if (!_contexts.contains(context) && _initParams.contains(context) &&
+-        !CreateDLSSContext(context, dispatchDescription))
++    if (!_contexts.contains(context) &&
++        (!_initParams.contains(context) || !CreateDLSSContext(context, dispatchDescription)))
+         return FFX_ERROR_INVALID_ARGUMENT;
+ 
+     NVSDK_NGX_Parameter* params = _nvParams[context];
+diff --git a/OptiScaler/inputs/FSR2_Dx12.cpp b/OptiScaler/inputs/FSR2_Dx12.cpp
+index 3b5e509..07994f8 100644
+--- a/OptiScaler/inputs/FSR2_Dx12.cpp
++++ b/OptiScaler/inputs/FSR2_Dx12.cpp
+@@ -397,6 +397,15 @@ static Fsr212::FfxErrorCode ffxFsr2ContextCreate_Dx12(Fsr212::FfxFsr2Context* co
+         }
+     }
+ 
++    // Vela 0028: a DX11 game (D3D11 swapchain) runs its FSR 2 on its own D3D11/RHI backend; the fallbacks
++    // below would hand that context an unrelated D3D12 device (vkd3d probe, OptiScaler's own 11on12 device)
++    // and its dispatch would then treat the D3D11 command list as ID3D12GraphicsCommandList
++    if (_d3d12Device == nullptr && state.swapchainApi == API::DX11)
++    {
++        LOG_INFO("FSR 2 context {:X} in a DX11 game, device is not D3D12: left to the game", (size_t) context);
++        return ccResult;
++    }
++
+     // if still no device use latest created one
+     // Might fixed TLOU but FMF2 still crashes
+     if (_d3d12Device == nullptr && state.d3d12Devices.size() > 0)
+@@ -486,6 +495,15 @@ static Fsr212::FfxErrorCode ffxFsr2ContextCreate_Pattern_Dx12(Fsr212::FfxFsr2Con
+         }
+     }
+ 
++    // Vela 0028: a DX11 game (D3D11 swapchain) runs its FSR 2 on its own D3D11/RHI backend; the fallbacks
++    // below would hand that context an unrelated D3D12 device (vkd3d probe, OptiScaler's own 11on12 device)
++    // and its dispatch would then treat the D3D11 command list as ID3D12GraphicsCommandList
++    if (_d3d12Device == nullptr && state.swapchainApi == API::DX11)
++    {
++        LOG_INFO("FSR 2 context {:X} in a DX11 game, device is not D3D12: left to the game", (size_t) context);
++        return ccResult;
++    }
++
+     // if still no device use latest created one
+     // Might fixed TLOU but FMF2 still crashes
+     if (_d3d12Device == nullptr && state.d3d12Devices.size() > 0)
+@@ -545,13 +563,15 @@ static Fsr212::FfxErrorCode ffxFsr2ContextDispatch_Dx12(Fsr212::FfxFsr2Context*
+     LOG_DEBUG("");
+ 
+     // HACK, try to detected when we hooked FSR 2.0 call as FSR2.1/2.2
+-    if (std::labs(dispatchDescription->renderSize.width) > 20000)
++    if (dispatchDescription != nullptr && std::labs(dispatchDescription->renderSize.width) > 20000)
+     {
+         return ffxFsr20ContextDispatch_Dx12(context, (FfxFsr20DispatchDescription*) dispatchDescription);
+     }
+ 
+     // Skip OptiScaler stuff
+-    if (!Config::Instance()->UseFsr2Inputs.value_or_default())
++    // A context OptiScaler did not adopt (its create hook found no D3D12 device, e.g. a DX11 game's
++    // own FSR 2 on its RHI backend) runs the game's FSR 2: _nvParams[context] would be a null pointer
++    if (!Config::Instance()->UseFsr2Inputs.value_or_default() || !_nvParams.contains(context))
+     {
+         _skipDispatch = true;
+         LOG_DEBUG("UseFsr2Inputs not enabled, skipping");
+@@ -564,8 +584,8 @@ static Fsr212::FfxErrorCode ffxFsr2ContextDispatch_Dx12(Fsr212::FfxFsr2Context*
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     // If not in contexts list create and add context
+-    if (!_contexts.contains(context) && _initParams.contains(context) &&
+-        !CreateDLSSContext(context, dispatchDescription))
++    if (!_contexts.contains(context) &&
++        (!_initParams.contains(context) || !CreateDLSSContext(context, dispatchDescription)))
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     NVSDK_NGX_Parameter* params = _nvParams[context];
+@@ -618,7 +638,7 @@ ffxFsr2ContextDispatch_Pattern_Dx12(Fsr212::FfxFsr2Context* context,
+     LOG_DEBUG("");
+ 
+     // Skip OptiScaler stuff
+-    if (!Config::Instance()->UseFsr2Inputs.value_or_default() || _skipDispatch)
++    if (!Config::Instance()->UseFsr2Inputs.value_or_default() || _skipDispatch || !_nvParams.contains(context))
+     {
+         LOG_DEBUG("UseFsr2Inputs not enabled, skipping");
+         return o_ffxFsr2ContextDispatch_Pattern_Dx12(context, dispatchDescription);
+@@ -628,8 +648,8 @@ ffxFsr2ContextDispatch_Pattern_Dx12(Fsr212::FfxFsr2Context* context,
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     // If not in contexts list create and add context
+-    if (!_contexts.contains(context) && _initParams.contains(context) &&
+-        !CreateDLSSContext(context, dispatchDescription))
++    if (!_contexts.contains(context) &&
++        (!_initParams.contains(context) || !CreateDLSSContext(context, dispatchDescription)))
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     NVSDK_NGX_Parameter* params = _nvParams[context];
+@@ -682,11 +702,16 @@ static Fsr212::FfxErrorCode ffxFsr20ContextDispatch_Dx12(Fsr212::FfxFsr2Context*
+     LOG_DEBUG("");
+ 
+     // Skip OptiScaler stuff
+-    if (!Config::Instance()->UseFsr2Inputs.value_or_default())
++    // A context OptiScaler did not adopt (its create hook found no D3D12 device, e.g. a DX11 game's
++    // own FSR 2 on its RHI backend) runs the game's FSR 2: _nvParams[context] would be a null pointer
++    if (!Config::Instance()->UseFsr2Inputs.value_or_default() || !_nvParams.contains(context))
+     {
+         _skipDispatch = true;
+         LOG_DEBUG("UseFsr2Inputs not enabled, skipping");
+-        auto result = o_ffxFsr20ContextDispatch_Dx12(context, dispatchDescription);
++        // FSR 2.0 can come through the 2.1 export, the 2.0 export may not exist
++        auto result = o_ffxFsr20ContextDispatch_Dx12 != nullptr
++                          ? o_ffxFsr20ContextDispatch_Dx12(context, dispatchDescription)
++                          : o_ffxFsr2ContextDispatch_Dx12(context, dispatchDescription);
+         _skipDispatch = false;
+         return result;
+     }
+@@ -695,8 +720,8 @@ static Fsr212::FfxErrorCode ffxFsr20ContextDispatch_Dx12(Fsr212::FfxFsr2Context*
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     // If not in contexts list create and add context
+-    if (!_contexts.contains(context) && _initParams.contains(context) &&
+-        !CreateDLSSContext20(context, dispatchDescription))
++    if (!_contexts.contains(context) &&
++        (!_initParams.contains(context) || !CreateDLSSContext20(context, dispatchDescription)))
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     NVSDK_NGX_Parameter* params = _nvParams[context];
+@@ -753,7 +778,7 @@ static Fsr212::FfxErrorCode ffxFsr20ContextDispatch_Pattern_Dx12(Fsr212::FfxFsr2
+     LOG_DEBUG("");
+ 
+     // Skip OptiScaler stuff
+-    if (!Config::Instance()->UseFsr2Inputs.value_or_default() || _skipDispatch)
++    if (!Config::Instance()->UseFsr2Inputs.value_or_default() || _skipDispatch || !_nvParams.contains(context))
+     {
+         LOG_DEBUG("UseFsr2Inputs not enabled, skipping");
+         return o_ffxFsr20ContextDispatch_Pattern_Dx12(context, dispatchDescription);
+@@ -763,8 +788,8 @@ static Fsr212::FfxErrorCode ffxFsr20ContextDispatch_Pattern_Dx12(Fsr212::FfxFsr2
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     // If not in contexts list create and add context
+-    if (!_contexts.contains(context) && _initParams.contains(context) &&
+-        !CreateDLSSContext20(context, dispatchDescription))
++    if (!_contexts.contains(context) &&
++        (!_initParams.contains(context) || !CreateDLSSContext20(context, dispatchDescription)))
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     NVSDK_NGX_Parameter* params = _nvParams[context];
+@@ -817,7 +842,9 @@ static Fsr212::FfxErrorCode ffxFsr2TinyContextDispatch_Dx12(Fsr212::FfxFsr2Conte
+     LOG_DEBUG("");
+ 
+     // Skip OptiScaler stuff
+-    if (!Config::Instance()->UseFsr2Inputs.value_or_default())
++    // A context OptiScaler did not adopt (its create hook found no D3D12 device, e.g. a DX11 game's
++    // own FSR 2 on its RHI backend) runs the game's FSR 2: _nvParams[context] would be a null pointer
++    if (!Config::Instance()->UseFsr2Inputs.value_or_default() || !_nvParams.contains(context))
+     {
+         LOG_DEBUG("UseFsr2Inputs not enabled, skipping");
+         return o_ffxFsr2TinyContextDispatch_Dx12(context, dispatchDescription);
+@@ -827,8 +854,8 @@ static Fsr212::FfxErrorCode ffxFsr2TinyContextDispatch_Dx12(Fsr212::FfxFsr2Conte
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     // If not in contexts list create and add context
+-    if (!_contexts.contains(context) && _initParams.contains(context) &&
+-        !CreateDLSSContextTiny(context, dispatchDescription))
++    if (!_contexts.contains(context) &&
++        (!_initParams.contains(context) || !CreateDLSSContextTiny(context, dispatchDescription)))
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     NVSDK_NGX_Parameter* params = _nvParams[context];
+diff --git a/OptiScaler/inputs/FSR2_Vk.cpp b/OptiScaler/inputs/FSR2_Vk.cpp
+index c209865..d47d3cb 100644
+--- a/OptiScaler/inputs/FSR2_Vk.cpp
++++ b/OptiScaler/inputs/FSR2_Vk.cpp
+@@ -377,7 +377,7 @@ static FfxErrorCode ffxFsr2ContextDispatch_Vk(FfxFsr2Context* context,
+     LOG_DEBUG("");
+ 
+     // Skip OptiScaler stuff
+-    if (!Config::Instance()->UseFsr2Inputs.value_or_default())
++    if (!Config::Instance()->UseFsr2Inputs.value_or_default() || !_nvParams.contains(context))
+     {
+         _skipDispatch = true;
+         LOG_DEBUG("UseFsr2Inputs not enabled, skipping");
+@@ -390,8 +390,8 @@ static FfxErrorCode ffxFsr2ContextDispatch_Vk(FfxFsr2Context* context,
+         return FFX_ERROR_INVALID_ARGUMENT;
+ 
+     // If not in contexts list create and add context
+-    if (!_contexts.contains(context) && _initParams.contains(context) &&
+-        !CreateDLSSContext(context, dispatchDescription))
++    if (!_contexts.contains(context) &&
++        (!_initParams.contains(context) || !CreateDLSSContext(context, dispatchDescription)))
+         return FFX_ERROR_INVALID_ARGUMENT;
+ 
+     NVSDK_NGX_Parameter* params = _nvParams[context];
+diff --git a/OptiScaler/inputs/FSR3_Dx12.cpp b/OptiScaler/inputs/FSR3_Dx12.cpp
+index 05026fa..0bc40db 100644
+--- a/OptiScaler/inputs/FSR3_Dx12.cpp
++++ b/OptiScaler/inputs/FSR3_Dx12.cpp
+@@ -307,7 +307,7 @@ static Fsr3::FfxErrorCode ffxFsr3ContextDispatch_Dx12(Fsr3::FfxFsr3UpscalerConte
+         return result;
+     }
+ 
+-    if (_d3d12Device == nullptr)
++    if (_d3d12Device == nullptr || !_nvParams.contains(pContext))
+     {
+         _skipDispatch = true;
+         auto result = o_ffxFsr3UpscalerContextDispatch_Dx12(pContext, pDispatchDescription);
+@@ -319,8 +319,8 @@ static Fsr3::FfxErrorCode ffxFsr3ContextDispatch_Dx12(Fsr3::FfxFsr3UpscalerConte
+         return Fsr3::FFX_ERROR_BACKEND_API_ERROR;
+ 
+     // If not in contexts list create and add context
+-    if (!_contexts.contains(pContext) && _initParams.contains(pContext) &&
+-        !CreateDLSSContext(pContext, pDispatchDescription))
++    if (!_contexts.contains(pContext) &&
++        (!_initParams.contains(pContext) || !CreateDLSSContext(pContext, pDispatchDescription)))
+         return Fsr3::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     NVSDK_NGX_Parameter* params = _nvParams[pContext];
+@@ -506,17 +506,17 @@ ffxFsr3ContextDispatch_Pattern_Dx12(Fsr3::FfxFsr3UpscalerContext* pContext,
+ {
+     // Skip OptiScaler stuff
+     if (!Config::Instance()->UseFsr3Inputs.value_or_default() || _skipDispatch)
+-        return o_ffxFsr3UpscalerContextDispatch_Dx12(pContext, pDispatchDescription);
++        return o_ffxFsr3UpscalerContextDispatch_Pattern_Dx12(pContext, pDispatchDescription);
+ 
+-    if (_d3d12Device == nullptr)
+-        return o_ffxFsr3UpscalerContextDispatch_Dx12(pContext, pDispatchDescription);
++    if (_d3d12Device == nullptr || !_nvParams.contains(pContext))
++        return o_ffxFsr3UpscalerContextDispatch_Pattern_Dx12(pContext, pDispatchDescription);
+ 
+     if (pDispatchDescription == nullptr || pContext == nullptr || pDispatchDescription->commandList == nullptr)
+         return Fsr3::FFX_ERROR_BACKEND_API_ERROR;
+ 
+     // If not in contexts list create and add context
+-    if (!_contexts.contains(pContext) && _initParams.contains(pContext) &&
+-        !CreateDLSSContext(pContext, pDispatchDescription))
++    if (!_contexts.contains(pContext) &&
++        (!_initParams.contains(pContext) || !CreateDLSSContext(pContext, pDispatchDescription)))
+         return Fsr3::FFX_ERROR_INVALID_ARGUMENT;
+ 
+     NVSDK_NGX_Parameter* params = _nvParams[pContext];
+-- 
+2.54.0.windows.1
+

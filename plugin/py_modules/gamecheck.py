@@ -11,8 +11,9 @@ gives the exe, the engine, the input libraries and anti-cheat):
           is the engine's own Vulkan code, sgsr3.godot_signs)
 
 kind (what the panel's modes run, presets.py):
-  fsr4    DX12 + an input: our OptiScaler fork, FSR 4 / SGSR 2 / Vela AI live (the fsr4vk provider needs vkd3d)
-  sgsr2   DX11 only + an input: OptiScaler runs SGSR 2 through 11on12 (sgsr3.ini_values Dx11Upscaler); no FSR 4
+  fsr4    DX12 or DX11 + an input: our OptiScaler fork, FSR 4 / FSR 4 Fast / FSR 3 / SGSR 2 live (the fsr4vk provider needs
+          vkd3d; DX11FSR 0.8.23: a DX11 game runs them over OptiScaler's D3D11 -> D3D12 bridge, sgsr3.dx11_upscaler);
+          dx11_only: the binary names DirectX 11 and not 12 (0.8.22 and older: kind sgsr2, SGSR 2 only)
   static  FSR 2 built into the exe, our interceptor (profiles.static_fsr2, RE4)
   any     no input (or native Vulkan / Linux): the Vulkan layer Vela Any (anygame.py)
   none    nothing works: reason says why
@@ -198,7 +199,7 @@ def verdict(scan, markers, static=False, s3_assets=True, ag_assets=True, appid=N
     d3d = "dx12" in api or "dx11" in api
     if windows and s3_assets and inputs and (d3d or not api):
         # no API marker read (a packed exe): DX12 is assumed, the first run's log tells the truth
-        return {**out, "kind": "fsr4" if ("dx12" in api or not api) else "sgsr2"}
+        return {**out, "kind": "fsr4", "dx11_only": bool(api) and "dx12" not in api}
     reason = "no_exe" if not windows else "vulkan_native" if api and not d3d else "no_inputs"
     if ag_assets:
         return {**out, "kind": "any", "reason": reason}

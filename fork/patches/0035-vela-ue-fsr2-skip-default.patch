@@ -1,0 +1,39 @@
+From 4f5f474bcb89c9a120742fc9f4acb6c26897aef6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 00:00:25 +0100
+Subject: [PATCH] 0035-vela-ue-fsr2-skip-default: once OptiScaler has adopted a
+ UE FSR 2 context in DX11, the game's own FSR 2 passes are skipped by default
+ (k2ue3 Bright Memory: picture correct, ~38 fps vs ~34 with both);
+ VELA_UEFSR2_SKIP=0 = both run
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/inputs/FSR2_Dx11.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/OptiScaler/inputs/FSR2_Dx11.cpp b/OptiScaler/inputs/FSR2_Dx11.cpp
+index f7bc5bc..33bb9ef 100644
+--- a/OptiScaler/inputs/FSR2_Dx11.cpp
++++ b/OptiScaler/inputs/FSR2_Dx11.cpp
+@@ -660,7 +660,8 @@ std::optional<int32_t> Fsr2Dx11Dispatch(void* ctx, const void* desc)
+ // takes colour / depth / MV / exposure from the SRVs of the reconstruct pass and the reactive mask from the depth clip
+ // pass (matched to the FFX resource descriptions), the output from the UAVs of the last pass, and runs the 0029 DX11
+ // adoption (AdoptOnDevice / Fsr2Dx11Dispatch) right after that pass. VELA_UEFSR2=0: old behaviour (left to the game);
+-// VELA_UEFSR2_SKIP=1: once adopted, the game's own FSR 2 passes from the reconstruct pass on are not dispatched.
++// Once adopted, the game's own FSR 2 passes from the reconstruct pass on are not dispatched (0035, k2ue3: ~38 fps vs ~34 with
++// both running); VELA_UEFSR2_SKIP=0 dispatches them as well.
+ #include <algorithm>
+ #include <atomic>
+ #include <format>
+@@ -1616,7 +1617,7 @@ void STDMETHODCALLTYPE hkUeDispatch(ID3D11DeviceContext* This, UINT x, UINT y, U
+                     _uePending.store(!_ueFrames.empty(), std::memory_order_release);
+                 }
+ 
+-                skip = uc.adopted && !ev.adopt && UeEnv("VELA_UEFSR2_SKIP", '1');
++                skip = uc.adopted && !ev.adopt && !UeEnv("VELA_UEFSR2_SKIP", '0');
+             }
+         }
+     }
+-- 
+2.54.0.windows.1
+
