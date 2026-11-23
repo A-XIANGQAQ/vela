@@ -3,12 +3,14 @@
 Read from the kernel, never from a name the user can change (values as the Retroid Pocket 6 / SM8550 console reports them):
 - /proc/device-tree/compatible: NUL-separated, e.g. "retroidpocket,rp6\0qcom,qcs8550\0qcom,sm8550\0";
 - /sys/devices/soc0/soc_id: the socinfo number (Linux include/dt-bindings/arm/qcom,ids.h: SM8550 519, QCS8550 603,
-  SM8750 618), machine: "QCS8550" / "SM8750";
-- /proc/device-tree/soc@0/gpu@*/compatible: "qcom,adreno-43050a01" (Adreno 740), "qcom,adreno-44050001" (Adreno 830,
-  Linux arch/arm64/boot/dts/qcom/sm8750.dtsi).
+  SM8650 557, SM8750 618; the Lenovo Legion Tab Gen 3 / TB321FU, an SM8650, reports 577), machine: "QCS8550" / "SM8750";
+- /proc/device-tree/soc@0/gpu@*/compatible: "qcom,adreno-43050a01" (Adreno 740), "qcom,adreno-43051401" (Adreno 750,
+  Linux arch/arm64/boot/dts/qcom/sm8650.dtsi), "qcom,adreno-44050001" (Adreno 830, Linux arch/arm64/boot/dts/qcom/sm8750.dtsi).
 
 Policy:
 - SM8550 (Adreno 740, Hexagon v73): everything as in the 0.8.16 release -- the NPU graphs are built for v73, FSR 4 Fast is tuned here.
+- SM8650 (Adreno 750, Hexagon v75): as SM8550. The v73 graphs run unchanged on the QNN V75 runtime of the NPU part, with
+  the same 17 fsr4npu-check output hashes as SM8550 (measured on a Lenovo Legion Tab Gen 3 / TB321FU).
 - SM8750 (Adreno 830, Hexagon v79): the NPU only when a v79 graph set is on the system or in the plugin
   (V79_DIRS: a "v79" folder with at least one *.bin); without it FSR 4 runs on the GPU, FSR 3, DittoSR and SGSR 2 stay, FSR 4 Fast
   (tuned on the A740 + v73 NPU) is not offered, and the panel says so.
@@ -18,14 +20,14 @@ Policy:
 import glob
 import os
 
-SM8550, SM8750 = "SM8550", "SM8750"
+SM8550, SM8650, SM8750 = "SM8550", "SM8650", "SM8750"
 NO_FSR4 = "FSR 4 needs the Snapdragon 8 Gen 2 or newer NPU; use FSR 3, DittoSR or SGSR 2"  # = en.json model.why.chip_no_fsr4
-SOC_IDS = {519: SM8550, 603: SM8550, 618: SM8750}  # QCS8550 = the SM8550 die (IoT part number), same GPU and cDSP
-COMPATIBLE = {"qcom,sm8550": SM8550, "qcom,qcs8550": SM8550, "qcom,sm8750": SM8750}
-GPUS = {"43050a01": "Adreno 740", "44050000": "Adreno 830", "44050001": "Adreno 830",
+SOC_IDS = {519: SM8550, 603: SM8550, 557: SM8650, 577: SM8650, 618: SM8750}  # QCS8550 = the SM8550 die (IoT part number), same GPU and cDSP
+COMPATIBLE = {"qcom,sm8550": SM8550, "qcom,qcs8550": SM8550, "qcom,sm8650": SM8650, "qcom,sm8750": SM8750}
+GPUS = {"43050a01": "Adreno 740", "43051401": "Adreno 750", "44050000": "Adreno 830", "44050001": "Adreno 830",
         "650.2": "Adreno 650"}  # SM8250 (Linux arch/arm64/boot/dts/qcom/sm8250.dtsi "qcom,adreno-650.2")
-NPU_ARCH = {SM8550: "v73", SM8750: "v79"}
-GPU_OF = {SM8550: "Adreno 740", SM8750: "Adreno 830"}
+NPU_ARCH = {SM8550: "v73", SM8650: "v75", SM8750: "v79"}
+GPU_OF = {SM8550: "Adreno 740", SM8650: "Adreno 750", SM8750: "Adreno 830"}
 # where a Hexagon v79 graph set may live: the system component's graph dir, or the plugin's assets
 V79_DIRS = ("/usr/lib64/vela-npu/v79",)
 
@@ -77,7 +79,7 @@ def policy(dev, v79_dirs=V79_DIRS):
     """What this chip may run. npu: the NPU path may be offered at all (the service checks still apply on top);
     fsr4: FSR 4 is offered at all (not on chips without a supported NPU); fsr4fast: FSR 4 Fast is offered; unavailable: English lines (logged, in game_state["device"]); note: one line, or None."""
     soc = dev.get("soc")
-    if soc == SM8550:
+    if soc in (SM8550, SM8650):  # SM8650: the v73 graphs on the V75 runtime
         return {"npu": True, "npu_graphs": "v73", "fsr4": True, "fsr4fast": True, "unavailable": [], "note": None}
     if soc == SM8750:
         d = v79_graphs(v79_dirs)

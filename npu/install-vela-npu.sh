@@ -88,11 +88,13 @@ CHIP=""
 if [ -n "$DT" ]; then
   compat=$(tr '\0' '\n' < "$DT" 2>/dev/null)
   if echo "$compat" | grep -qx "qcom,sm8550"; then CHIP=SM8550
+  elif echo "$compat" | grep -qx "qcom,sm8650"; then CHIP=SM8650
   elif echo "$compat" | grep -qx "qcom,sm8750"; then CHIP=SM8750
-  else fail "the NPU graphs are built for Snapdragon 8 Gen 2 (SM8550) and Snapdragon 8 Elite (SM8750) only; on this chip Vela runs FSR 4 on the GPU"; fi
+  else fail "the NPU graphs are built for Snapdragon 8 Gen 2 (SM8550), 8 Gen 3 (SM8650) and 8 Elite (SM8750) only; on this chip Vela runs FSR 4 on the GPU"; fi
 fi
 case $CHIP in
   SM8550) say "  chip: SM8550 (Snapdragon 8 Gen 2), HTP v73 graphs";;
+  SM8650) say "  chip: SM8650 (Snapdragon 8 Gen 3), HTP v73 graphs on the HTP v75 runtime (same output hashes as SM8550)";;
   SM8750) say "  chip: Snapdragon 8 Elite (SM8750): experimental. HTP v79 graphs (/usr/lib64/vela-npu/v79)"; WANT=$WANT_SM8750;;
 esac
 if [ "${VERSION_ID:-}" != 44 ] && [ $FORCE = 0 ]; then

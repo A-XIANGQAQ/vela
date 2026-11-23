@@ -423,7 +423,13 @@ On v79 the 1080p graphs plan less traffic (spill/fill about 21.1–21.2 MB). The
   `/proc/device-tree/compatible` for `qcom,sm8750` and links `/run/vela-npu/graphs` to `/usr/lib64/vela-npu/v79`. A
   drop-in then mounts each v79 file over its v73 path in the daemon's mount namespace. Status: experimental. Proven on
   the simulator, run on an Odin 3, not bit-exact on the device.
-- **Other chips:** our notes cover only v73 (SM8550) and v79 (SM8750). For another Hexagon generation you would change
+- **HTP v75 (Snapdragon 8 Gen 3, SM8650):** the v73 graphs run unchanged with the QAIRT 2.47.0.260601 HTP v75 runtime
+  (`libQnnHtpV75Stub.so`, `libQnnHtpV75Skel.so`, `libQairtHtpV75Skel.so`, `libQnnHtpV75.so`). On a Lenovo Legion Tab
+  Gen 3 (TB321FU) all 17 graphs give the SM8550 output hashes of section 6, so the installer treats SM8650 as SM8550. A
+  native v75 build (`soc_model 57`, `dsp_arch v75` in `htp.json`) of `nf4_k1h`, `nf4_k1h_400` and `nf4_k1h_324` gets the
+  same compiler plan as v73 (same spill/fill bytes), the same output hashes and the same NPU time on the device
+  (`fsr4npu-check` NPU execute p50, v73 / v75: 4.64 / 4.65 ms, 2.25 / 2.24 ms, 2.42 / 2.37 ms), so no v75 graph set is shipped.
+- **Other chips:** our notes cover only v73 (SM8550), v75 (SM8650) and v79 (SM8750). For another Hexagon generation you would change
   `soc_model`/`dsp_arch`, check the result on the simulator, and add that chip's runtime libraries. **[unknown: never
   built or tested by us]**
 

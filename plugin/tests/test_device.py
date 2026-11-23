@@ -35,7 +35,9 @@ def tree(name, compatible, soc_id, machine, gpu):
 rp6 = tree("rp6", ["retroidpocket,rp6", "qcom,qcs8550", "qcom,sm8550"], 603, "QCS8550", "43050a01")
 odin3 = tree("odin3", ["ayntec,odin3", "qcom,sm8750"], 618, "SM8750", "44050001")
 sid_only = tree("sid", ["vendor,board"], 618, "SM8750", None)  # no gpu node, no qcom compatible: soc_id decides
-other = tree("other", ["vendor,x", "qcom,sm8650"], 557, "SM8650", "43051401")
+tb321fu = tree("tb321fu", ["lenovo,tb321fu", "qcom,sm8650"], 577, "Lenovo Legion Y700 (2025) / TB321FU", "43051401")
+sm8650_sid = tree("sm8650sid", ["vendor,board"], 557, "SM8650", None)  # no gpu node, no qcom compatible: soc_id decides
+other = tree("other", ["vendor,x", "qcom,sm8450"], 457, "SM8450", "730.1")  # Linux sm8450.dtsi "qcom,adreno-730.1"
 empty = os.path.join(tmp, "empty")
 os.makedirs(empty)
 
@@ -45,8 +47,12 @@ d8 = device.detect(odin3)
 assert d8["soc"] == "SM8750" and d8["gpu"] == "Adreno 830" and d8["npu_arch"] == "v79" and d8["gpu_chip"] == "44050001", d8
 ds = device.detect(sid_only)
 assert ds["soc"] == "SM8750" and ds["gpu"] == "Adreno 830" and ds["gpu_chip"] is None, ds
+dt = device.detect(tb321fu)
+assert dt["soc"] == "SM8650" and dt["gpu"] == "Adreno 750" and dt["npu_arch"] == "v75" and dt["soc_id"] == 577, dt
+d65 = device.detect(sm8650_sid)
+assert d65["soc"] == "SM8650" and d65["gpu"] == "Adreno 750" and d65["gpu_chip"] is None, d65
 du = device.detect(other)
-assert du["soc"] is None and du["gpu"] == "Adreno 43051401" and du["npu_arch"] is None, du
+assert du["soc"] is None and du["gpu"] == "Adreno 730.1" and du["npu_arch"] is None, du
 de = device.detect(empty)  # a PC / no device tree: unknown
 assert de["soc"] is None and de["gpu"] is None and de["npu_arch"] is None, de
 
@@ -62,8 +68,10 @@ write(os.path.join(v79, "nf4_k1h.bin"), b"graph")
 p8g = device.policy(d8, (os.path.join(tmp, "nope"), v79))
 assert p8g["npu"] and p8g["fsr4fast"] and p8g["npu_graphs"] == "v79" and p8g["graph_dir"] == v79, p8g
 assert not device.policy(d, (v79,))["unavailable"]  # SM8550 ignores the v79 folder
+pt = device.policy(dt, (v79,))  # SM8650 = SM8550: v73 graphs, FSR 4 Fast, no note
+assert pt["npu"] and pt["fsr4"] and pt["fsr4fast"] and pt["npu_graphs"] == "v73" and pt["note"] is None and pt["unavailable"] == [], pt
 pu = device.policy(du, (v79,))
-assert not pu["npu"] and not pu["fsr4fast"] and "SM8650" in pu["note"], pu
+assert not pu["npu"] and not pu["fsr4fast"] and "SM8450" in pu["note"], pu
 pe = device.policy(de, (v79,))
 assert not pe["npu"] and not pe["fsr4fast"] and "unknown chip" in pe["note"], pe
 
