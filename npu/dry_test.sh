@@ -11,7 +11,7 @@
 HERE=$(cd "$(dirname "$0")" && pwd)
 IMG=${IMG:?path to vela-npu-sysext-14.raw}
 DSP_TREE=${DSP_TREE:?extracted dsp partition tree}
-dnf -y -q install e2fsprogs util-linux systemd udev squashfs-tools >/dev/null 2>&1
+dnf -y -q install e2fsprogs util-linux systemd udev squashfs-tools procps-ng >/dev/null 2>&1  # procps-ng: the installer needs pgrep
 mkdir -p /home/armada/Downloads
 useradd -M -d /home/armada armada 2>/dev/null
 # an ext4 image of the extracted dsp tree stands in for the dsp partition

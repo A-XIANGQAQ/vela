@@ -1,23 +1,24 @@
 #!/bin/sh
-# Vela NPU system part, package 14: lets Vela run FSR 4 / FSR 4 Fast on the Hexagon NPU (Snapdragon 8 Gen 2, SM8550;
-# Snapdragon 8 Elite, SM8750, experimental).
+# Vela NPU system part, package 15: lets Vela run FSR 4 / FSR 4 Fast on the Hexagon NPU (Snapdragon 8 Gen 2, SM8550;
+# Snapdragon 8 Gen 3, SM8650; Snapdragon 8 Elite, SM8750, experimental).
 # Needs sudo ONCE (it adds a system extension, a udev rule and system services). Run in Desktop mode -> Konsole, game closed:
 #   curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.21/install-vela-npu.sh | sudo sh
 # What it does:
-#   1. downloads vela-npu-sysext-14.raw (NPU daemon, 17 FSR 4 graphs for HTP v73 and for HTP v79, quic/fastrpc, and the
+#   1. downloads vela-npu-sysext-15.raw (NPU daemon, 17 FSR 4 graphs for HTP v73 and for HTP v79, quic/fastrpc, and the
 #      Qualcomm AI Engine Direct (QNN) runtime 2.47.0.260601, unmodified) and checks its sha256;
 #   2. reads the DSP shell and C++ runtime (3 files) read-only from your device's own dsp partition;
 #   3. installs both as systemd system extensions in /var/lib/extensions (nothing in armadaOS is overwritten), enables the
 #      NPU daemon, and checks each graph with a fixed input. Prints "Vela NPU: OK" or "Vela NPU: FAILED" + the reason.
-# Remove: uninstall-vela-npu.sh (same release). Options: --image <local vela-npu-sysext-14.raw>, --force.
+# Remove: uninstall-vela-npu.sh (same release). Options: --image <local vela-npu-sysext-15.raw>, --force.
 # The image carries the QNN runtime (no SDK download); library search paths: /usr/lib64/vela-npu only; root:root, umask 022.
 set -u
 umask 022
-VER=14
-TAG=v0.8.21
+VER=15
+# PKG15: set TAG to the release that carries vela-npu-sysext-15.raw (until then the download fails, nothing is installed)
+TAG=vX.Y.Z
 BASE_URL="https://github.com/zrprod9-cmyk/vela/releases/download/$TAG"
 IMAGE=vela-npu-sysext-$VER.raw
-IMAGE_SHA256=10acba9196a7a55f712d14451ed64a20385cc5eab045744be6a63dd264392ac1
+IMAGE_SHA256=aedc7f8962ca264824b21f5f68099df5171b7584f557def69dd12c3264d39af9
 EXT=/var/lib/extensions
 QDIR=/var/lib/extensions/armada-vela-npu-qnn
 # One daemon serves all graphs (one cDSP session). The graphs are loaded on first use, so the check below loads each one in turn.
@@ -30,7 +31,8 @@ OLD_UNITS="vela-npu@nf4_exact.service vela-npu@nf4_k1h.service vela-npu@nf4_k1h_
 DSP_FILES="cb2a0a8ed448bd6e0fea0a81bd0c3892b93373f3eff5c43ca577c7a0628d7251 fastrpc_shell_unsigned_3
 6050f67f1416a69a81d3b7f34fa4ccdca139d8c752a24698a7fd679bf418b90f libc++.so.1
 934f8039214f15b1a692a2278909a9468f1b5561affafbf60efb96e158583563 libc++abi.so.1"
-# fsr4npu-check output hash per daemon (fixed input). SM8550: measured on the tested device (HTP v73 graphs).
+# fsr4npu-check output hash per daemon (fixed input). SM8550: measured on the tested device (HTP v73 graphs); SM8650 (the same
+# v73 graphs on the HTP v75 runtime) gives the same 17 hashes (measured on a Lenovo TB321FU, PR #6).
 WANT="fsr4npud_nf4up_k1h 60a3d9ad466fca76
 fsr4npud_nf4up_k1h_450 90a028a11df7fc3e
 fsr4npud_nf4up_k1h_360 f27ed0e09ef0d7b8

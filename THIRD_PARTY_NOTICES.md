@@ -52,7 +52,8 @@ reads them from the device's own dsp partition.
 
 - **Included** (only inside `vela-npu-sysext-14.raw`, never as a separate download): `libQnnHtp.so`,
   `libQnnHtpV73Stub.so`, `libQnnSystem.so`, `libQnnHtpV73Skel.so`, `libQairtHtpV73Skel.so`, `libQnnHtpV73.so`,
-  `libQnnHtpV79Stub.so`, `libQnnHtpV79Skel.so`, `libQairtHtpV79Skel.so`, `libQnnHtpV79.so` from the
+  `libQnnHtpV79Stub.so`, `libQnnHtpV79Skel.so`, `libQairtHtpV79Skel.so`, `libQnnHtpV79.so`, `libQnnHtpV75Stub.so`,
+  `libQnnHtpV75Skel.so`, `libQairtHtpV75Skel.so`, `libQnnHtpV75.so` from the
   Qualcomm AI Engine Direct SDK (QAIRT) 2.47.0.260601, unmodified.
 - **Licence:** Qualcomm AI Stack License, shipped unchanged in the image as
   `/usr/share/licenses/armada-vela-npu/Qualcomm-AI-Stack-LICENSE.pdf`, with Qualcomm's third-party Notice File

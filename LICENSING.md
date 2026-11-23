@@ -23,9 +23,11 @@ kept in `assets/licenses/decky-plugin-template-BSD-3-Clause.txt`.
   quic/fastrpc (BSD-3-Clause, its text is inside the image) and the **Qualcomm AI Engine Direct SDK runtime
   2.47.0.260601**, unmodified, under the Qualcomm AI Stack License: `libQnnHtp.so`, `libQnnHtpV73Stub.so`,
   `libQnnSystem.so` (in `/usr/lib64/vela-npu`), `libQnnHtpV73Skel.so`, `libQairtHtpV73Skel.so`, `libQnnHtpV73.so`
-  (in `/usr/lib/rfsa/adsp`), and its HTP v79 part: `libQnnHtpV79Stub.so` (in `/usr/lib64/vela-npu`), `libQnnHtpV79Skel.so`, `libQairtHtpV79Skel.so`, `libQnnHtpV79.so` (in `/usr/lib/rfsa/adsp`).
+  (in `/usr/lib/rfsa/adsp`), and its HTP v79 part: `libQnnHtpV79Stub.so` (in `/usr/lib64/vela-npu`), `libQnnHtpV79Skel.so`, `libQairtHtpV79Skel.so`, `libQnnHtpV79.so` (in `/usr/lib/rfsa/adsp`), and its HTP v75 part
+  (Snapdragon 8 Gen 3, SM8650): `libQnnHtpV75Stub.so` (in `/usr/lib64/vela-npu`), `libQnnHtpV75Skel.so`, `libQairtHtpV75Skel.so`, `libQnnHtpV75.so` (in `/usr/lib/rfsa/adsp`).
 - The 17 graphs are the AMD FSR 4.1.1 network (AMD's MIT licence, see `THIRD_PARTY_NOTICES.md`), compiled with Qualcomm's
-  QAIRT tools into QNN context binaries for HTP v73 (SM8550) and HTP v79 (SM8750, in `v79/`).
+  QAIRT tools into QNN context binaries for HTP v73 (SM8550; SM8650 runs the same files on the HTP v75 runtime) and HTP v79
+  (SM8750, in `v79/`).
 - No DSP firmware file is in the image: `install-vela-npu.sh` reads `fastrpc_shell_unsigned_3`, `libc++.so.1` and
   `libc++abi.so.1` from the device's own dsp partition.
 - Qualcomm's licence for the 10 runtime files, the **Qualcomm AI Stack License** (the SDK's `LICENSE.pdf`), and its Notice

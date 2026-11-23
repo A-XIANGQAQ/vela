@@ -1,10 +1,10 @@
 #!/bin/sh
-# Builds the Vela NPU system part, package 14: the systemd system extension vela-npu-sysext-14.raw.
+# Builds the Vela NPU system part, package 15: the systemd system extension vela-npu-sysext-15.raw.
 # Contents: the NPU daemon fsr4npud and its checker, the 17 FSR 4 graphs for HTP v73 (Snapdragon 8 Gen 2, SM8550) and the same
 # 17 graphs built for HTP v79 (Snapdragon 8 Elite, SM8750; in v79/), quic/fastrpc (commit a56e9d4, BSD-3-Clause, built from
 # source), the systemd units (units/ next to this script), two drop-ins that pick the v79 graphs on SM8750 (units/ next to this script), the udev rule,
-# modules-load, extension-release, notices, and the Qualcomm AI Engine Direct (QNN) runtime 2.47.0.260601 (10 files: host part,
-# HTP v73 and HTP v79 parts, unmodified, each sha256-checked) with Qualcomm's licence and Notice File (unchanged).
+# modules-load, extension-release, notices, and the Qualcomm AI Engine Direct (QNN) runtime 2.47.0.260601 (14 files: host part,
+# HTP v73, HTP v75 and HTP v79 parts, unmodified, each sha256-checked) with Qualcomm's licence and Notice File (unchanged).
 # NOT in the image: the 3 DSP-side files of the device (fastrpc_shell_unsigned_3, libc++.so.1, libc++abi.so.1);
 # install-vela-npu.sh reads those from the device's own dsp partition into a second, directory extension armada-vela-npu-qnn.
 # Library search paths: libcdsp_default_listener RUNPATH and fsr4npud RPATH are set to /usr/lib64/vela-npu (DT_RPATH kept on
@@ -24,14 +24,14 @@
 #   (not an input: the units, the udev rule, modules-load and the two drop-ins are units/ next to this script)
 #   QAIRT          the unpacked Qualcomm AI Engine Direct SDK 2.47.0.260601 (lib/..., LICENSE.pdf, QNN_NOTICE.txt)
 #   PAYLOAD_MD5    md5 list of the payload ("<md5>  ./usr/..."): the files tested on the SM8550 device, the v79 graphs,
-#                  the V79 runtime files and the two drop-ins
+#                  the V79 and V75 runtime files and the two drop-ins
 #   OUT            output folder
 # Example (Fedora 44 container):
 #   docker run --rm -v <inputs>:/in -v <out>:/out -v <repo>/npu:/npu -e FASTRPC_STAGE=/in/... ... -e OUT=/out \
 #     registry.fedoraproject.org/fedora:44 sh /npu/mk_public_sysext.sh
 set -e
 umask 022
-VER=14
+VER=15
 EPOCH=1761955200   # 2025-11-01 00:00 UTC
 SYSLIB=/usr/lib64/vela-npu
 dnf -y -q install squashfs-tools patchelf binutils >/dev/null 2>&1
@@ -95,13 +95,14 @@ echo "$QLIC_FILES" | while read -r sha src dst; do
 done
 cat > $D/README.txt <<R
 Vela NPU system part, package $VER (public image).
-Ours: fsr4npud, fsr4npu-check (the NPU daemon and its checker), the 17 FSR 4 graphs nf4*.bin (HTP v73, Snapdragon 8 Gen 2 SM8550)
+Ours: fsr4npud, fsr4npu-check (the NPU daemon and its checker), the 17 FSR 4 graphs nf4*.bin (HTP v73, Snapdragon 8 Gen 2 SM8550; on Snapdragon 8 Gen 3 SM8650 with the HTP v75 runtime)
 and v79/nf4*.bin (the same graphs for HTP v79, Snapdragon 8 Elite SM8750), the systemd units and drop-ins, the udev rule.
 quic/fastrpc (BSD-3-Clause, fastrpc-BSD-3-Clause.txt): cdsprpcd, libcdsprpc, libcdsp_default_listener, built from source.
 Qualcomm AI Engine Direct SDK runtime $QAIRT_VER, redistributed by the Vela author, unmodified:
   usr/lib64/vela-npu/libQnnHtp.so, libQnnHtpV73Stub.so, libQnnSystem.so;
   usr/lib/rfsa/adsp/libQnnHtpV73Skel.so, libQairtHtpV73Skel.so, libQnnHtpV73.so;
-  usr/lib64/vela-npu/libQnnHtpV79Stub.so; usr/lib/rfsa/adsp/libQnnHtpV79Skel.so, libQairtHtpV79Skel.so, libQnnHtpV79.so.
+  usr/lib64/vela-npu/libQnnHtpV79Stub.so; usr/lib/rfsa/adsp/libQnnHtpV79Skel.so, libQairtHtpV79Skel.so, libQnnHtpV79.so;
+  usr/lib64/vela-npu/libQnnHtpV75Stub.so; usr/lib/rfsa/adsp/libQnnHtpV75Skel.so, libQairtHtpV75Skel.so, libQnnHtpV75.so.
   Licence: Qualcomm AI Stack License (Qualcomm-AI-Stack-LICENSE.pdf, the SDK's LICENSE.pdf unchanged) and its Notice File
   (QNN_NOTICE.txt, unchanged). Distributed only as part of Vela, never on a standalone basis (licence section 1).
   Export: see the licence's export-control section (10(f)).
@@ -118,7 +119,7 @@ X_VELA_NPU_PACKAGE=$VER
 X_VELA_NPU_PART=base + Qualcomm QNN runtime (public r2; the device's DSP shell: extension armada-vela-npu-qnn)
 X_VELA_NPU_GRAPHS=nf4_k1h nf4_k1h_360 nf4_k1h_450 nf4up_k1h nf4up_k1h_450 nf4up_k1h_360 nf4_exact nf4_k1h_452 nf4up_k1h_452 nf4_k1h_405 nf4up_k1h_405 nf4_k1h_400 nf4up_k1h_400 nf4_k1h_324 nf4up_k1h_324 nf4_k1h_270 nf4up_k1h_270
 X_VELA_NPU_UNIT=vela-npu.service
-X_VELA_NPU_CHIPS=SM8550 (HTP v73) SM8750 (HTP v79, graphs in v79/)
+X_VELA_NPU_CHIPS=SM8550 (HTP v73) SM8650 (HTP v73 graphs, HTP v75 runtime) SM8750 (HTP v79, graphs in v79/)
 X_VELA_NPU_QAIRT=$QAIRT_VER
 X_VELA_NPU_FASTRPC=$(cut -d' ' -f2 $FCOMMIT)
 X_VELA_NPU_BUILT_ON_IMAGE=20261010.c3d178c

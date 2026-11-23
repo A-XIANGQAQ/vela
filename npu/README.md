@@ -1,4 +1,4 @@
-# Vela NPU system part (package 14)
+# Vela NPU system part (package 15)
 
 It lets Vela run FSR 4 and FSR 4 Fast on the Hexagon NPU of the Snapdragon 8 Gen 2 (SM8550, HTP v73), of the Snapdragon 8 Gen 3
 (SM8650, HTP v75: the same v73 graphs on the v75 runtime) and, experimentally,
@@ -6,21 +6,23 @@ of the Snapdragon 8 Elite (SM8750, HTP v79: the AYN Odin 3 and other devices wit
 
 ## Install (Desktop mode → Konsole, game closed)
 
-1. Run: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.21/install-vela-npu.sh | sudo sh`
+1. Run: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.24/install-vela-npu.sh | sudo sh`
    Nothing else to download: the image carries the Qualcomm QNN runtime; the installer reads 3 DSP files from your device.
 2. It ends with `Vela NPU: OK - all NPU graphs checked work` or `Vela NPU: FAILED - <reason>`. Start the game again; the Vela
    panel shows "on the NPU".
 
-Remove: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.21/uninstall-vela-npu.sh | sudo sh`
+Remove: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.24/uninstall-vela-npu.sh | sudo sh`
 
 ## Game resolutions on the NPU
 
-Package 14 has FSR 4 networks for these output sizes: 1920x1080, 1600x900 and 1280x720, and the newer 1600x904, 1440x810, 1280x800,
+Package 15 has the FSR 4 networks of package 14, for these output sizes: 1920x1080, 1600x900 and 1280x720, and the newer 1600x904, 1440x810, 1280x800,
 1152x648 and 960x540. At any other size, FSR 4 runs on the GPU.
 
 - On the Retroid Pocket 6, 960x540 has run on the NPU in a game (RE4). The other four new sizes pass the installer's fixed-input
   check on that device but have not been run in a game yet.
 - On the Snapdragon 8 Elite the five new sizes are experimental: not tested there yet.
+- On the Snapdragon 8 Gen 3 (SM8650) the v73 graphs run on the HTP v75 runtime. The author of PR #6 checked all 17 graphs
+  on a Lenovo Legion Tab Gen 3 (TB321FU): same output hashes as on SM8550. We have no SM8650 device to check it ourselves.
 - 1366x768 is not supported on the NPU. The panel asks for 1920x1080.
 
 ## What it installs
@@ -29,18 +31,15 @@ Package 14 has FSR 4 networks for these output sizes: 1920x1080, 1600x900 and 12
 |---|---|---|
 | `/var/lib/extensions/armada-vela-npu.raw` | release asset `vela-npu-sysext-14.raw` (squashfs systemd system extension, sha256 `10acba9196a7a55f712d14451ed64a20385cc5eab045744be6a63dd264392ac1`, list in `vela-npu-sysext-14.contents.txt`) | `mk_public_sysext.sh`, byte-reproducible (built twice, same sha256) |
 | inside: `/usr/lib64/vela-npu/fsr4npud`, `fsr4npu-check` | the NPU daemon (one process for all FSR 4 graphs) and its checker | ours, GPL-3.0-or-later; source and build steps: [`src/`](src/README.md) |
-| inside: `/usr/lib64/vela-npu/nf4*.bin` (17) | the FSR 4.1.1 network compiled for HTP v73: 1920x1080 / 1600x900 / 1280x720 / 1600x904 / 1440x810 / 1280x800 / 1152x648 / 960x540 output × Performance / Ultra Performance, + exact | ours (from AMD's FSR 4 network) |
-| inside: `/usr/lib64/vela-npu/v79/nf4*.bin` (17) | the same 17 graphs compiled for HTP v79 (SM8750), same file names | ours (from AMD's FSR 4 network) |
+| inside: `/usr/lib64/vela-npu/nf4*.bin` (17) | the FSR 4.1.1 network compiled for HTP v73 (also used on SM8650, with the HTP v75 runtime): 1920x1080 / 1600x900 / 1280x720 / 1600x904 / 1440x810 / 1280x800 / 1152x648 / 960x540 output × Performance / Ultra Performance, + exact | ours (from AMD's FSR 4 network) |
 | inside: `/usr/lib64/vela-npu/v79/nf4*.bin` (17) | the same 17 graphs compiled for HTP v79 (SM8750), same file names | ours (from AMD's FSR 4 network) |
 | inside: `cdsprpcd`, `libcdsprpc.so`, `libcdsp_default_listener.so` | the FastRPC client and the cDSP listener | quic/fastrpc a56e9d4, BSD-3-Clause |
 | inside: `/usr/lib64/vela-npu/libQnnHtp.so`, `libQnnHtpV73Stub.so`, `libQnnSystem.so`; `/usr/lib/rfsa/adsp/libQnnHtpV73Skel.so`, `libQairtHtpV73Skel.so`, `libQnnHtpV73.so` | the Qualcomm AI Engine Direct (QNN) runtime 2.47.0.260601 (host part + HTP v73 part) | Qualcomm AI Engine Direct SDK runtime, unmodified, Qualcomm AI Stack License (sha256 of each file in `mk_public_sysext.sh`) |
 | inside: `/usr/lib64/vela-npu/libQnnHtpV79Stub.so`; `/usr/lib/rfsa/adsp/libQnnHtpV79Skel.so`, `libQairtHtpV79Skel.so`, `libQnnHtpV79.so` | the same runtime's HTP v79 part (SM8750) | same |
-| inside: `/usr/lib64/vela-npu/libQnnHtpV79Stub.so`; `/usr/lib/rfsa/adsp/libQnnHtpV79Skel.so`, `libQairtHtpV79Skel.so`, `libQnnHtpV79.so` | the same runtime's HTP v79 part (SM8750) | same |
 | inside: `/usr/lib64/vela-npu/libQnnHtpV75Stub.so`; `/usr/lib/rfsa/adsp/libQnnHtpV75Skel.so`, `libQairtHtpV75Skel.so`, `libQnnHtpV75.so` | the same runtime's HTP v75 part (SM8650) | same |
 | inside: `/usr/share/licenses/armada-vela-npu/Qualcomm-AI-Stack-LICENSE.pdf`, `QNN_NOTICE.txt` | Qualcomm's licence for that runtime (the SDK's `LICENSE.pdf`) and its third-party Notice File, both unchanged (sha256 in `mk_public_sysext.sh`) | Qualcomm AI Engine Direct SDK 2.47.0.260601 |
 | inside: `vela-npu.service`, `vela-npu-listener.service`, `vela-npu-setup.service` (source: [`units/`](units/)) | the daemon runs as a dynamic user in group `render`, no capabilities, read-only system; the listener runs as root with 2 capabilities (it needs the root-only `/dev/fastrpc-cdsp-secure`) | ours |
-| inside: `vela-npu-setup.service.d/50-vela-npu-chip.conf`, `vela-npu.service.d/50-vela-npu-chip.conf` (source: [`units/`](units/)) | chip selection: on `qcom,sm8550` nothing changes; on `qcom,sm8750` the setup unit links `/run/vela-npu/graphs` to `v79/` and each graph's v79 file is mounted read-only over its v73 path | ours |
-| inside: `vela-npu-setup.service.d/50-vela-npu-chip.conf`, `vela-npu.service.d/50-vela-npu-chip.conf` (source: [`units/`](units/)) | chip selection: on `qcom,sm8550` nothing changes; on `qcom,sm8750` the setup unit links `/run/vela-npu/graphs` to `v79/` and each graph's v79 file is mounted read-only over its v73 path | ours |
+| inside: `vela-npu-setup.service.d/50-vela-npu-chip.conf`, `vela-npu.service.d/50-vela-npu-chip.conf` (source: [`units/`](units/)) | chip selection: on `qcom,sm8550` and `qcom,sm8650` nothing changes; on `qcom,sm8750` the setup unit links `/run/vela-npu/graphs` to `v79/` and each graph's v79 file is mounted read-only over its v73 path | ours |
 | inside: `70-vela-npu.rules`, `modules-load.d/vela-npu.conf` | `/dev/fastrpc-cdsp` and `/dev/dma_heap/system` → group `render`, mode 0660: this is how the daemon reaches the NPU without root; loads `system_heap` | ours |
 | `/var/lib/extensions/armada-vela-npu-qnn/` (root:root) | directory extension (name kept from the first installer): DSP shell `fastrpc_shell_unsigned_3`, `libc++.so.1`, `libc++abi.so.1` read from the device's own `dsp` partition | the device |
 | `/etc/systemd/system/vela-npu-boot.service` | starts the NPU service `vela-npu.service` after the extension merge at every boot | written by the installer |
@@ -61,7 +60,7 @@ systemd-sysext stops loading it and the installer must be run again (it refuses 
   root PD) stays root-only.
 
 ## Qualcomm runtime: conditions
-- The 10 Qualcomm files are distributed only inside this image (and the armadaOS `vela-npu` package made from it), as part
+- The 14 Qualcomm files are distributed only inside this image (and the armadaOS `vela-npu` package made from it), as part
   of Vela. They are never offered as separate downloads: the Qualcomm AI Stack License allows distribution "as incorporated
   in Your software application", not on a standalone basis (section 1).
 - They are unmodified (no strip, no patchelf); the licence and the Notice File ship next to them, unchanged.

@@ -448,7 +448,7 @@ On v79 the 1080p graphs plan less traffic (spill/fill about 21.1–21.2 MB). The
 
 All graphs share one cDSP session in one process.
 
-### 8.2 Files in the image (from Qualcomm QAIRT 2.47.0.260601, unmodified)
+### 8.2 Files in the image (from Qualcomm QAIRT 2.47.0.260601, unmodified; the V75 files since package 15)
 
 | path in image | from SDK | sha256 |
 |---|---|---|
@@ -456,12 +456,16 @@ All graphs share one cDSP session in one process.
 | usr/lib64/vela-npu/libQnnSystem.so | lib/aarch64-oe-linux-gcc11.2/libQnnSystem.so | 1dcc4e535f94b7d921d5c294eafc06bc0c87968077e5ee36bb14538820ef6990 |
 | usr/lib64/vela-npu/libQnnHtpV73Stub.so | lib/aarch64-oe-linux-gcc11.2/libQnnHtpV73Stub.so | 71253e59ef34bc1b41bd7a54c0a1bd780e65aa47f4e2d542305106eb02af6e32 |
 | usr/lib64/vela-npu/libQnnHtpV79Stub.so | lib/aarch64-oe-linux-gcc11.2/libQnnHtpV79Stub.so | e8b7712f1df3e05e08b61f1d9ebde5b966cca0f598c55fd96c85d6bf37c41dcc |
+| usr/lib64/vela-npu/libQnnHtpV75Stub.so | lib/aarch64-oe-linux-gcc11.2/libQnnHtpV75Stub.so | 6b83dc2f78f809f469aee92d4d12473dd69db6095602f37061906e9081cc915f |
 | usr/lib/rfsa/adsp/libQnnHtpV73Skel.so | lib/hexagon-v73/unsigned/libQnnHtpV73Skel.so | b5084469a693b05e372eedf8861e29e92c6e012c1cf543144c894f6141a5348f |
 | usr/lib/rfsa/adsp/libQairtHtpV73Skel.so | lib/hexagon-v73/unsigned/libQairtHtpV73Skel.so | 472a7e75763a83dca3463b14f543f54bb4cd5b392a615343375ea1738159cafc |
 | usr/lib/rfsa/adsp/libQnnHtpV73.so | lib/hexagon-v73/unsigned/libQnnHtpV73.so | 9be81519a066a7beee544d1c1a5fe7947df04b53e087fd8e55160b846db0c614 |
 | usr/lib/rfsa/adsp/libQnnHtpV79Skel.so | lib/hexagon-v79/unsigned/libQnnHtpV79Skel.so | dd8987c17928e53877e51ce5739c550d3e74393bd5b1b5ccf311326eddb08612 |
 | usr/lib/rfsa/adsp/libQairtHtpV79Skel.so | lib/hexagon-v79/unsigned/libQairtHtpV79Skel.so | bea936b4ab0d5d8a3d172a634cbeaba38ab6b59c103c23b4580191f95717707c |
 | usr/lib/rfsa/adsp/libQnnHtpV79.so | lib/hexagon-v79/unsigned/libQnnHtpV79.so | 998a3f868c906db88969b11a328ef9adefa4269017f5216b33780574f06d2e0c |
+| usr/lib/rfsa/adsp/libQnnHtpV75Skel.so | lib/hexagon-v75/unsigned/libQnnHtpV75Skel.so | 607be3d7ec64df053f019438ad6eea59dd3eea5d5f985001709d52d5663479ba |
+| usr/lib/rfsa/adsp/libQairtHtpV75Skel.so | lib/hexagon-v75/unsigned/libQairtHtpV75Skel.so | 1229177eb5bc53220ddb5c77bb25e4025209e4c8ea0a46712aedd92e4f4e705e |
+| usr/lib/rfsa/adsp/libQnnHtpV75.so | lib/hexagon-v75/unsigned/libQnnHtpV75.so | 14efadf5fdbac6116767d797394cb60454d252748895b284e24d2540b0560449 |
 
 The image also carries quic/fastrpc built from source (commit `a56e9d4`): `cdsprpcd`, `libcdsprpc.so.1.0.0` and
 `libcdsp_default_listener.so.1.0.0`. The service uses `LD_LIBRARY_PATH=/usr/lib64/vela-npu` and
