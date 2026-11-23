@@ -35,3 +35,7 @@ ce0d39e2cbfd4beeea781b6209e75883 *0031-vela-dx11-probe.patch
 e35aaaac27648e3107befe87a0dc1d69 *0034-vela-ue-fsr2-slots.patch
 ae3ebcb901ace81ef52b153616aec21a *0035-vela-ue-fsr2-skip-default.patch
 6d1024bedeff607d983ae747e6dfe70a *0036-vela-dittosr-model.patch
+ba7450a8c640779e69f0c0b51c6c80b7 *0037-vela-input-api-log.patch
+6388498c0bbcd16ca79e8a0409d38bbc *0038-vela-ue-xess-depth.patch
+bcb1fc606cdcd25527140d1c8380e099 *0039-vela-nodepth-flat.patch
+6a3354a9989f515442a31da7dd50dd6a *0040-vela-vk-live.patch

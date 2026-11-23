@@ -40,6 +40,16 @@ STDERR_CAP = 2 << 20        # one file at most: the first STDERR_HEAD bytes (Pro
 STDERR_HEAD = 256 << 10
 STDERR_CHUNK = 64 << 10
 STDERR_RX = re.compile(r"^stderr-(\d{8})-(\d{6})\.log$")
+# RSL (2026-11-22, Red Dead Redemption 2 1174180 on the console, Steam offline): a game Steam starts through Rockstar's stub
+# (PlayRDR2.exe -> Rockstar Games Launcher -> RDR2.exe) failed inside the overlay: the stub showed "Unable to launch game,
+# please verify your game files" (Wine's mrpippy, Proton #3291: the launcher stopped before it started the game) and
+# RDR2.exe never started; the same launch without vela-launch started the game. Such a game is set up in the game folder
+# (sgsr3: copy mode) and this launcher leaves an overlay kit of it out (the game starts as without Vela) unless the kit
+# or the environment asks for the overlay (STUB_OVERLAY: a console test of the overlay itself).
+# Stub names: PlayRDR2.exe (the console's RDR2), PlayGTAV.exe (GTA V Legacy / Enhanced), PlayGTAIV.exe (GTA IV),
+# PlayRDR.exe (Red Dead Redemption); sources in fsr4r/RDR2/LAUNCH.md.
+LAUNCHER_STUBS = ("playrdr2.exe", "playgtav.exe", "playgtaiv.exe", "playrdr.exe")
+STUB_OVERLAY = "VELA_STUB_OVERLAY"
 
 
 def log(msg, appid=None):
@@ -108,6 +118,19 @@ def read_kit(appid, kits=None):
         if not isinstance(kit.get(key), str) or not os.path.isabs(kit[key]):
             raise RuntimeError(f"launch.json: bad {key}")
     return kit
+
+
+def launcher_stub(*dirs):
+    """RSL: the name of a launcher stub (LAUNCHER_STUBS, any case) in one of the folders, else None. Never raises."""
+    for d in dirs:
+        try:
+            names = os.listdir(d) if d else ()
+        except OSError:
+            continue
+        for name in sorted(names):
+            if name.lower() in LAUNCHER_STUBS and os.path.isfile(os.path.join(d, name)):
+                return name
+    return None
 
 
 def split_options(options):
@@ -219,6 +242,10 @@ def plan(args, env, kits=None, run=subprocess.run):
         raise RuntimeError(f"game folder {game} not found")
     if not os.path.isdir(layer):
         raise RuntimeError("kit folder not found")
+    stub = launcher_stub(game)
+    if stub and not kit.get("stub_overlay") and env.get(STUB_OVERLAY) != "1":
+        raise RuntimeError(f"{stub} starts the game through its own launcher, which fails inside the overlay: the game "
+                           "runs without Vela's kit (the panel sets it up in the game folder)")
     missing = [rel for rel in kit.get("files") or () if not os.path.isfile(os.path.join(layer, *rel.split("/")))]
     if missing:
         raise RuntimeError(f"kit incomplete: {', '.join(missing)}")

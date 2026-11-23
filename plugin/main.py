@@ -437,8 +437,10 @@ class Plugin:
             v = {**v, "kind": "static" if s3.get("static_fsr2") else "fsr4", "reason": None}
         return v
 
-    def _models(self, kind, s3):
-        models = presets.models_for(kind, s3.get("fsr4_available"), s3.get("fsr3_available"), s3.get("dittosr_available"))
+    def _models(self, kind, s3, vulkan=False):
+        # VK1: vulkan = a native Vulkan game (gamecheck verdict "vulkan"): no FSR 4 there yet
+        models = presets.models_for(kind, s3.get("fsr4_available"), s3.get("fsr3_available"), s3.get("dittosr_available"),
+                                    vulkan=vulkan)
         chip = getattr(self, "chip", None)
         if chip is not None and not chip["fsr4fast"]:  # 0.8.16: FSR 4 Fast is tuned for the A740 + v73 NPU
             models = [(m, ok and m != "fsr4fast") for m, ok in models]
@@ -453,11 +455,11 @@ class Plugin:
             return "chip_no_fsr4"
         return None
 
-    def _default_model(self, kind, s3, npu_st):
+    def _default_model(self, kind, s3, npu_st, vulkan=False):
         """presets.default_model, but never a model this chip does not offer (0.8.16: without the NPU and FSR 4 Fast
         the cheap GPU path is FSR 3, then SGSR 2)."""
         model = presets.default_model(kind, s3.get("fsr4_available"), npu_st)
-        ok = dict(self._models(kind, s3))
+        ok = dict(self._models(kind, s3, vulkan))
         if not ok.get(model):
             model = next((m for m in ("fsr3", "sgsr2") if ok.get(m)), model)
         return model
@@ -467,12 +469,12 @@ class Plugin:
         v = self._check(appid, gs["scan"], s3, ag)
         on = bool(s3.get("installed"))
         npu_st = s3.get("npu")
-        models = self._models(v["kind"], s3)
+        models = self._models(v["kind"], s3, bool(v.get("vulkan")))
         win = presets.window_size(window)
         out = {"check": v, "models": [{"id": m, "ok": ok, "why": None if ok else self._chip_off(m)} for m, ok in models],
                "model": "off", "plan": None, "hint": None,
                # 0.8.16: what apply_model "auto" would set up (None: Vela cannot set this game up)
-               "auto_model": self._default_model(v["kind"], s3, npu_st),
+               "auto_model": self._default_model(v["kind"], s3, npu_st, bool(v.get("vulkan"))),
                "window": win, "window_fix": False,
                "layer_on": bool(ag.get("installed")),  # 0.8.12's any-game layer: the panel turns it off
                "launch_fix": self._launch_pending(appid, s3),
@@ -612,6 +614,8 @@ class Plugin:
             return False
         if self.s3.migrate_pending(appid) and appid not in gameutil.running_appids():
             return True  # 0.8.20: a copy setup moves to the overlay
+        if self.s3.stub_move_pending(appid) and appid not in gameutil.running_appids():
+            return True  # RSL: an overlay setup of a launcher-stub game moves to the game folder
         if self.s3.launch_legacy(appid):
             return True  # 0.8.17: set up by an older Vela, no record of its own tokens yet
         if self._launch_lost(appid):
@@ -674,6 +678,8 @@ class Plugin:
             return {"launch_options": launch_options}  # Steam's options not read: nothing to rewrite
         if self.s3.migrate_pending(appid) and appid not in gameutil.running_appids():
             return {"launch_options": self._overlay_migrate(appid, launch_options)}
+        if self.s3.stub_move_pending(appid) and appid not in gameutil.running_appids():
+            return {"launch_options": self._copy_migrate(appid, launch_options)}
         mode = self._kit_mode(appid, None, launch_options)
         if mode is None:
             return {"launch_options": self._launch_keep(appid, launch_options)}
@@ -734,6 +740,26 @@ class Plugin:
         self.s3.log(f"sgsr3: {appid}: moved from the game folder to the overlay ({mode})")
         return self._kit_out(appid, launch, kit, mode)
 
+    def _copy_migrate(self, appid, launch_options):
+        """RSL: an overlay setup of a game Steam starts through a launcher stub (PlayRDR2.exe ...) into the game folder
+        (game closed): the kit goes off (nothing was in the game folder), Steam's options lose exactly the launcher token
+        (launcher mode; the wrapper mode never edited them), then the same choices are set up the copy way (backup,
+        restore on Off). A copy setup that fails leaves the game Off with the options as they were before Vela."""
+        st = self.s3.read_state(self.s3.where(appid)) or {}
+        mode = self.s3.install_mode(appid)
+        npu_on = bool((self.npu.read(appid) or {}).get("on"))
+        kit = self.s3.kit_options(appid)
+        kit = self.npu.disable(appid, kit) if npu_on else kit
+        res = self.s3.disable(appid, kit)
+        launch = self._kit_out(appid, launch_options, res["launch_options"], mode)
+        try:
+            r = self.s3.enable(appid, st.get("opts"), launch, res.get("resolution"), mode="copy")
+        except Exception as e:
+            decky.logger.exception(f"move to the game folder failed for {appid}: {e}")
+            return launch
+        self.s3.log(f"sgsr3: {appid}: moved from the overlay ({mode}) to the game folder: Steam starts it through a launcher stub")
+        return self.npu.enable(appid, r["launch_options"]) if npu_on else r["launch_options"]
+
     def _launch_fix_seen(self, appid, launch_options):
         out = self._launch_fix(appid, launch_options)
         if isinstance(out.get("launch_options"), str):  # V03: what Steam's options are after the fix (the panel sets them)
@@ -783,8 +809,8 @@ class Plugin:
         if v["kind"] not in presets.KINDS:
             raise RuntimeError(f"not supported: {v['reason']}")
         if model == "auto":  # 0.8.16: the device's best model for this game (presets.default_model)
-            model = self._default_model(v["kind"], s3, self.npu.status(appid))
-        if not dict(self._models(v["kind"], s3)).get(model):
+            model = self._default_model(v["kind"], s3, self.npu.status(appid), bool(v.get("vulkan")))
+        if not dict(self._models(v["kind"], s3, bool(v.get("vulkan")))).get(model):
             raise RuntimeError(f"{model} is not available for this game")
         override = None
         if not s3["installed"]:

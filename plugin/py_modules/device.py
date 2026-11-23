@@ -3,7 +3,8 @@
 Read from the kernel, never from a name the user can change (values as the Retroid Pocket 6 / SM8550 console reports them):
 - /proc/device-tree/compatible: NUL-separated, e.g. "retroidpocket,rp6\0qcom,qcs8550\0qcom,sm8550\0";
 - /sys/devices/soc0/soc_id: the socinfo number (Linux include/dt-bindings/arm/qcom,ids.h: SM8550 519, QCS8550 603,
-  SM8650 557, SM8750 618; the Lenovo Legion Tab Gen 3 / TB321FU, an SM8650, reports 577), machine: "QCS8550" / "SM8750";
+  SM8650 557, SM8750 618; SM8650P 577, from Qualcomm's RFC patch, not in mainline qcom,ids.h: the Lenovo Legion Tab Gen 3 /
+  TB321FU reports it), machine: "QCS8550" / "SM8750";
 - /proc/device-tree/soc@0/gpu@*/compatible: "qcom,adreno-43050a01" (Adreno 740), "qcom,adreno-43051401" (Adreno 750,
   Linux arch/arm64/boot/dts/qcom/sm8650.dtsi), "qcom,adreno-44050001" (Adreno 830, Linux arch/arm64/boot/dts/qcom/sm8750.dtsi).
 
@@ -22,7 +23,7 @@ import os
 
 SM8550, SM8650, SM8750 = "SM8550", "SM8650", "SM8750"
 NO_FSR4 = "FSR 4 needs the Snapdragon 8 Gen 2 or newer NPU; use FSR 3, DittoSR or SGSR 2"  # = en.json model.why.chip_no_fsr4
-SOC_IDS = {519: SM8550, 603: SM8550, 557: SM8650, 577: SM8650, 618: SM8750}  # QCS8550 = the SM8550 die (IoT part number), same GPU and cDSP
+SOC_IDS = {519: SM8550, 603: SM8550, 557: SM8650, 577: SM8650, 618: SM8750}  # QCS8550 = the SM8550 die (IoT part number), same GPU and cDSP; 577 = SM8650P
 COMPATIBLE = {"qcom,sm8550": SM8550, "qcom,qcs8550": SM8550, "qcom,sm8650": SM8650, "qcom,sm8750": SM8750}
 GPUS = {"43050a01": "Adreno 740", "43051401": "Adreno 750", "44050000": "Adreno 830", "44050001": "Adreno 830",
         "650.2": "Adreno 650"}  # SM8250 (Linux arch/arm64/boot/dts/qcom/sm8250.dtsi "qcom,adreno-650.2")
@@ -42,7 +43,7 @@ def _read(path, binary=False):
 
 
 def detect(root="/"):
-    """{"soc": "SM8550" | "SM8750" | None, "soc_id", "machine", "gpu", "gpu_chip", "npu_arch", "compatible"}"""
+    """{"soc": "SM8550" | "SM8650" | "SM8750" | None, "soc_id", "machine", "gpu", "gpu_chip", "npu_arch", "compatible"}"""
     j = lambda *p: os.path.join(root, *p)
     raw = _read(j("proc", "device-tree", "compatible"), binary=True) or b""
     compat = [c for c in raw.decode("utf-8", "replace").split("\0") if c]

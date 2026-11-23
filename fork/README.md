@@ -4,8 +4,8 @@ Base: [justradical/Sloptiscaler](https://github.com/justradical/Sloptiscaler) co
 = ARM64EC build of [OptiScaler](https://github.com/optiscaler/OptiScaler) 10.0.0.1 with an SGSR 2 backend.
 Our changes are the patches in `patches/`, applied in number order. License: GPL-3.0 (`LICENSE`, OptiScaler's).
 
-The `OptiScaler.dll` in Vela 0.8.23 (md5 `f2ff97d36751a40eb20fe8479bd207b4`, 18 775 552 bytes) was built from the base +
-**0001–0008, 0010–0021, 0023, 0024, 0024b–0024d and 0025–0036** (patch 0009 and the experimental upstream-sync patch 0000 are not part of this build and are not
+The `OptiScaler.dll` in Vela 0.8.24 (md5 `3a02ef78a479ab4bd9a4ec6a3b5415d1`, 18 924 544 bytes) was built from the base +
+**0001–0008, 0010–0021, 0023, 0024, 0024b–0024d and 0025–0040** (patch 0009 and the experimental upstream-sync patch 0000 are not part of this build and are not
 included). Checksums of the patch files: `patches.md5`.
 
 | patch | what |
@@ -36,6 +36,10 @@ included). Checksums of the patch files: `patches.md5`.
 | 0034 | 0033 takes the inputs and output at the shader slots the FFX pipeline gave them |
 | 0035 | once adopted, the game's own FSR 2 passes are skipped; `VELA_UEFSR2_SKIP=0` runs them as well |
 | 0036 | live model `dittosr`: DittoSR (github.com/Vancete/DittoSR) as the FFX upscaler, loaded from `dittosr/` next to OptiScaler, FSR 3 when it cannot run |
+| 0037 | the log says which input API (DLSS, XeSS, FFX, Streamline) created each upscaler context |
+| 0038 | Unreal Engine XeSS without a depth input: takes the engine's scene depth (port of upstream OptiScaler 7e94156), on by default, `VELA_UE_XESS_DEPTH=0` turns it off |
+| 0039 | `VELA_NODEPTH_FLAT=1` test switch (off by default): FSR 4 with a flat depth instead of FSR 1 for contexts without depth |
+| 0040 | Vela live models in native Vulkan games: SGSR 2, FSR 3 (AMD's `amd_fidelityfx_vk.dll`) and DittoSR; FSR 4 picks fall back to SGSR 2 |
 
 ## Build
 

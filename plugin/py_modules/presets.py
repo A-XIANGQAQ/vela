@@ -49,13 +49,16 @@ def default_model(kind, fsr4=True, npu_state=None):
     return "fsr4" if npu_ready(npu_state) else "fsr4fast"
 
 
-def models_for(kind, fsr4=True, fsr3=True, dittosr=True):
+def models_for(kind, fsr4=True, fsr3=True, dittosr=True, vulkan=False):
     """[(model, offered)] for a game of this kind, in the panel's order; DX11 games the same as DX12 (DX11FSR: the fork
     runs every model over the D3D11 -> D3D12 bridge). fsr4 / fsr3 / dittosr: the plugin carries what the model needs (sgsr3.py
     fsr4_available, fsr3_available, dittosr_available). DITTO: DittoSR only where FSR 3 is offered, and not in a static
     (FSR 2 inside the exe) game: the interceptor has no DittoSR."""
     if kind not in KINDS:
         return []
+    # VK1: a native Vulkan game (gamecheck vulkan): FSR 3, DittoSR and SGSR 2 on the game's Vulkan device (fork patch
+    # 0040); FSR 4 / FSR 4 Fast are shown, not offered (the fork logs "fsr4 cannot run in this Vulkan game yet")
+    fsr4 = fsr4 and not vulkan
     out = [("fsr4", bool(fsr4)), ("fsr4fast", bool(fsr4)), ("fsr3", bool(fsr3))]
     if kind != "static":
         out.append(("dittosr", bool(fsr3) and bool(dittosr)))

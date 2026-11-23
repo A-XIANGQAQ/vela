@@ -11,9 +11,11 @@ gives the exe, the engine, the input libraries and anti-cheat):
           is the engine's own Vulkan code, sgsr3.godot_signs)
 
 kind (what the panel's modes run, presets.py):
-  fsr4    DX12 or DX11 + an input: our OptiScaler fork, FSR 4 / FSR 4 Fast / FSR 3 / SGSR 2 live (the fsr4vk provider needs
+  fsr4    DX12, DX11 or (VK1, fork patch 0040) native Vulkan + an input: our OptiScaler fork, FSR 4 / FSR 4 Fast / FSR 3 / SGSR 2 live (the fsr4vk provider needs
           vkd3d; DX11FSR 0.8.23: a DX11 game runs them over OptiScaler's D3D11 -> D3D12 bridge, sgsr3.dx11_upscaler);
           dx11_only: the binary names DirectX 11 and not 12 (0.8.22 and older: kind sgsr2, SGSR 2 only)
+          vulkan: the binary names Vulkan and no Direct3D (a native Vulkan game): FSR 3, DittoSR and SGSR 2 live on the
+          game's own Vulkan device (OptiScaler's VulkanUpscaler); no FSR 4 there yet (its provider runs on vkd3d's device)
   static  FSR 2 built into the exe, our interceptor (profiles.static_fsr2, RE4)
   any     no input (or native Vulkan / Linux): the Vulkan layer Vela Any (anygame.py)
   none    nothing works: reason says why
@@ -41,6 +43,9 @@ INPUT_MARKERS = {
     b"ffxfsr3upscalercontextcreate": "FSR 3", b"ffx_fsr3upscaler": "FSR 3",
     b"nvsdk_ngx_d3d12_init": "DLSS", b"nvsdk_ngx_d3d11_init": "DLSS",
     b"xessd3d12createcontext": "XeSS",
+    # VK1: the Vulkan inputs (OptiScaler's NVNGX_DLSS_Vk.cpp: DLSS, and FSR 2 / FSR 3.1 / XeSS through its NGX create)
+    b"nvsdk_ngx_vulkan_init": "DLSS", b"nvsdk_ngx_vulkan_createfeature": "DLSS",
+    b"xessvkcreatecontext": "XeSS", b"ffxfsr2getinterfacevk": "FSR 2",
 }
 # files next to the exe that name an API by themselves (Agility SDK, DXVK / vkd3d shipped by the game)
 API_FILES = {"d3d12core.dll": "dx12", "d3d12sdklayers.dll": "dx12"}
@@ -200,6 +205,9 @@ def verdict(scan, markers, static=False, s3_assets=True, ag_assets=True, appid=N
     if windows and s3_assets and inputs and (d3d or not api):
         # no API marker read (a packed exe): DX12 is assumed, the first run's log tells the truth
         return {**out, "kind": "fsr4", "dx11_only": bool(api) and "dx12" not in api}
+    if windows and s3_assets and inputs and "vulkan" in api:
+        # VK1: native Vulkan (no Direct3D named): kind fsr4 with vulkan, the fork's Vulkan live models (no FSR 4 yet)
+        return {**out, "kind": "fsr4", "dx11_only": False, "vulkan": True}
     reason = "no_exe" if not windows else "vulkan_native" if api and not d3d else "no_inputs"
     if ag_assets:
         return {**out, "kind": "any", "reason": reason}

@@ -34,6 +34,7 @@ import time
 import launchers
 import launchopts
 import velakit
+import vela_launch
 import npu
 import presets
 import profiles
@@ -112,11 +113,17 @@ DITTO_DIR = "dittosr"
 DITTO_DLL = DITTO_DIR + "/amd_fidelityfx_upscaler_dx12.dll"
 DITTO_INI = DITTO_DIR + "/dittosr.ini"
 DITTO_FILES = (DITTO_DLL, DITTO_INI)
-INSTALLED = ["dxgi.dll", "OptiScaler.ini", "OptiScaler/plugins/OptiPatcher.asi", FFX_DLL, AMDXC, FSR4VK, DITTO_DLL, DITTO_INI]
-OPTIONAL = {FFX_DLL, AMDXC, FSR4VK, DITTO_DLL, DITTO_INI}  # only while FSR 3 / FSR 4 / DittoSR needs them; otherwise what the game had stays
+# VK1 (fork patch 0040): FSR 3.1 in a native Vulkan game -- AMD's amd_fidelityfx_vk.dll from the same FidelityFX SDK 1.1.4
+# release as FFX_DLL (PrebuiltSignedDLL/, md5 9718fd774c61be1af6af411cf65394cd); the fork's Vulkan FFX backend loads it from
+# the exe folder. DittoSR on Vulkan needs no file of its own: the fork loads the same dittosr/ DLL (one binary for both APIs).
+# Goes in with FSR 3 (fsr3_available) when the plugin carries it; a game's own copy stays (its FSR 3.1 VK input)
+FFXVK_DLL = "amd_fidelityfx_vk.dll"
+INSTALLED = ["dxgi.dll", "OptiScaler.ini", "OptiScaler/plugins/OptiPatcher.asi", FFX_DLL, AMDXC, FSR4VK, DITTO_DLL, DITTO_INI,
+             FFXVK_DLL]
+OPTIONAL = {FFX_DLL, AMDXC, FSR4VK, DITTO_DLL, DITTO_INI, FFXVK_DLL}  # only while FSR 3 / FSR 4 / DittoSR needs them; otherwise what the game had stays
 RUNTIME = ["OptiScaler.log"]          # written by OptiScaler while the game runs
 ASSET_OF = {"dxgi.dll": "OptiScaler.dll", "OptiScaler/plugins/OptiPatcher.asi": "OptiPatcher.asi", FFX_DLL: FFX_DLL,
-            DITTO_DLL: DITTO_DLL, DITTO_INI: DITTO_INI}
+            DITTO_DLL: DITTO_DLL, DITTO_INI: DITTO_INI, FFXVK_DLL: FFXVK_DLL}
 # folders Vela may create in a copy setup (removed again on Off when empty)
 OUR_DIRS = ("OptiScaler", "OptiScaler/plugins", DITTO_DIR)
 REQUIRED_ASSETS = ("OptiScaler.dll", "OptiScaler.ini", "OptiPatcher.asi")
@@ -486,6 +493,8 @@ INPUT_LIBS = {
     "ffx_fsr2_api_x64.dll": "FSR 2", "ffx_fsr2_api_dx12_x64.dll": "FSR 2",
     "ffx_fsr3upscaler_x64.dll": "FSR 3", "ffx_fsr3_x64.dll": "FSR 3",
     "amd_fidelityfx_dx12.dll": "FSR 3.1", "amd_fidelityfx_upscaler_dx12.dll": "FSR 3.1",
+    # VK1: the Vulkan builds of the same inputs
+    "amd_fidelityfx_vk.dll": "FSR 3.1", "ffx_fsr2_api_vk_x64.dll": "FSR 2",
 }
 # name fragment of a file or folder -> anti-cheat
 ANTICHEAT_MARKERS = {"easyanticheat": "EasyAntiCheat", "start_protected_game": "EasyAntiCheat",
@@ -869,11 +878,21 @@ def pick_exe(exes, unity_dirs):
 # (a model change re-creates the upscaler, as in DX12); the ini only decides the first one. No model known: sgsr3_12
 # DITTO: DittoSR is the FFX backend with DittoSR's DLL (ffx_12, as FSR 3)
 DX11_UPSCALER = {"fsr4": "sgsr3_12", "fsr4fast": "sgsr3_12", "fsr3": "ffx_12", "dittosr": "ffx_12", "sgsr2": "sgsr2_12"}
+# VK1 (fork patch 0040): OptiScaler's VulkanUpscaler for the live model in a native Vulkan game. ffx = FSR 3.1 from
+# amd_fidelityfx_vk.dll (FFXVK_DLL), DittoSR on the same backend through its own module; sgsr2 = SGSR 2 (Vulkan). FSR 4 has
+# no Vulkan route yet: SGSR 2 (the fork says "cannot run in this Vulkan game yet"). The fork follows the live file at run
+# time; the ini decides the first upscaler. No model known: sgsr2
+VULKAN_UPSCALER = {"fsr4": "sgsr2", "fsr4fast": "sgsr2", "fsr3": "ffx", "dittosr": "ffx", "sgsr2": "sgsr2"}
 
 
 def dx11_upscaler(model):
     """OptiScaler's Dx11Upscaler for a live model (fsr4lite: as fsr4)."""
     return DX11_UPSCALER.get(presets.RETIRED_MODELS.get(model, model), "sgsr3_12")
+
+
+def vulkan_upscaler(model):
+    """OptiScaler's VulkanUpscaler for a live model (fsr4lite: as fsr4)."""
+    return VULKAN_UPSCALER.get(presets.RETIRED_MODELS.get(model, model), "sgsr2")
 
 
 def live_model(appid, live_dir="/tmp/vela-live"):
@@ -896,12 +915,14 @@ def ini_values(opts):
     vals = {
         ("Upscalers", "Dx12Upscaler"): "sgsr3",
         ("Upscalers", "Dx11Upscaler"): dx11_upscaler(opts.get("live_model")),
+        ("Upscalers", "VulkanUpscaler"): vulkan_upscaler(opts.get("live_model")),  # VK1
         # Vulkan spoofing turns Adreno into "NVIDIA" inside vkd3d-proton and D3D12CreateDevice fails;
-        # DXGI spoofing and OptiPatcher are what open the DLSS input
+        # DXGI spoofing and OptiPatcher are what open the DLSS input. VK1: opts "vulkan_spoof" (a native Vulkan game whose
+        # only input is DLSS: no vkd3d in the process, and the game shows DLSS only on an NVIDIA GPU) turns it on
         ("Spoofing", "Dxgi"): "true",
         ("Spoofing", "StreamlineSpoofing"): "true",
-        ("Spoofing", "Vulkan"): "false",
-        ("Spoofing", "VulkanExtensionSpoofing"): "false",
+        ("Spoofing", "Vulkan"): "true" if opts.get("vulkan_spoof") else "false",
+        ("Spoofing", "VulkanExtensionSpoofing"): "true" if opts.get("vulkan_spoof") else "false",
         ("Plugins", "LoadAsiPlugins"): "true",
         ("Log", "LogToFile"): "true",
         ("Log", "LogLevel"): "2",
@@ -1424,7 +1445,19 @@ class Sgsr3:
             # (an AppImage launcher does not start inside bwrap, and one already open starts the game outside it; seen in
             # indiesaudi's launcher-games PR #3, 2026-11-16). The files go into the game folder, which every launch reads
             return "copy"
-        if not sc["exe_dir"] or not self.overlay_ok(appid, sc):
+        if not sc["exe_dir"]:
+            return "copy"
+        stub = self.launcher_stub(appid, sc)
+        if stub:
+            # RSL (2026-11-22, RDR2 1174180): Steam starts the game through a launcher stub (PlayRDR2.exe -> Rockstar Games
+            # Launcher -> RDR2.exe), which failed inside the overlay ("Unable to launch game, please verify your game
+            # files"; the same launch without the overlay started the game). The files go into the game folder, as before
+            # 0.8.20, with the backup and the restore of the copy setup
+            if sc["appid"] not in self.__dict__.setdefault("_stub_said", set()):  # once per game (the panel asks often)
+                self._stub_said.add(sc["appid"])
+                self.log(f"sgsr3: {sc['appid']}: {stub} starts the game through its own launcher: files go into the game folder")
+            return "copy"
+        if not self.overlay_ok(appid, sc):
             return "copy"
         if self.new_mode == "wrapper" and isinstance(launch_options, str) and \
                 "armada-game-launch" not in launch_options:
@@ -1448,6 +1481,16 @@ class Sgsr3:
             self.log(f"sgsr3: {sc['appid']}: overlay not available ({why}): files go into the game folder")
         self._probes[sc["appid"]] = (time.time(), ok)
         return ok
+
+    def launcher_stub(self, appid, sc=None):
+        """RSL: the launcher stub (vela_launch.LAUNCHER_STUBS) Steam starts the game through, else None."""
+        sc = sc or self.scan(appid)
+        return vela_launch.launcher_stub(sc.get("exe_dir"), sc.get("install_dir"))
+
+    def stub_move_pending(self, appid):
+        """RSL: an overlay setup (an older Vela) of a game Steam starts through a launcher stub: it moves to the game
+        folder (main's _copy_migrate, game closed); vela-launch leaves its kit out until then."""
+        return self.install_mode(appid) in ("wrapper", "launcher") and bool(self.launcher_stub(appid))
 
     def migrate_pending(self, appid):
         """A game set up by copying files into its folder that can move to the overlay (the panel does it, game closed)."""
@@ -1661,6 +1704,10 @@ class Sgsr3:
         (VERSION.json "dittosr_live") and the plugin carries DittoSR's DLL and its settings (assets/sgsr3/dittosr/)."""
         return self.fsr3_available() and bool(self.version.get("dittosr_live")) and \
             all(os.path.isfile(os.path.join(self.assets, *rel.split("/"))) for rel in DITTO_FILES)
+
+    def ffxvk_available(self):
+        """VK1: AMD's FidelityFX SDK 1.1.4 Vulkan DLL (FSR 3.1 in a native Vulkan game) is in the plugin."""
+        return os.path.isfile(os.path.join(self.assets, FFXVK_DLL))
 
     def fsr4_driver(self):
         """AMD's driver FSR 4 route (FFX backend + amdxcffx64.dll): off, see FSR4_READY."""
@@ -1889,7 +1936,9 @@ class Sgsr3:
             if rel not in OPTIONAL or (rel == FFX_DLL and fsr4) or \
                     (rel == FFX_DLL and fsr3 and not self._game_own(d, st, sc, rel)) or \
                     (rel == AMDXC and fsr4) or (rel == FSR4VK and self.fsr4_available()) or \
-                    (rel in DITTO_FILES and ditto):
+                    (rel in DITTO_FILES and ditto) or \
+                    (rel == FFXVK_DLL and fsr3 and not kit["static"] and self.ffxvk_available() and
+                     not self._game_own(d, st, sc, rel)):
                 out.add(rel)
         return out
 

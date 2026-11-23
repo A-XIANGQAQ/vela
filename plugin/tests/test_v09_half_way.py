@@ -150,7 +150,7 @@ P4.s3 = types.SimpleNamespace(scan=lambda appid, fresh=False: {}, status=lambda 
 P4.ag = types.SimpleNamespace(status=lambda *a, **k: {"installed": False})
 P4.npu = types.SimpleNamespace(status=lambda appid: {})
 P4._check = lambda *a, **k: {"kind": "fsr4"}
-P4._models = lambda kind, s3: [("fsr4", True)]
+P4._models = lambda kind, s3, vulkan=False: [("fsr4", True)]
 P4._win_restart = set()
 
 

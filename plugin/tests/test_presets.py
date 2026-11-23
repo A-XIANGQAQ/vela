@@ -99,14 +99,16 @@ assert V(base, set())["kind"] == "fsr4"  # nothing read: DX12 assumed, the first
 assert V(base, {"opengl"}) == {**V(base, {"opengl"}), "kind": "none", "reason": "opengl"}
 assert V({**base, "anticheat": ["EasyAntiCheat"]}, {"dx12"})["reason"] == "anticheat"
 assert V({**base, "install_dir": None}, set())["reason"] == "not_installed"
-assert V(base, {"vulkan"})["kind"] == "any" and V(base, {"vulkan"})["reason"] == "vulkan_native"
+# VK1: a native Vulkan game with an input is kind fsr4 (vulkan); without one it is still "vulkan_native"
+assert V(base, {"vulkan"})["kind"] == "fsr4" and V(base, {"vulkan"})["vulkan"]
+assert V({**base, "inputs": []}, {"vulkan"})["reason"] == "vulkan_native"
 v = V({**base, "inputs": []}, {"dx12"})
 assert (v["kind"], v["reason"]) == ("any", "no_inputs"), v
 v = V({**base, "inputs": []}, {"dx12", "FSR 2"})  # FSR linked into the exe: OptiScaler's pattern search
 assert (v["kind"], v["inputs"], v["inputs_from"]) == ("fsr4", ["FSR 2"], "exe"), v
 assert V({**base, "exe_dir": None, "exe": None, "inputs": []}, set())["reason"] == "no_exe"  # native Linux -> layer
 assert V({**base, "exe_dir": None, "exe": None, "inputs": []}, set(), ag_assets=False)["kind"] == "none"
-assert V(base, {"vulkan"}, ag_assets=False)["reason"] == "vulkan_native"  # 0.8.13: the reason without the layer
+assert V({**base, "inputs": []}, {"vulkan"}, ag_assets=False)["reason"] == "vulkan_native"  # 0.8.13: the reason without the layer
 assert V(base, {"dx11"}, static=True)["kind"] == "static"
 
 calls = []

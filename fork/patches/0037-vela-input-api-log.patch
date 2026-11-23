@@ -1,0 +1,207 @@
+From f579e647a2d622f570eaa305e0d5dac5a2c6f33e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 11:42:57 +0100
+Subject: [PATCH] 0037-vela-input-api-log: every new DX12 feature logs at INFO
+ which input API created it (XeSS / FSR 2.X / FSR 2.0 / FSR 2.TT / FSR 3.0 /
+ FFX mark their NGX create; unmarked = the game's own NGX call: DLSS,
+ 'Streamline sl.dlss.dll loaded' when that module is in the process) with its
+ size and create flags (DepthInverted, LowResMV, AutoExposure, JitteredMV); an
+ XeSS context also logs its init flags (MV high-res / low-res, inverted depth,
+ autoexposure, exposure texture, jittered, NDC, LDR), quality, sizes, MV size,
+ whether a depth texture came and the XeSS version; the 0024 no-depth line
+ names the handle's input API
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/State.h                    | 10 +++++++++
+ OptiScaler/inputs/FSR2_Dx12.cpp       |  3 +++
+ OptiScaler/inputs/FSR3_Dx12.cpp       |  1 +
+ OptiScaler/inputs/FfxApiExe_Dx12.cpp  |  1 +
+ OptiScaler/inputs/FfxApi_Dx12.cpp     |  1 +
+ OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp | 31 +++++++++++++++++++++++++--
+ OptiScaler/inputs/XeSS_Dx12.cpp       | 21 ++++++++++++++++++
+ 7 files changed, 66 insertions(+), 2 deletions(-)
+
+diff --git a/OptiScaler/State.h b/OptiScaler/State.h
+index 8bfd298..6072cc3 100644
+--- a/OptiScaler/State.h
++++ b/OptiScaler/State.h
+@@ -350,6 +350,9 @@ class State
+ 
+     std::optional<ApiUpscalerInput> setInputApiName;
+     ApiUpscalerInput currentInputApiName;
++    // Vela 0037: the input API whose NVSDK_NGX_D3D12_CreateFeature call is running (set by OptiScaler's XeSS / FSR /
++    // FFX inputs around the call, VelaCreateApiScope); unset = the game called NGX itself (DLSS, or Streamline's sl.dlss)
++    std::optional<ApiUpscalerInput> velaCreateApi;
+ 
+     bool isShuttingDown = false;
+     std::set<PVOID> modulesToFree;
+@@ -552,6 +555,13 @@ class ScopedVulkanCreatingSC
+     ~ScopedVulkanCreatingSC() { State::Instance().vulkanCreatingSC = previousState; }
+ };
+ 
++class VelaCreateApiScope
++{
++  public:
++    explicit VelaCreateApiScope(ApiUpscalerInput api) { State::Instance().velaCreateApi = api; }
++    ~VelaCreateApiScope() { State::Instance().velaCreateApi.reset(); }
++};
++
+ class ScopedCreatingD3DDevice
+ {
+   private:
+diff --git a/OptiScaler/inputs/FSR2_Dx12.cpp b/OptiScaler/inputs/FSR2_Dx12.cpp
+index afdb427..7ca7f97 100644
+--- a/OptiScaler/inputs/FSR2_Dx12.cpp
++++ b/OptiScaler/inputs/FSR2_Dx12.cpp
+@@ -172,6 +172,7 @@ static bool CreateDLSSContext(Fsr212::FfxFsr2Context* handle, const Fsr212::FfxF
+     else
+         params->Set(NVSDK_NGX_Parameter_PerfQualityValue, NVSDK_NGX_PerfQuality_Value_DLAA);
+ 
++    VelaCreateApiScope velaApi(ApiUpscalerInput::FSR2X_DX12); // 0037
+     if (NVSDK_NGX_D3D12_CreateFeature(commandList, NVSDK_NGX_Feature_SuperSampling, params, &nvHandle) !=
+         NVSDK_NGX_Result_Success)
+         return false;
+@@ -232,6 +233,7 @@ static bool CreateDLSSContext20(Fsr212::FfxFsr2Context* handle, const FfxFsr20Di
+     else
+         params->Set(NVSDK_NGX_Parameter_PerfQualityValue, NVSDK_NGX_PerfQuality_Value_DLAA);
+ 
++    VelaCreateApiScope velaApi(ApiUpscalerInput::FSR20_DX12); // 0037
+     if (NVSDK_NGX_D3D12_CreateFeature(commandList, NVSDK_NGX_Feature_SuperSampling, params, &nvHandle) !=
+         NVSDK_NGX_Result_Success)
+         return false;
+@@ -293,6 +295,7 @@ static bool CreateDLSSContextTiny(Fsr212::FfxFsr2Context* handle, const FfxFsr2T
+     else
+         params->Set(NVSDK_NGX_Parameter_PerfQualityValue, NVSDK_NGX_PerfQuality_Value_DLAA);
+ 
++    VelaCreateApiScope velaApi(ApiUpscalerInput::FSR2_TinyTina); // 0037
+     if (NVSDK_NGX_D3D12_CreateFeature(commandList, NVSDK_NGX_Feature_SuperSampling, params, &nvHandle) !=
+         NVSDK_NGX_Result_Success)
+         return false;
+diff --git a/OptiScaler/inputs/FSR3_Dx12.cpp b/OptiScaler/inputs/FSR3_Dx12.cpp
+index 0bc40db..f47a373 100644
+--- a/OptiScaler/inputs/FSR3_Dx12.cpp
++++ b/OptiScaler/inputs/FSR3_Dx12.cpp
+@@ -135,6 +135,7 @@ static bool CreateDLSSContext(Fsr3::FfxFsr3UpscalerContext* handle,
+     else
+         params->Set(NVSDK_NGX_Parameter_PerfQualityValue, NVSDK_NGX_PerfQuality_Value_DLAA);
+ 
++    VelaCreateApiScope velaApi(ApiUpscalerInput::FSR3_DX12); // 0037
+     if (NVSDK_NGX_D3D12_CreateFeature(commandList, NVSDK_NGX_Feature_SuperSampling, params, &nvHandle) !=
+         NVSDK_NGX_Result_Success)
+         return false;
+diff --git a/OptiScaler/inputs/FfxApiExe_Dx12.cpp b/OptiScaler/inputs/FfxApiExe_Dx12.cpp
+index 2aaced5..f67e1cc 100644
+--- a/OptiScaler/inputs/FfxApiExe_Dx12.cpp
++++ b/OptiScaler/inputs/FfxApiExe_Dx12.cpp
+@@ -91,6 +91,7 @@ static bool CreateDLSSContext(ffxContext handle, const ffxDispatchDescUpscale* p
+     else
+         params->Set(NVSDK_NGX_Parameter_PerfQualityValue, NVSDK_NGX_PerfQuality_Value_DLAA);
+ 
++    VelaCreateApiScope velaApi(ApiUpscalerInput::FFX_DX12); // 0037
+     auto nvngxResult = NVSDK_NGX_D3D12_CreateFeature(commandList, NVSDK_NGX_Feature_SuperSampling, params, &nvHandle);
+     if (nvngxResult != NVSDK_NGX_Result_Success)
+     {
+diff --git a/OptiScaler/inputs/FfxApi_Dx12.cpp b/OptiScaler/inputs/FfxApi_Dx12.cpp
+index 0b598b0..6efa06a 100644
+--- a/OptiScaler/inputs/FfxApi_Dx12.cpp
++++ b/OptiScaler/inputs/FfxApi_Dx12.cpp
+@@ -115,6 +115,7 @@ static bool CreateDLSSContext(ffxContext handle, const ffxDispatchDescUpscale* p
+     else
+         params->Set(NVSDK_NGX_Parameter_PerfQualityValue, NVSDK_NGX_PerfQuality_Value_DLAA);
+ 
++    VelaCreateApiScope velaApi(ApiUpscalerInput::FFX_DX12); // 0037
+     auto nvngxResult = NVSDK_NGX_D3D12_CreateFeature(commandList, NVSDK_NGX_Feature_SuperSampling, params, &nvHandle);
+     if (nvngxResult != NVSDK_NGX_Result_Success)
+     {
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 2712027..77d69b9 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -640,6 +640,18 @@ static bool EnsureD3D12Device(ID3D12GraphicsCommandList* cmdList)
+     return true;
+ }
+ 
++// Vela 0037: the input API that created each handle (XeSS / FSR 2 / FSR 3 / FFX inputs mark their create; unmarked = the
++// game's own NGX call: DLSS, through Streamline when sl.dlss.dll is loaded)
++static ankerl::unordered_dense::map<unsigned int, std::string> velaHandleApi;
++
++static std::string VelaCreateApiName()
++{
++    const auto& api = State::Instance().velaCreateApi;
++    if (api.has_value())
++        return ApiUpscalerInputName(api.value());
++    return GetModuleHandleW(L"sl.dlss.dll") != nullptr ? "DLSS (Streamline sl.dlss.dll loaded)" : "DLSS";
++}
++
+ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_Feature InFeatureID,
+                                              NVSDK_NGX_Parameter* InParameters, NVSDK_NGX_Handle** OutHandle)
+ {
+@@ -650,6 +662,20 @@ static NVSDK_NGX_Result TryCreateOptiFeature(ID3D12GraphicsCommandList* InCmdLis
+ 
+     const uint32_t handleId = IFeature::GetNextHandleId();
+     LOG_INFO("Creating OptiScaler feature, HandleId: {}", handleId);
++    {
++        unsigned int cf = 0, rw = 0, rh = 0, ow = 0, oh = 0;
++        InParameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &cf);
++        InParameters->Get(NVSDK_NGX_Parameter_Width, &rw);
++        InParameters->Get(NVSDK_NGX_Parameter_Height, &rh);
++        InParameters->Get(NVSDK_NGX_Parameter_OutWidth, &ow);
++        InParameters->Get(NVSDK_NGX_Parameter_OutHeight, &oh);
++        velaHandleApi[handleId] = VelaCreateApiName();
++        LOG_INFO("Vela input: handle {0} created by {1} input ({2}x{3} -> {4}x{5}, create flags 0x{6:x}: DepthInverted {7}, "
++                 "LowResMV {8}, AutoExposure {9}, JitteredMV {10})",
++                 handleId, velaHandleApi[handleId], rw, rh, ow, oh, cf,
++                 (cf & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0, (cf & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0,
++                 (cf & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) != 0, (cf & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) != 0);
++    }
+ 
+     // Determine backend name
+     Upscaler upscalerBackend;
+@@ -1178,8 +1204,9 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
+         if (noDepth && !h.noDepthLogged)
+         {
+             h.noDepthLogged = true;
+-            LOG_INFO("Vela live: handle {0} has no depth buffer: SGSR 2 on this context, the others keep {1}", handleId,
+-                     VelaLive::ModelName(m));
++            const auto api = velaHandleApi.find(handleId);
++            LOG_INFO("Vela live: handle {0} ({2} input) has no depth buffer: SGSR 2 on this context, the others keep {1}",
++                     handleId, VelaLive::ModelName(m), api != velaHandleApi.end() ? api->second : std::string("unknown"));
+         }
+         bool change = false;
+         if (seen && (h.model != m || h.lossy != lossy || h.npu != npu))
+diff --git a/OptiScaler/inputs/XeSS_Dx12.cpp b/OptiScaler/inputs/XeSS_Dx12.cpp
+index 08931a7..fb573fc 100644
+--- a/OptiScaler/inputs/XeSS_Dx12.cpp
++++ b/OptiScaler/inputs/XeSS_Dx12.cpp
+@@ -85,6 +85,27 @@ static bool CreateDLSSContext(xess_context_handle_t handle, ID3D12GraphicsComman
+         break;
+     }
+ 
++    // Vela 0037: which XeSS setup made this context (the UE XeSS plugin sends no depth with display-size motion
++    // vectors, by design of XeSS: depth is needed only with low-res MVs)
++    {
++        const auto f = initParams->initFlags;
++        D3D12_RESOURCE_DESC vd {};
++        if (pExecParams->pVelocityTexture != nullptr)
++            vd = pExecParams->pVelocityTexture->GetDesc();
++        LOG_INFO("Vela input: XeSS context {0:X}: init flags 0x{1:x} (MV {2}, inverted depth {3}, autoexposure {4}, "
++                 "exposure texture {5}, jittered MV {6}, NDC velocity {7}, LDR {8}), quality {9}, {10}x{11} -> {12}x{13}, "
++                 "mv {14}x{15}, depth {16}, XeSS {17}.{18}.{19}",
++                 (size_t) handle, f, (f & XESS_INIT_FLAG_HIGH_RES_MV) ? "high-res" : "low-res",
++                 (f & XESS_INIT_FLAG_INVERTED_DEPTH) != 0, (f & XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE) != 0,
++                 (f & XESS_INIT_FLAG_EXPOSURE_SCALE_TEXTURE) != 0, (f & XESS_INIT_FLAG_JITTERED_MV) != 0,
++                 (f & XESS_INIT_FLAG_USE_NDC_VELOCITY) != 0, (f & XESS_INIT_FLAG_LDR_INPUT_COLOR) != 0,
++                 (int) initParams->qualitySetting, pExecParams->inputWidth, pExecParams->inputHeight,
++                 initParams->outputResolution.x, initParams->outputResolution.y, vd.Width, vd.Height,
++                 pExecParams->pDepthTexture != nullptr ? "present" : "none", XeSSProxy::Version().major,
++                 XeSSProxy::Version().minor, XeSSProxy::Version().patch);
++    }
++
++    VelaCreateApiScope velaApi(ApiUpscalerInput::XeSS_DX12); // 0037
+     if (NVSDK_NGX_D3D12_CreateFeature(commandList, NVSDK_NGX_Feature_SuperSampling, params, &nvHandle) !=
+         NVSDK_NGX_Result_Success)
+         return false;
+-- 
+2.54.0.windows.1
+

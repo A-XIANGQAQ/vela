@@ -1,0 +1,162 @@
+From 8218e7982823f4c5080a77925d00789184944a55 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 11:47:45 +0100
+Subject: [PATCH] 0039-vela-nodepth-flat: test switch, default off:
+ VELA_NODEPTH_FLAT=1 keeps a context without depth on FSR 4 (the SGSR 3
+ feature) instead of SGSR 2 / EASU, with a flat far-plane depth (render size
+ R32F, cleared once per size through an RTV to 0 when the depth is inverted,
+ else 1, which the bridge's 1 - d flip makes 0); logged once per handle (with
+ its input API) and once per feature (size, value)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp         | 24 ++++++++
+ .../upscalers/sgsr3/SGSR3Feature_Dx12.cpp     | 58 +++++++++++++++++++
+ .../upscalers/sgsr3/SGSR3Feature_Dx12.h       |  6 ++
+ 3 files changed, 88 insertions(+)
+
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 77d69b9..fba9dd2 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -987,6 +987,18 @@ static bool VelaTestNoDepth()
+     return on;
+ }
+ 
++// 0039 (test only, default off): VELA_NODEPTH_FLAT=1 keeps a no-depth handle on FSR 4 (SGSR 3 feature), which gets a flat
++// far-plane depth (SGSR3FeatureDx12::FlatDepth) instead of SGSR 2 / EASU
++static bool VelaNoDepthFlat()
++{
++    static const bool on = []
++    {
++        const char* e = std::getenv("VELA_NODEPTH_FLAT");
++        return e != nullptr && e[0] == '1';
++    }();
++    return on;
++}
++
+ static bool VelaIsDepthFormat(DXGI_FORMAT f)
+ {
+     switch (f)
+@@ -1192,6 +1204,18 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
+                     InParameters->Set(NVSDK_NGX_Parameter_Depth, velaDepth);
+             }
+             noDepth = isFsr4 && !fsr4Down && velaDepth == nullptr;
++            if (noDepth && VelaNoDepthFlat())
++            {
++                noDepth = false;  // 0039: FSR 4 on a flat depth
++                static ankerl::unordered_dense::set<unsigned int> velaFlatLogged;
++                if (velaFlatLogged.insert(handleId).second)
++                {
++                    const auto api = velaHandleApi.find(handleId);
++                    LOG_INFO("Vela depth: handle {0} ({1} input): no depth, VELA_NODEPTH_FLAT=1: FSR 4 with a flat "
++                             "far-plane depth instead of SGSR 2",
++                             handleId, api != velaHandleApi.end() ? api->second : std::string("unknown"));
++                }
++            }
+         }
+         const Upscaler iniUp = cfg.Dx12Upscaler.value_or_default();
+         const Upscaler want = m == VelaLive::Model::Sgsr2 || fsr4Down || noDepth ? Upscaler::SGSR2
+diff --git a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
+index f70e673..331e978 100644
+--- a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
++++ b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
+@@ -689,6 +689,9 @@ bool SGSR3FeatureDx12::EvaluateFsr4(ID3D12GraphicsCommandList* cl, NVSDK_NGX_Par
+     constexpr auto UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+     // Vela 0.8.22: no depth says nothing about FSR 4 in this game, so no global failure and the context stays. The handle
+     // normally went to SGSR 2 before this frame (TryEvaluateOptiFeature); this is the case where its tries ran out
++    const char* flatEnv = std::getenv("VELA_NODEPTH_FLAT");
++    if (depth == nullptr && flatEnv != nullptr && flatEnv[0] == '1')
++        depth = FlatDepth(cl);  // 0039, test only
+     if (depth == nullptr)
+     {
+         if (!_loggedVkFail)
+@@ -705,6 +708,59 @@ bool SGSR3FeatureDx12::EvaluateFsr4(ID3D12GraphicsCommandList* cl, NVSDK_NGX_Par
+     return true;
+ }
+ 
++// 0039: the far plane in the game's convention (0 when inverted; the bridge flips a non-inverted depth, so 1 -> 0 there
++// too). The texture stays in NON_PIXEL_SHADER_RESOURCE after its clear.
++ID3D12Resource* SGSR3FeatureDx12::FlatDepth(ID3D12GraphicsCommandList* cl)
++{
++    const uint32_t w = RenderWidth(), h = RenderHeight();
++    if (_flatDepth != nullptr)
++    {
++        const auto d = _flatDepth->GetDesc();
++        if (d.Width == w && d.Height == h)
++            return _flatDepth;
++        _flatDepth->Release();  // a new render size: the old one is no longer in this context's frames
++        _flatDepth = nullptr;
++    }
++    ID3D12Device* device = nullptr;
++    if (FAILED(cl->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
++        return nullptr;
++    if (_flatRtvHeap == nullptr)
++    {
++        D3D12_DESCRIPTOR_HEAP_DESC hd {};
++        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
++        hd.NumDescriptors = 1;
++        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&_flatRtvHeap))))
++            _flatRtvHeap = nullptr;
++    }
++    if (_flatRtvHeap != nullptr)
++        _flatDepth = CreateTexture(device, w, h, DXGI_FORMAT_R32_FLOAT, L"Vela_FlatDepth", true);
++    if (_flatDepth == nullptr)
++    {
++        device->Release();
++        LOG_ERROR("Vela depth: the flat depth {}x{} could not be made: FSR 4 skipped on this context", w, h);
++        return nullptr;
++    }
++    const auto rtv = _flatRtvHeap->GetCPUDescriptorHandleForHeapStart();
++    D3D12_RENDER_TARGET_VIEW_DESC rd {};
++    rd.Format = DXGI_FORMAT_R32_FLOAT;
++    rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
++    device->CreateRenderTargetView(_flatDepth, &rd, rtv);
++    device->Release();
++    const float farPlane = DepthInverted() ? 0.0f : 1.0f;
++    const float clear[4] = { farPlane, farPlane, farPlane, farPlane };
++    ResourceBarrier(cl, _flatDepth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_RENDER_TARGET);
++    cl->ClearRenderTargetView(rtv, clear, 0, nullptr);
++    ResourceBarrier(cl, _flatDepth, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    if (!_flatLogged)
++    {
++        _flatLogged = true;
++        LOG_INFO("Vela depth: no depth on this context, VELA_NODEPTH_FLAT=1: FSR 4 with a flat far-plane depth {}x{} "
++                 "(value {}, depth inverted {})",
++                 w, h, farPlane, DepthInverted());
++    }
++    return _flatDepth;
++}
++
+ bool SGSR3FeatureDx12::InitFast(ID3D12Device* device)
+ {
+     // v1f: its bit set follows the D3D12 kernel's (v1a / v1b / v1c by scale)
+@@ -1310,6 +1366,8 @@ void SGSR3FeatureDx12::ReleaseResources()
+             p = nullptr;
+         }
+     };
++    release(_flatDepth);  // 0039
++    release(_flatRtvHeap);
+ 
+     if (_constantBuffer != nullptr && _constantBufferMapped != nullptr)
+     {
+diff --git a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.h b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.h
+index ff1381c..bcf5ce7 100644
+--- a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.h
++++ b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.h
+@@ -83,6 +83,12 @@ class SGSR3FeatureDx12 : public SGSR3Feature, public IFeature_Dx12
+                       ID3D12Resource* depth, ID3D12Resource* mv, ID3D12Resource* output);
+     Mode _lastVkMode = Mode::V1Cs;
+     bool _loggedVkFail = false;
++    // 0039 (VELA_NODEPTH_FLAT=1, test only): a context without depth runs FSR 4 on a flat far-plane depth (render size,
++    // R32F, cleared once per size) instead of going to SGSR 2 / EASU
++    ID3D12Resource* _flatDepth = nullptr;
++    ID3D12DescriptorHeap* _flatRtvHeap = nullptr;
++    bool _flatLogged = false;
++    ID3D12Resource* FlatDepth(ID3D12GraphicsCommandList* cl);
+     bool _loggedVkSize = false;
+     bool _studentFailed = false;  // the student's Evaluate failed: v1f from then on
+     float _amaxLogged = -1.0f;    // the student's amax last logged (it follows the upscale ratio)
+-- 
+2.54.0.windows.1
+
