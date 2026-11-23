@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.24 — 2026-11-23
+
+New
+- **Snapdragon 8 Gen 3 (SM8650) devices can run FSR 4 on the NPU.** NPU package 15 adds the Qualcomm runtime part for this chip. Contributed by enij90 (github.com/zrprod9-cmyk/vela/pull/6), who checked it on a Lenovo Legion Tab Gen 3.
+- **Native Vulkan games:** FSR 3, DittoSR and SGSR 2 can be picked there. FSR 4 is shown but not offered in Vulkan games yet.
+
+Changed
+- NPU package 15: while a game uses the NPU, it runs one power level lower. When the device is hot this leaves more power to the GPU: about 6 % more fps with FSR 4 on the NPU at 1920x1080 in our test, and no loss at 1280x720. The daemon option `--power-corner max` (or `FSR4NPUD_POWER_CORNER=max`) gives the old level.
+- With 0.8.24 and NPU package 15 our Retroid Pocket 6 ran 1 to 11 % more fps than with 0.8.23 in the games we measured (table in the release notes).
+- Reports say which upscaler input a game uses.
+
+Fixed
+- Games that Steam starts through the Rockstar Games Launcher: the launcher no longer fails with Vela on.
+
+Known issues
+- Vulkan games: FSR 3, DittoSR and SGSR 2 are not yet checked in a game on our device.
+- Snapdragon 8 Gen 3: we have no such device, so package 15 isn't confirmed on a device by us yet. Please send the installer's last lines if you try it.
+- Unreal games with XeSS and no depth buffer: Vela now takes the depth from the engine, but this path hasn't run in a game yet.
+- Some games crash early on Snapdragon 8 Elite devices; the crash reports say where.
+- On some Retroid Pocket 6 and Odin 2 Portal units the NPU part's check fails (github.com/zrprod9-cmyk/vela/issues/2). We are collecting tests from those units.
+- Scenes without a depth buffer still use FSR 1.
+- FSR 4 Fast: black rectangles in some games on 8 Elite. We don't see them on 8 Gen 2.
+
 ## 0.8.23 — 2026-11-22
 
 - **DirectX 11 games get FSR 4.** FSR 4, FSR 4 Fast, FSR 3 and SGSR 2 now work in DirectX 11 games, the same as in DirectX 12, and switch while you play. Checked in Ghostrunner and Bright Memory: Infinite.
