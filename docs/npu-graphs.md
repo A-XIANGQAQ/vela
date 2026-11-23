@@ -1,6 +1,6 @@
 # How the Vela NPU graphs are built
 
-This page describes how the 34 graph files in `vela-npu-sysext-14.raw` were made: 17 for HTP v73 (Snapdragon 8 Gen 2,
+This page describes how the 34 graph files in `vela-npu-sysext-14.raw` (the same files are in `vela-npu-sysext-15.raw`) were made: 17 for HTP v73 (Snapdragon 8 Gen 2,
 SM8550) and the same 17 for HTP v79 (Snapdragon 8 Elite, SM8750). It lists the inputs, the tool versions, the commands,
 and the hashes a correct build gives.
 
@@ -324,7 +324,9 @@ a tool version is different.
 ## 5. Expected files (package 14)
 
 Hashes of the files inside `vela-npu-sysext-14.raw` (image sha256
-`10acba9196a7a55f712d14451ed64a20385cc5eab045744be6a63dd264392ac1`). The image's own
+`10acba9196a7a55f712d14451ed64a20385cc5eab045744be6a63dd264392ac1`).
+The graph files are the same in package 15 (`vela-npu-sysext-15.raw`, sha256
+`5cdfc9c15180eb5c14ee4810f89d221a8d390d9459560c08346af6358c91ae73`). The image's own
 `usr/lib64/vela-npu/MANIFEST.md5` has the same md5s.
 
 ### 5.1 HTP v73 (`usr/lib64/vela-npu/`)
@@ -389,7 +391,7 @@ On v79 the 1080p graphs plan less traffic (spill/fill about 21.1–21.2 MB). The
 
 ## 6. The device check (installer step 6)
 
-`install-vela-npu.sh` (package 14) starts the daemon and then, for each of the 17 graphs, runs
+`install-vela-npu.sh` (package 14 and 15) starts the daemon and then, for each of the 17 graphs, runs
 `/usr/lib64/vela-npu/fsr4npu-check --name fsr4npud_<graph> --runs 20` as the user.
 
 - **Fixed input** (`fsr4npu_check.c`): byte `i` of `x` = `(i*7 + (i >> 12)) % 59`. Outputs are filled with

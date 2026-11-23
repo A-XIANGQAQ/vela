@@ -29,7 +29,7 @@ Package 15 has the FSR 4 networks of package 14, for these output sizes: 1920x10
 
 | where | what | from |
 |---|---|---|
-| `/var/lib/extensions/armada-vela-npu.raw` | release asset `vela-npu-sysext-14.raw` (squashfs systemd system extension, sha256 `10acba9196a7a55f712d14451ed64a20385cc5eab045744be6a63dd264392ac1`, list in `vela-npu-sysext-14.contents.txt`) | `mk_public_sysext.sh`, byte-reproducible (built twice, same sha256) |
+| `/var/lib/extensions/armada-vela-npu.raw` | release asset `vela-npu-sysext-15.raw` (squashfs systemd system extension, sha256 `5cdfc9c15180eb5c14ee4810f89d221a8d390d9459560c08346af6358c91ae73`, list in `vela-npu-sysext-15.contents.txt`) | `mk_public_sysext.sh`, byte-reproducible (built twice, same sha256) |
 | inside: `/usr/lib64/vela-npu/fsr4npud`, `fsr4npu-check` | the NPU daemon (one process for all FSR 4 graphs) and its checker | ours, GPL-3.0-or-later; source and build steps: [`src/`](src/README.md) |
 | inside: `/usr/lib64/vela-npu/nf4*.bin` (17) | the FSR 4.1.1 network compiled for HTP v73 (also used on SM8650, with the HTP v75 runtime): 1920x1080 / 1600x900 / 1280x720 / 1600x904 / 1440x810 / 1280x800 / 1152x648 / 960x540 output × Performance / Ultra Performance, + exact | ours (from AMD's FSR 4 network) |
 | inside: `/usr/lib64/vela-npu/v79/nf4*.bin` (17) | the same 17 graphs compiled for HTP v79 (SM8750), same file names | ours (from AMD's FSR 4 network) |
@@ -49,6 +49,13 @@ How the 34 graph files are built and how to rebuild them byte for byte: [docs/np
 The numbers in the main README were measured with an earlier NPU package. Package 14 measured the same on the Retroid Pocket 6
 in the games checked (Control 8.32 ms on the NPU). The extension says `ID=armada VERSION_ID=44`; after an armadaOS update with another VERSION_ID,
 systemd-sysext stops loading it and the installer must be run again (it refuses other versions unless `--force`).
+
+Package 15 adds the HTP v75 runtime (SM8650) and changes the daemon's power vote: while a game uses the NPU, the daemon
+asks for the NPU's turbo voltage level instead of the top one (max). On the Retroid Pocket 6 this left more power to the
+GPU when the chip was hot: Deep Rock Galactic at 1920x1080 with FSR 4 on the NPU ran about 6.5 % faster, 1280x720 games the
+same. The level is a daemon option: `--power-corner <max|turbo_plus|turbo|nom_plus|nom|svs_plus|svs|svs2|dcvs>` or the
+environment variable `FSR4NPUD_POWER_CORNER` (the option wins; a wrong name stops the daemon). `max` gives the vote of
+package 14. The other files, the 34 graphs included, are the same as in package 14.
 
 ## Security
 - Library search paths: only `/usr/lib64/vela-npu` (`fsr4npud` RPATH, `libcdsp_default_listener` RUNPATH), plus `$ORIGIN`

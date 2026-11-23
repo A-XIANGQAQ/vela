@@ -37,7 +37,7 @@
 // Usage: fsr4npud --graphs a,b,c --graph-dir DIR [--socket-prefix fsr4npud_] [--max-loaded 3] [--graph-idle-ms 120000] [--graph-retry-ms 10000]
 //                 [--load-hard-timeout-ms 20000]            (or one graph, loaded at the start: --name N --ctx lite_x.bin)
 //                 [--backend stub|qnn] [--alloc auto|rpcmem|vk|memfd] [--exec-timeout-ms 2000]
-//                 [--exec-hard-timeout-ms 10000] [--power-grace-ms 2000] [--stub-bytes 8294400] [--stub-nout 1]
+//                 [--exec-hard-timeout-ms 10000] [--power-grace-ms 2000] [--power-corner turbo] [--stub-bytes 8294400] [--stub-nout 1]
 //                 [--stub-delay-us 0] [--stub-load-ms 0] [--max-clients 4] [--allow-uid U]... [--exit-after-clients K] [--max-seconds S] [--qnn-log L]
 #define _GNU_SOURCE 1
 #define VK_NO_PROTOTYPES
@@ -116,10 +116,20 @@ static string optAlloc = "auto"; static bool gAllocVk = false, gAllocReady = tru
 // 3 soft timeouts within 120 s = a sick session -> ordered exit 75 (fresh session via systemd).
 static int optExecTimeoutMs = 2000, optExecHardMs = 10000, gExitCode = 0;
 static std::atomic<uint64_t> gExecId{0}, gExecTimedOutId{0}; static double gSoftT[3] = {-1e18, -1e18, -1e18}; static int gSoftN = 0;
-// Power vote: top corner (0xA0) + DSP sleep disabled only while >= 1 client is connected; released --power-grace-ms
-// after the last client left (a layer reconnect on swapchain re-creation does not flap the vote).
+// Power vote: the --power-corner voltage corner (default turbo 0x80) + DSP sleep disabled only while >= 1 client is connected;
+// released --power-grace-ms after the last client left (a layer reconnect on swapchain re-creation does not flap the vote).
 static int optPowerGraceMs = 2000; static bool gVoted = false; static double gIdleSince = 0; static uint32_t gPcid = 0;
 static QnnHtpDevice_PerfInfrastructure_t* gPerf = nullptr;
+// --power-corner (or env FSR4NPUD_POWER_CORNER; the option wins): the core+bus voltage corner of the ON vote, one of max (0xA0, the vote
+// of packages <= 14), turbo_plus, turbo, nom_plus, nom, svs_plus, svs, svs2 or dcvs; dcvs = no corner vote (DCVS_VOLTAGE_CORNER_DISABLE),
+// DCVS on, mode ADJUST_UP_DOWN (the header has no BALANCED); sleep disabled + latency 40 as for every corner.
+// Default turbo, not max: RP6 (SM8550) DRG 1080p FSR 4 +6.5 % fps (HTP 8.92 -> 9.66 ms, GPU keeps a higher clock, less SoC heat), Manor Lords 720p no loss.
+static string optPowerCorner = "turbo"; static uint32_t gCornerVal = DCVS_VOLTAGE_VCORNER_TURBO; static bool gCornerDcvs = false;
+static bool powerCornerParse(const string& n) {
+  static const struct { const char* n; uint32_t v; } T[] = {{"max", DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER}, {"turbo_plus", DCVS_VOLTAGE_VCORNER_TURBO_PLUS},
+    {"turbo", DCVS_VOLTAGE_VCORNER_TURBO}, {"nom_plus", DCVS_VOLTAGE_VCORNER_NOM_PLUS}, {"nom", DCVS_VOLTAGE_VCORNER_NOM}, {"svs_plus", DCVS_VOLTAGE_VCORNER_SVS_PLUS},
+    {"svs", DCVS_VOLTAGE_VCORNER_SVS}, {"svs2", DCVS_VOLTAGE_VCORNER_SVS2}, {"dcvs", DCVS_VOLTAGE_CORNER_DISABLE}};
+  for (auto& t : T) if (n == t.n) { optPowerCorner = n; gCornerVal = t.v; gCornerDcvs = n == "dcvs"; return true; } return false; }
 static std::atomic<double> gExecStart{0}; static std::atomic<int> gExecSock{-1}, gExecDone{-1}; static std::atomic<uint64_t> gExecSeq{0};
 
 // ---------------- graphs (both backends)
@@ -197,9 +207,11 @@ static void powerVote(bool on, const char* why) {
   std::lock_guard<std::mutex> ql(gQnnMu);
   QnnHtpPerfInfrastructure_PowerConfig_t d; memset(&d, 0, sizeof d); d.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3; auto& v = d.dcvsV3Config;
   v.contextId = gPcid; v.setDcvsEnable = 1; v.setSleepLatency = 1; v.setSleepDisable = 1; v.setBusParams = 1; v.setCoreParams = 1;
-  if (on) { v.dcvsEnable = 0; v.powerMode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE; v.sleepLatency = 40; v.sleepDisable = 1;   // maximum-performance settings
-    v.busVoltageCornerMin = v.busVoltageCornerTarget = v.busVoltageCornerMax = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
-    v.coreVoltageCornerMin = v.coreVoltageCornerTarget = v.coreVoltageCornerMax = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER; }
+  if (on) { v.dcvsEnable = gCornerDcvs ? 1 : 0; v.powerMode = gCornerDcvs ? QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_ADJUST_UP_DOWN : QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+    v.sleepLatency = 40; v.sleepDisable = 1;   // performance settings of packages <= 14 (max); the other corners change only the corner
+    const QnnHtpPerfInfrastructure_VoltageCorner_t vc = (QnnHtpPerfInfrastructure_VoltageCorner_t)gCornerVal;
+    v.busVoltageCornerMin = v.busVoltageCornerTarget = v.busVoltageCornerMax = vc;
+    v.coreVoltageCornerMin = v.coreVoltageCornerTarget = v.coreVoltageCornerMax = vc; }
   else { v.dcvsEnable = 1; v.powerMode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_MODE; v.sleepLatency = 1000; v.sleepDisable = 0;   // no corner vote: DSP DCVS decides
     v.busVoltageCornerMin = v.busVoltageCornerTarget = v.busVoltageCornerMax = DCVS_VOLTAGE_CORNER_DISABLE;
     v.coreVoltageCornerMin = v.coreVoltageCornerTarget = v.coreVoltageCornerMax = DCVS_VOLTAGE_CORNER_DISABLE; }
@@ -208,7 +220,9 @@ static void powerVote(bool on, const char* why) {
     Qnn_ErrorHandle_t e2 = gPerf->destroyPowerConfigId(gPcid); uint32_t np = 0; Qnn_ErrorHandle_t e3 = gPerf->createPowerConfigId(0, 0, &np); if (e3 == QNN_SUCCESS) gPcid = np;
     logf("power_vote release rc 0x%lx -> destroyPowerConfigId rc 0x%lx, new id rc 0x%lx", (unsigned long)e, (unsigned long)e2, (unsigned long)e3); e = e2; }
   if (e == QNN_SUCCESS) gVoted = on;
-  logf("power_vote %s (%s) rc 0x%lx", on ? "ON top corner 0xA0, DCVS off, sleep disabled" : "OFF released (DCVS on, power saver, sleep allowed)", why, (unsigned long)e); }
+  char onTxt[128]; if (gCornerDcvs) snprintf(onTxt, sizeof onTxt, "ON corner dcvs (no corner vote 0x%x), DCVS on, adjust up-down, sleep disabled", gCornerVal);
+  else snprintf(onTxt, sizeof onTxt, "ON corner %s 0x%X, DCVS off, sleep disabled", optPowerCorner.c_str(), gCornerVal);
+  logf("power_vote %s (%s) rc 0x%lx", on ? onTxt : "OFF released (DCVS on, power saver, sleep allowed)", why, (unsigned long)e); }
 static string dmabufExporter(int fd) {   // /proc/self/fdinfo exp_name of a dma-buf: system = kernel dma-heap, else the fastrpc exporter
   char p[64]; snprintf(p, sizeof p, "/proc/self/fdinfo/%d", fd); FILE* f = fopen(p, "r"); if (!f) return ""; char l[256]; string r;
   while (fgets(l, sizeof l, f)) if (!strncmp(l, "exp_name:", 9)) { char* q = l + 9; while (*q == ' ' || *q == '\t') q++; r = q; while (!r.empty() && (r.back() == '\n' || r.back() == ' ')) r.pop_back(); break; }
@@ -605,6 +619,7 @@ static void resultsApply() {
 
 int main(int argc, char** argv) {
   T0 = now_ms(); setvbuf(stderr, nullptr, _IOLBF, 0);
+  if (const char* pc = getenv("FSR4NPUD_POWER_CORNER")) if (*pc && !powerCornerParse(pc)) { fprintf(stderr, "FSR4NPUD_POWER_CORNER must be max, turbo_plus, turbo, nom_plus, nom, svs_plus, svs, svs2 or dcvs\n"); return 2; }
   for (int i = 1; i < argc; i++) { string a = argv[i]; auto nx = [&]() -> const char* { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", a.c_str()); exit(2); } return argv[++i]; };
     if (a == "--name") optName = nx(); else if (a == "--backend") optBackend = nx(); else if (a == "--ctx") optCtx = nx();
     else if (a == "--stub-bytes") optStubBytes = strtoull(nx(), 0, 10); else if (a == "--stub-nout") optStubNout = atoi(nx()); else if (a == "--stub-delay-us") optStubDelayUs = atoi(nx()); else if (a == "--stub-load-ms") optStubLoadMs = atoi(nx());
@@ -613,6 +628,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-clients") optMaxClients = atoi(nx()); else if (a == "--allow-uid") allowUid.push_back((uid_t)atoi(nx())); else if (a == "--allow-gid") allowGid.push_back((gid_t)atoi(nx())); else if (a == "--exec-timeout-ms") optExecTimeoutMs = atoi(nx());
     else if (a == "--exit-after-clients") optExitAfter = atoi(nx()); else if (a == "--max-seconds") optMaxSec = atoi(nx()); else if (a == "--qnn-log") optQnnLog = atoi(nx()); else if (a == "--alloc") optAlloc = nx();
     else if (a == "--exec-hard-timeout-ms") optExecHardMs = atoi(nx()); else if (a == "--power-grace-ms") optPowerGraceMs = atoi(nx());
+    else if (a == "--power-corner") { if (!powerCornerParse(nx())) { fprintf(stderr, "--power-corner must be max, turbo_plus, turbo, nom_plus, nom, svs_plus, svs, svs2 or dcvs\n"); return 2; } }
     else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; } }
   if (optAlloc != "auto" && optAlloc != "rpcmem" && optAlloc != "vk" && optAlloc != "memfd") { fprintf(stderr, "--alloc must be auto, rpcmem, vk or memfd\n"); return 2; }
   if (!optGraphs.empty() && (optGraphDir.empty() || !optCtx.empty())) { fprintf(stderr, "--graphs needs --graph-dir and excludes --ctx\n"); return 2; }

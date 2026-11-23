@@ -2,7 +2,7 @@
 # Vela NPU system part, package 15: lets Vela run FSR 4 / FSR 4 Fast on the Hexagon NPU (Snapdragon 8 Gen 2, SM8550;
 # Snapdragon 8 Gen 3, SM8650; Snapdragon 8 Elite, SM8750, experimental).
 # Needs sudo ONCE (it adds a system extension, a udev rule and system services). Run in Desktop mode -> Konsole, game closed:
-#   curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.21/install-vela-npu.sh | sudo sh
+#   curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.24/install-vela-npu.sh | sudo sh
 # What it does:
 #   1. downloads vela-npu-sysext-15.raw (NPU daemon, 17 FSR 4 graphs for HTP v73 and for HTP v79, quic/fastrpc, and the
 #      Qualcomm AI Engine Direct (QNN) runtime 2.47.0.260601, unmodified) and checks its sha256;
@@ -14,11 +14,10 @@
 set -u
 umask 022
 VER=15
-# PKG15: set TAG to the release that carries vela-npu-sysext-15.raw (until then the download fails, nothing is installed)
-TAG=vX.Y.Z
+TAG=v0.8.24
 BASE_URL="https://github.com/zrprod9-cmyk/vela/releases/download/$TAG"
 IMAGE=vela-npu-sysext-$VER.raw
-IMAGE_SHA256=aedc7f8962ca264824b21f5f68099df5171b7584f557def69dd12c3264d39af9
+IMAGE_SHA256=5cdfc9c15180eb5c14ee4810f89d221a8d390d9459560c08346af6358c91ae73
 EXT=/var/lib/extensions
 QDIR=/var/lib/extensions/armada-vela-npu-qnn
 # One daemon serves all graphs (one cDSP session). The graphs are loaded on first use, so the check below loads each one in turn.
