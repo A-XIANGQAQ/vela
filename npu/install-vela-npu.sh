@@ -14,7 +14,7 @@
 set -u
 umask 022
 VER=17
-# PKG17: set TAG to the release that carries vela-npu-sysext-17.raw (until then the download fails, nothing is installed)
+# TAG: the release that carries vela-npu-sysext-17.raw
 TAG=v0.8.25
 BASE_URL="https://github.com/zrprod9-cmyk/vela/releases/download/$TAG"
 IMAGE=vela-npu-sysext-$VER.raw

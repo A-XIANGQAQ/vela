@@ -13,7 +13,7 @@ upscale/assets/sgsr3/OptiScaler.ini   the fork's settings template: GPL-3.0, as 
 upscale/assets/sgsr3/VERSION.json     what each binary is (md5, source): part of the plugin, GPL-3.0-only.
 upscale/assets/sgsr3/OptiPatcher.asi  OptiPatcher v0.42: MIT (OptiPatcher-MIT.txt).
 upscale/assets/sgsr3/amd_fidelityfx_dx12.dll  AMD FidelityFX SDK 1.1.4, signed by AMD: MIT (FidelityFX-MIT.txt).
-upscale/assets/sgsr3/amd_fidelityfx_upscaler_vk.dll  the Vulkan FSR 4 provider (md5 d230a120...), built from
+upscale/assets/sgsr3/amd_fidelityfx_upscaler_vk.dll  the Vulkan FSR 4 provider (md5 221a1647...), built from
                               https://github.com/dvj5411/fsr4vk @391f62b + Vela changes: GPL-3.0 (fsr4vk/GPL-3.0.txt; the
                               provider code of fsr4vk and Vela is GPL-3.0, not MIT); inside: AMD FSR 4.1.1 INT8 and 4.1.2 Lite
                               shaders/weights (MIT, fsr4vk/AMD-FidelityFX-SDK-MIT.md; no FSR 4.0.2), FFX API headers (MIT,
