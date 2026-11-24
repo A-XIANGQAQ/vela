@@ -45,4 +45,7 @@
  *  - VELA_NPU_F_OUTSLOT (UPSCALE, zero-copy only): cmd.reserved[33] = output slot (0/1) the HTP writes for this kick. */
 #define VELA_NPU_CAP_OUTPINGPONG 32u
 #define VELA_NPU_F_OUTSLOT 256u
+/* Graph-family phase (ANF, anf1): VELA_NPU_F_PHASE (UPSCALE, zero-copy only): cmd.reserved[34] = phase 0..255; the layer kicks the
+ * daemon with the phase in kick bits 40..47 (family graph <family>_p<k>); no flag = the old kick. */
+#define VELA_NPU_F_PHASE 512u
 #endif

@@ -33,6 +33,10 @@
 //      VELA_NPU_LOG_FILE (append; none -> stderr; the plugin parses the four "Vela NPU layer: " lines), VELA_NPU_CONNECT_MS (100),
 //      VELA_NPU_RECONNECT_MS (150), VELA_NPU_E1_TIMEOUT_MS (200), VELA_NPU_SLOW_MS (20: a longer execute -> that frame on the GPU),
 //      VELA_NPU_NPU_TIMEOUT_MS (400: no answer -> the HTP counts as hung, fresh connection).
+// GPU identity override (build 14, opt-in): VELA_VK_SPOOF_GPU=nvidia makes vkGetPhysicalDeviceProperties / ...2 / ...2KHR report
+// the GPU OptiScaler's own Vulkan spoof reports (values and source lines: spoof_props() below), for every caller in the process
+// (native-Vulkan games under FEX whose calls OptiScaler's in-process hooks never see: Unity, Haste Demo). Anything else or unset:
+// the three functions are not intercepted and vkCreateInstance asks the next layer for nothing more (build 12 behaviour).
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 #include <time.h>
@@ -51,6 +55,8 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <set>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -92,8 +98,8 @@ static void worker_live(long jobs) {
 #define VELA_NPU_ACK_ERROR_TIMEOUT 5u   /* layer-private final status: GPU/HTP timeout or device lost (provider reason "error") */
 
 #define VL_EXPORT extern "C" __attribute__((visibility("default")))
-#define VL_BUILD 12u   /* layer build number: reported in every ack and in the log; the manifest's implementation_version is the same number */
-#define VL_BUILD_PREV 11u   /* previous layer build number */
+#define VL_BUILD 25u   /* layer build number: reported in every ack and in the log; the manifest's implementation_version is the same number */
+#define VL_BUILD_PREV 12u   /* previous shipped layer build number (13 = PUB/lay13, not shipped) */
 #define NSLOT 8
 #define KSTEP 11   /* steps of the bounded wait (111 << k iterations, k = 0..10: 227k in all) */
 
@@ -104,7 +110,9 @@ static void* key_of(const void* h) { return *(void* const*)h; }
 // ---------------------------------------------------------------- log (file under the game's /tmp)
 static std::mutex g_logm; static FILE* g_log = nullptr; static volatile int g_logfd = -1;   // fd for the async-signal-safe line
 static FILE* log_file() {  // VELA_NPU_LOG_FILE (plugin contract, append); no env -> stderr
-  if (!g_log) { const char* p = getenv("VELA_NPU_LOG_FILE"); if (!p || !*p) p = getenv("VELA_NPU_LOG"); g_log = p && *p ? fopen(p, "a") : nullptr; if (!g_log) g_log = stderr; g_logfd = fileno(g_log); }
+  if (!g_log) { const char* p = getenv("VELA_NPU_LOG_FILE"); if (!p || !*p) p = getenv("VELA_NPU_LOG"); g_log = p && *p ? fopen(p, "a") : nullptr;
+    if (!g_log) { const char* f4 = getenv("VELA_VK_FSR4"); if (f4 && !strcmp(f4, "1")) { char b[96]; snprintf(b, sizeof b, "/tmp/vela_npu_layer_%d.log", (int)getpid()); g_log = fopen(b, "a"); } }   // build 23: no env path -> a file under /tmp, not only stderr
+    if (!g_log) g_log = stderr; g_logfd = fileno(g_log); }
   return g_log;
 }
 // Lines the plugin parses (loaded / daemon connected / daemon not reachable / job statistics): printed exactly, nothing before them on the line.
@@ -127,7 +135,10 @@ static void vlog(const char* f, ...) {
 //   ack bytes 32..35 = caps (CAP_ASYNC | CAP_TENSORS), bytes 36..39 = HTP time in us (GPU-written with the status).
 static const uint32_t kCaps = VELA_NPU_CAP_ASYNC | VELA_NPU_CAP_TENSORS;
 static const uint32_t kPending = 0x7FFFFFFFu;  // record-time status of a marker whose final status is copied after the wait
-struct Inst { PFN_vkGetInstanceProcAddr gipa; VkInstance inst; };
+struct Inst { PFN_vkGetInstanceProcAddr gipa; VkInstance inst;
+  // GPU identity override only (VELA_VK_SPOOF_GPU=nvidia): the next layer's physical-device functions; null otherwise
+  PFN_vkGetPhysicalDeviceProperties gpdp = nullptr; PFN_vkGetPhysicalDeviceProperties2 gpdp2 = nullptr; PFN_vkGetPhysicalDeviceProperties2KHR gpdp2khr = nullptr;
+  PFN_vkEnumerateDeviceExtensionProperties edep = nullptr; };   // build 15: NVIDIA-only device extensions listed (spoof only)
 struct TSet { fsr4npu* npu = nullptr; VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkDeviceAddress bda = 0; uint64_t offAlt = 0, offOut1 = 0;   // ping-pong: input slot 1, output slot 1 (0 = none)
   uint32_t gen = 0; double tRet = 0, tUse = 0; };   // A1: its generation; retired at; last zero-copy marker of the provider that named it (vela_npu_retire.h)
 enum { P_FREE = 0, P_RECORDED, P_QUEUED, P_DONE, P_DROPPED };
@@ -140,12 +151,13 @@ struct Slot {
   bool zc = false;          // zero-copy job (the provider's pack/unpack use the dma-buf directly)
   bool e2Set = false; uint64_t e2After = 0;   // E2 left set: host-reset once a later job's E1 proves the GPU passed its wait
 };
-struct Job { int slot; uint64_t seq; uint32_t gen; double tSubmit; uint64_t qn; bool async = false; int in = 0, out = 0; bool released = false; };   // in / out = ping-pong input / output slot of the kick   // async: its wait is a frame later   // released: frame already on the GPU network (slow execute), no kick
+struct Job { int slot; uint64_t seq; uint32_t gen; double tSubmit; uint64_t qn; bool async = false; int in = 0, out = 0; bool released = false; int phase = -1; };   // in / out = ping-pong input / output slot of the kick   // async: its wait is a frame later   // released: frame already on the GPU network (slow execute), no kick
 struct Consumer { int slot; uint64_t seq; };
 struct CbRec { std::vector<Job> jobs; std::vector<Consumer> cons; bool submitted = false; };
 
 struct Dev {
   VkDevice dev; PFN_vkGetDeviceProcAddr gdpa; VkPhysicalDeviceMemoryProperties mp{};
+  bool fsr4 = false; std::vector<std::string> exts;   // build 23: FSR 4 device set made; names of the extensions enabled on the device
   bool on = false, extOk = false, bda = false;   // bda = the app enabled bufferDeviceAddress
   char want[64] = "";                           // daemon name of the last PROBE
 #define F(n) PFN_vk##n n = nullptr;
@@ -157,6 +169,8 @@ struct Dev {
   F(ResetCommandPool) F(DeviceWaitIdle) F(GetBufferDeviceAddress)
   F(CreateShaderModule) F(DestroyShaderModule) F(CreatePipelineLayout) F(DestroyPipelineLayout) F(CreateComputePipelines) F(DestroyPipeline)
   F(CmdBindPipeline) F(CmdDispatchIndirect)
+  F(CmdDispatch) F(EndCommandBuffer) F(CmdBeginRenderPass) F(CmdBeginRenderPass2) F(CmdBeginRenderPass2KHR) F(CmdEndRenderPass) F(CmdEndRenderPass2) F(CmdEndRenderPass2KHR)
+  F(CmdBeginRendering) F(CmdBeginRenderingKHR) F(CmdEndRendering) F(CmdEndRenderingKHR) F(CmdPipelineBarrier2) F(CmdPipelineBarrier2KHR) F(UpdateDescriptorSets) F(CmdPushDescriptorSetKHR)
 #undef F
   // bounded wait (bw): GPU-only scratch for the step atomics, one pipeline per step length (no sets, no push constants)
   bool bw = false; VkBuffer wsBuf = VK_NULL_HANDLE; VkDeviceMemory wsMem = VK_NULL_HANDLE; VkShaderModule wsm = VK_NULL_HANDLE;
@@ -215,6 +229,83 @@ static Dev* dev_of(const void* h) {
   void* k = key_of(h);
   for (auto& e : g_dev) if (e.key.load(std::memory_order_acquire) == k) return e.d;
   return nullptr;
+}
+// ---------------------------------------------------------------- build 21: crash trace of the FSR 4 provider (VELA_VK_FSR4=1), log only
+// Haste dies inside the provider's first ffxDispatch (AUDIT/r11/IMPL.md). Trace on after the first provider pipeline (required subgroup size)
+// is created: per frame <= 400 lines (reset at every vkQueueSubmit), 2500 in all, every line flushed. cb = the command buffer the call records into.
+struct CbSt { VkCommandBufferLevel level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; bool inRP = false; bool inDyn = false; };
+static std::mutex g_dgm; static std::unordered_map<VkCommandBuffer, CbSt> g_cbst; static std::set<std::string> g_gpseen;
+static std::atomic<int> g_prov{0}, g_dgn{0}, g_frn{0}, g_gpn{0};
+static int g_fsr4d = -1;
+static bool dg_fsr4() { if (g_fsr4d < 0) { const char* v = getenv("VELA_VK_FSR4"); g_fsr4d = v && !strcmp(v, "1"); } return g_fsr4d; }
+#define DG(...) do { if (g_prov.load(std::memory_order_relaxed) && g_dgn.fetch_add(1) < 2500 && g_frn.fetch_add(1) < 400) vlog("dg " __VA_ARGS__); } while (0)
+static CbSt cbs_get(VkCommandBuffer cb) { std::lock_guard<std::mutex> l(g_dgm); auto it = g_cbst.find(cb); return it == g_cbst.end() ? CbSt{} : it->second; }
+static void cbs_set(VkCommandBuffer cb, int rp, int dyn) { std::lock_guard<std::mutex> l(g_dgm); CbSt& c = g_cbst[cb]; if (rp >= 0) c.inRP = rp; if (dyn >= 0) c.inDyn = dyn; }
+static const char* dg_lay(int l) {
+  switch (l) { case 0: return "UNDEFINED"; case 1: return "GENERAL"; case 2: return "COLOR_ATT"; case 3: return "DS_ATT"; case 4: return "DS_READONLY"; case 5: return "SHADER_READONLY";
+    case 6: return "XFER_SRC"; case 7: return "XFER_DST"; case 8: return "PREINIT"; case 1000001002: return "PRESENT"; case 1000314000: return "DS_RO_STENCIL_ATT"; case 1000241000: return "DEPTH_ATT"; case 1000241001: return "DEPTH_RO"; case 1000024001: return "READONLY_2"; case 1000314001: return "ATT_OPT"; default: return "other"; } }
+static const char* dg_st(const CbSt& c) { return c.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY ? "SECONDARY" : "primary"; }
+#define DGCB(cb) CbSt cs = cbs_get(cb)
+static VKAPI_ATTR void VKAPI_CALL vl_CmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+  Dev* d = dev_of(cb); DGCB(cb); DG("dispatch cb %p %s inRP %d inDyn %d (%u,%u,%u)", (void*)cb, dg_st(cs), cs.inRP, cs.inDyn, x, y, z); d->CmdDispatch(cb, x, y, z);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL vl_EndCommandBuffer(VkCommandBuffer cb) {
+  Dev* d = dev_of(cb); DGCB(cb); DG("end cb %p %s inRP %d", (void*)cb, dg_st(cs), cs.inRP); cbs_set(cb, 0, 0); return d->EndCommandBuffer(cb);
+}
+static VKAPI_ATTR void VKAPI_CALL vl_CmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo* bi, VkSubpassContents c) {
+  Dev* d = dev_of(cb); DGCB(cb); DG("beginRenderPass cb %p %s contents %d", (void*)cb, dg_st(cs), (int)c); cbs_set(cb, 1, -1); d->CmdBeginRenderPass(cb, bi, c);
+}
+static VKAPI_ATTR void VKAPI_CALL vl_CmdBeginRenderPass2(VkCommandBuffer cb, const VkRenderPassBeginInfo* bi, const VkSubpassBeginInfo* sb) {
+  Dev* d = dev_of(cb); DGCB(cb); DG("beginRenderPass2 cb %p %s contents %d", (void*)cb, dg_st(cs), sb ? (int)sb->contents : -1); cbs_set(cb, 1, -1); d->CmdBeginRenderPass2(cb, bi, sb);
+}
+static VKAPI_ATTR void VKAPI_CALL vl_CmdBeginRenderPass2KHR(VkCommandBuffer cb, const VkRenderPassBeginInfo* bi, const VkSubpassBeginInfo* sb) {
+  Dev* d = dev_of(cb); DGCB(cb); DG("beginRenderPass2KHR cb %p %s", (void*)cb, dg_st(cs)); cbs_set(cb, 1, -1); d->CmdBeginRenderPass2KHR(cb, bi, sb);
+}
+static VKAPI_ATTR void VKAPI_CALL vl_CmdEndRenderPass(VkCommandBuffer cb) { Dev* d = dev_of(cb); DGCB(cb); DG("endRenderPass cb %p %s", (void*)cb, dg_st(cs)); cbs_set(cb, 0, -1); d->CmdEndRenderPass(cb); }
+static VKAPI_ATTR void VKAPI_CALL vl_CmdEndRenderPass2(VkCommandBuffer cb, const VkSubpassEndInfo* e) { Dev* d = dev_of(cb); DGCB(cb); DG("endRenderPass2 cb %p %s", (void*)cb, dg_st(cs)); cbs_set(cb, 0, -1); d->CmdEndRenderPass2(cb, e); }
+static VKAPI_ATTR void VKAPI_CALL vl_CmdEndRenderPass2KHR(VkCommandBuffer cb, const VkSubpassEndInfo* e) { Dev* d = dev_of(cb); DGCB(cb); DG("endRenderPass2KHR cb %p %s", (void*)cb, dg_st(cs)); cbs_set(cb, 0, -1); d->CmdEndRenderPass2KHR(cb, e); }
+static VKAPI_ATTR void VKAPI_CALL vl_CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* ri) { Dev* d = dev_of(cb); DGCB(cb); DG("beginRendering cb %p %s", (void*)cb, dg_st(cs)); cbs_set(cb, -1, 1); d->CmdBeginRendering(cb, ri); }
+static VKAPI_ATTR void VKAPI_CALL vl_CmdBeginRenderingKHR(VkCommandBuffer cb, const VkRenderingInfo* ri) { Dev* d = dev_of(cb); DGCB(cb); DG("beginRenderingKHR cb %p %s", (void*)cb, dg_st(cs)); cbs_set(cb, -1, 1); d->CmdBeginRenderingKHR(cb, ri); }
+static VKAPI_ATTR void VKAPI_CALL vl_CmdEndRendering(VkCommandBuffer cb) { Dev* d = dev_of(cb); DGCB(cb); DG("endRendering cb %p %s", (void*)cb, dg_st(cs)); cbs_set(cb, -1, 0); d->CmdEndRendering(cb); }
+static VKAPI_ATTR void VKAPI_CALL vl_CmdEndRenderingKHR(VkCommandBuffer cb) { Dev* d = dev_of(cb); DGCB(cb); DG("endRenderingKHR cb %p %s", (void*)cb, dg_st(cs)); cbs_set(cb, -1, 0); d->CmdEndRenderingKHR(cb); }
+static VKAPI_ATTR void VKAPI_CALL vl_CmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags ss, VkPipelineStageFlags ds, VkDependencyFlags df, uint32_t nm, const VkMemoryBarrier* m, uint32_t nb, const VkBufferMemoryBarrier* b, uint32_t ni, const VkImageMemoryBarrier* im) {
+  Dev* d = dev_of(cb); DGCB(cb);
+  if (g_prov.load(std::memory_order_relaxed)) {
+    DG("barrier cb %p %s inRP %d src 0x%x dst 0x%x mem %u buf %u img %u", (void*)cb, dg_st(cs), cs.inRP, (unsigned)ss, (unsigned)ds, nm, nb, ni);
+    for (uint32_t i = 0; i < ni && i < 6; i++) DG("  imgbarrier image %p %s -> %s aspect 0x%x mips %u layers %u access 0x%x->0x%x", (void*)(uintptr_t)im[i].image, dg_lay(im[i].oldLayout), dg_lay(im[i].newLayout), (unsigned)im[i].subresourceRange.aspectMask, im[i].subresourceRange.levelCount, im[i].subresourceRange.layerCount, (unsigned)im[i].srcAccessMask, (unsigned)im[i].dstAccessMask);
+  }
+  d->CmdPipelineBarrier(cb, ss, ds, df, nm, m, nb, b, ni, im);
+}
+static void dg_barrier2(const char* nm, VkCommandBuffer cb, const VkDependencyInfo* di) {
+  DGCB(cb);
+  if (g_prov.load(std::memory_order_relaxed) && di) {
+    DG("%s cb %p %s inRP %d mem %u buf %u img %u", nm, (void*)cb, dg_st(cs), cs.inRP, di->memoryBarrierCount, di->bufferMemoryBarrierCount, di->imageMemoryBarrierCount);
+    for (uint32_t i = 0; i < di->imageMemoryBarrierCount && i < 6; i++) { const VkImageMemoryBarrier2& b = di->pImageMemoryBarriers[i];
+      DG("  imgbarrier2 image %p %s -> %s aspect 0x%x mips %u layers %u stage 0x%llx->0x%llx", (void*)(uintptr_t)b.image, dg_lay(b.oldLayout), dg_lay(b.newLayout), (unsigned)b.subresourceRange.aspectMask, b.subresourceRange.levelCount, b.subresourceRange.layerCount, (unsigned long long)b.srcStageMask, (unsigned long long)b.dstStageMask); }
+  }
+}
+static VKAPI_ATTR void VKAPI_CALL vl_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo* di) { Dev* d = dev_of(cb); dg_barrier2("barrier2", cb, di); d->CmdPipelineBarrier2(cb, di); }
+static VKAPI_ATTR void VKAPI_CALL vl_CmdPipelineBarrier2KHR(VkCommandBuffer cb, const VkDependencyInfo* di) { Dev* d = dev_of(cb); dg_barrier2("barrier2KHR", cb, di); d->CmdPipelineBarrier2KHR(cb, di); }
+static void dg_writes(const char* nm, void* who, uint32_t n, const VkWriteDescriptorSet* w) {
+  if (!g_prov.load(std::memory_order_relaxed)) return;
+  DG("%s %p: %u writes", nm, who, n);
+  for (uint32_t i = 0; i < n && i < 40; i++) {
+    const VkWriteDescriptorSet& x = w[i];
+    bool img = x.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || x.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || x.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || x.descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+    if (!img || !x.pImageInfo) { DG("  write set %p binding %u type %d count %u", (void*)(uintptr_t)x.dstSet, x.dstBinding, (int)x.descriptorType, x.descriptorCount); continue; }
+    for (uint32_t j = 0; j < x.descriptorCount && j < 4; j++) DG("  write set %p binding %u[%u] type %d view %p layout %s(%d)", (void*)(uintptr_t)x.dstSet, x.dstBinding, x.dstArrayElement + j, (int)x.descriptorType, (void*)(uintptr_t)x.pImageInfo[j].imageView, dg_lay(x.pImageInfo[j].imageLayout), (int)x.pImageInfo[j].imageLayout);
+  }
+}
+static VKAPI_ATTR void VKAPI_CALL vl_UpdateDescriptorSets(VkDevice dev, uint32_t nw, const VkWriteDescriptorSet* w, uint32_t nc, const VkCopyDescriptorSet* c) { Dev* d = dev_of(dev); dg_writes("updateDescriptorSets", (void*)dev, nw, w); d->UpdateDescriptorSets(dev, nw, w, nc, c); }
+static VKAPI_ATTR void VKAPI_CALL vl_CmdPushDescriptorSetKHR(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t set, uint32_t nw, const VkWriteDescriptorSet* w) {
+  Dev* d = dev_of(cb); { DGCB(cb); DG("pushDescriptorSet cb %p %s inRP %d set %u", (void*)cb, dg_st(cs), cs.inRP, set); } dg_writes("pushDescriptorSet", (void*)cb, nw, w); d->CmdPushDescriptorSetKHR(cb, bp, l, set, nw, w);
+}
+static void dg_frame(const char* what) { if (g_prov.load(std::memory_order_relaxed)) { g_frn.store(0); DG("-- %s", what); } }
+static void dg_gp(const char* kind, const char* name, bool null) {   // vkGet{Device,Instance}ProcAddr answers, deduped, <= 400 lines
+  if (!dg_fsr4() || !name) return;
+  std::string k = std::string(kind) + name + (null ? "!" : "");
+  { std::lock_guard<std::mutex> l(g_dgm); if (!g_gpseen.insert(k).second) return; }
+  if (g_gpn.fetch_add(1) < 400) vlog("gp %s %s -> %s", kind, name, null ? "NULL" : "ok");
 }
 static int g_enabled = -1;
 static bool enabled() { if (g_enabled < 0) { const char* v = getenv("VELA_NPU"); g_enabled = !(v && !strcmp(v, "0")); } return g_enabled; }
@@ -497,7 +588,7 @@ static void worker_main(Dev* d) {
     if (seen) d->ResetEvent(d->dev, s.e1);
     if (!seen || j.released) ack = VELA_NPU_ACK_ERROR_TIMEOUT;
     else if (!npu) ack = VELA_NPU_ACK_NODAEMON;
-    else { st = (j.in || j.out) ? fsr4npu_kick_slots(npu, j.in, j.out) : fsr4npu_kick(npu); if (st == S_OK) st = fsr4npu_wait(npu, slowMs);
+    else { st = j.phase >= 0 ? fsr4npu_kick_phase(npu, j.in, j.out, j.phase) : (j.in || j.out) ? fsr4npu_kick_slots(npu, j.in, j.out) : fsr4npu_kick(npu); if (st == S_OK) st = fsr4npu_wait(npu, slowMs);
            // the poll ran out (the daemon's own E_TIMEOUT comes earlier): slow execute. Its frame and every queued one go to the GPU
            // network now; the wait for this execute goes on up to npuTmo on the same connection, so its "done" pairs with this kick.
            if (st == E_TIMEOUT && slowMs < npuTmo && now_ms() - tE1 >= slowMs - 0.5) {
@@ -671,6 +762,7 @@ static void record_marker(Dev* d, VkCommandBuffer cb, const VelaNpuCmd* c, VkBuf
       rec.jobs.push_back(Job{si, c->seq, d->gen, 0, 0, async});
       if (zc && (c->flags & VELA_NPU_F_INSLOT) && d->set.offAlt) rec.jobs.back().in = c->reserved[32] & 1;   // input ping-pong slot
       if (zc && (c->flags & VELA_NPU_F_OUTSLOT) && d->set.offOut1) rec.jobs.back().out = c->reserved[33] & 1;   // output ping-pong slot
+      if (zc && (c->flags & VELA_NPU_F_PHASE)) rec.jobs.back().phase = c->reserved[34];   // ANF family phase
       a.slot = si;
       if (!async) { wait_and_copy_out(d, cb, si); a.status = kPending; copySlot = si; rec.cons.push_back(Consumer{si, c->seq}); }
       else { a.status = VELA_NPU_ACK_OK; d->lastKick = si; s.refs++; }        // "kicked"; hold until its OP_WAIT
@@ -709,6 +801,8 @@ static void drop_rec(Dev* d, VkCommandBuffer cb) {  // d->mtx held
 }
 static VKAPI_ATTR VkResult VKAPI_CALL vl_BeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo* bi) {
   Dev* d = dev_of(cb);
+  if (dg_fsr4()) { CbSt cs = cbs_get(cb); cbs_set(cb, 0, 0);
+    if (g_prov.load(std::memory_order_relaxed)) { if (cs.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY && bi && bi->pInheritanceInfo) DG("begin cb %p SECONDARY flags 0x%x inherit renderPass %p subpass %u fb %p", (void*)cb, (unsigned)bi->flags, (void*)(uintptr_t)bi->pInheritanceInfo->renderPass, bi->pInheritanceInfo->subpass, (void*)(uintptr_t)bi->pInheritanceInfo->framebuffer); else DG("begin cb %p %s flags 0x%x", (void*)cb, dg_st(cs), bi ? (unsigned)bi->flags : 0u); } }
   note_begin(cb);   // remember the begin epoch
   if (d->nRec.load(std::memory_order_relaxed)) { std::lock_guard<std::mutex> l(d->mtx); drop_rec(d, cb); }
   return d->BeginCommandBuffer(cb, bi);
@@ -720,6 +814,7 @@ static VKAPI_ATTR void VKAPI_CALL vl_CmdBindPipeline(VkCommandBuffer cb, VkPipel
 }
 static VKAPI_ATTR VkResult VKAPI_CALL vl_AllocateCommandBuffers(VkDevice dev, const VkCommandBufferAllocateInfo* ai, VkCommandBuffer* cbs) {
   Dev* d = dev_of(dev); VkResult r = d->AllocateCommandBuffers(dev, ai, cbs);
+  if (r == VK_SUCCESS && dg_fsr4()) { std::lock_guard<std::mutex> l(g_dgm); for (uint32_t i = 0; i < ai->commandBufferCount; i++) { CbSt& c = g_cbst[cbs[i]]; c = CbSt{}; c.level = ai->level; } }
   if (r == VK_SUCCESS) { std::lock_guard<std::mutex> l(d->mtx); for (uint32_t i = 0; i < ai->commandBufferCount; i++) d->cbPool[cbs[i]] = ai->commandPool; }
   return r;
 }
@@ -775,12 +870,12 @@ template <class GetCb> static VkResult submit_common(Dev* d, uint32_t n, GetCb c
 struct S1 { Dev* d; VkQueue q; uint32_t n; const VkSubmitInfo* si; VkFence f; };
 struct S2 { Dev* d; VkQueue q; uint32_t n; const VkSubmitInfo2* si; VkFence f; PFN_vkQueueSubmit2 fn; };
 static VKAPI_ATTR VkResult VKAPI_CALL vl_QueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence f) {
-  Dev* d = dev_of(q); S1 c{d, q, n, si, f};
+  Dev* d = dev_of(q); S1 c{d, q, n, si, f}; dg_frame("vkQueueSubmit");
   return submit_common(d, n, [&](uint32_t i, auto fn) { for (uint32_t k = 0; k < si[i].commandBufferCount; k++) fn(si[i].pCommandBuffers[k]); },
                        [](void* p) { S1* s = (S1*)p; return s->d->QueueSubmit(s->q, s->n, s->si, s->f); }, &c);
 }
 static VkResult submit2(VkQueue q, uint32_t n, const VkSubmitInfo2* si, VkFence f, bool khr) {
-  Dev* d = dev_of(q); S2 c{d, q, n, si, f, khr ? d->QueueSubmit2KHR : d->QueueSubmit2};
+  Dev* d = dev_of(q); S2 c{d, q, n, si, f, khr ? d->QueueSubmit2KHR : d->QueueSubmit2}; dg_frame("vkQueueSubmit2");
   return submit_common(d, n, [&](uint32_t i, auto fn) { for (uint32_t k = 0; k < si[i].commandBufferInfoCount; k++) fn(si[i].pCommandBufferInfos[k].commandBuffer); },
                        [](void* p) { S2* s = (S2*)p; return s->fn(s->q, s->n, s->si, s->f); }, &c);
 }
@@ -812,6 +907,83 @@ static VKAPI_ATTR void VKAPI_CALL vl_DestroyDevice(VkDevice dev, const VkAllocat
   delete d; next(dev, alloc);
 }
 
+// ---------------------------------------------------------------- GPU identity override (VELA_VK_SPOOF_GPU=nvidia)
+// The values are OptiScaler's own Vulkan spoof (FT9/fx24/src/OptiScaler):
+//   deviceName  "NVIDIA GeForce RTX 4090"   Config.h:498 SpoofedGPUName default; written at spoofing/Vulkan_Spoofing.cpp:111-112, 140-141
+//   vendorID    0x10DE                       Config.h:494 SpoofedVendorId default VendorId::Nvidia = 0x10DE (OptiTypes.h:233); Vulkan_Spoofing.cpp:114, 142
+//   deviceID    0x2684                       Config.h:495 SpoofedDeviceId default; Vulkan_Spoofing.cpp:115, 143
+//   driverVersion VK_MAKE_API_VERSION(999, 99, 0, 0)                    Vulkan_Spoofing.cpp:116, 144
+//   VkPhysicalDeviceDriverProperties: driverID VK_DRIVER_ID_NVIDIA_PROPRIETARY, driverName "NVIDIA", driverInfo "999.99"
+//                                                                       Vulkan_Spoofing.cpp:153-158 (2KHR: 201-206)
+// OptiScaler patches only VkPhysicalDeviceDriverProperties in the chain; the same three fields of VkPhysicalDeviceVulkan12Properties
+// get the same values here (a Vulkan 1.2 app reads them there). Nothing else changes (deviceType, limits, features, extensions, UUIDs).
+static int g_spoof = -1;
+static bool spoof_on() { if (g_spoof < 0) { const char* v = getenv("VELA_VK_SPOOF_GPU"); g_spoof = v && !strcmp(v, "nvidia"); } return g_spoof; }
+static const char kSpoofName[] = "NVIDIA GeForce RTX 4090";
+static const uint32_t kSpoofVendor = 0x10DE, kSpoofDevice = 0x2684, kSpoofDriverVersion = VK_MAKE_API_VERSION(999, 99, 0, 0);
+// Build 17 handshake for the OptiScaler fork (native Vulkan FSR 4): a device made with the FSR 4 set (VELA_VK_FSR4=1) is marked in the
+// driver description. Without the mark the fork must not call the provider: winevulkan hands out a thunk for every function name.
+static const char kFsr4Mark[] = " | VELA layer 17 fsr4dev";
+static std::mutex g_fsr4m; static std::vector<VkPhysicalDevice> g_fsr4pd;   // physical devices a device with the FSR 4 set was created on
+static bool fsr4_pd(VkPhysicalDevice pd) { std::lock_guard<std::mutex> l(g_fsr4m); for (auto p : g_fsr4pd) if (p == pd) return true; return false; }
+static void spoof_driver(VkDriverId* id, char* name, char* info, bool mark) {
+  *id = VK_DRIVER_ID_NVIDIA_PROPRIETARY;
+  snprintf(name, VK_MAX_DRIVER_NAME_SIZE, "%s", "NVIDIA"); snprintf(info, VK_MAX_DRIVER_INFO_SIZE, "%s%s", "999.99", mark ? kFsr4Mark : "");
+}
+static void spoof_props(VkPhysicalDevice pd, VkPhysicalDeviceProperties* p, void* chain, const char* via) {
+  const bool mark = fsr4_pd(pd);
+  if (mark) { static std::atomic<bool> once{false}; if (!once.exchange(true)) vlog("FSR 4 handshake served (first call %s): driverInfo gets '%s'", via, kFsr4Mark); }
+  static std::atomic<bool> once{false};
+  if (!once.exchange(true))   // one line per process: the real identity and what every caller sees from now on
+    vlog("GPU identity override (VELA_VK_SPOOF_GPU=nvidia, first call %s): vendor 0x%04x device 0x%04x '%s' driver 0x%08x -> "
+         "vendor 0x%04x device 0x%04x '%s' driver 0x%08x, driverID NVIDIA_PROPRIETARY", via, p->vendorID, p->deviceID, p->deviceName,
+         p->driverVersion, kSpoofVendor, kSpoofDevice, kSpoofName, kSpoofDriverVersion);
+  snprintf(p->deviceName, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE, "%s", kSpoofName);
+  p->vendorID = kSpoofVendor; p->deviceID = kSpoofDevice; p->driverVersion = kSpoofDriverVersion;
+  for (auto* n = (VkBaseOutStructure*)chain; n; n = n->pNext) {
+    if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES) { auto* x = (VkPhysicalDeviceDriverProperties*)n; spoof_driver(&x->driverID, x->driverName, x->driverInfo, mark); }
+    else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES) { auto* x = (VkPhysicalDeviceVulkan12Properties*)n; spoof_driver(&x->driverID, x->driverName, x->driverInfo, mark); }
+  }
+}
+static Inst* inst_of_pd(VkPhysicalDevice pd) {   // a physical device shares its instance's dispatch key (vl_CreateDevice relies on it too)
+  std::lock_guard<std::mutex> l(g_mtx); auto it = g_inst.find(key_of(pd)); return it == g_inst.end() ? nullptr : it->second;
+}
+static VKAPI_ATTR void VKAPI_CALL vl_GetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalDeviceProperties* p) {
+  Inst* in = inst_of_pd(pd); if (!in || !in->gpdp) return;
+  in->gpdp(pd, p); spoof_props(pd, p, nullptr, "vkGetPhysicalDeviceProperties");
+}
+static VKAPI_ATTR void VKAPI_CALL vl_GetPhysicalDeviceProperties2(VkPhysicalDevice pd, VkPhysicalDeviceProperties2* p) {
+  Inst* in = inst_of_pd(pd); if (!in || !in->gpdp2) return;
+  in->gpdp2(pd, p); spoof_props(pd, &p->properties, p->pNext, "vkGetPhysicalDeviceProperties2");
+}
+static VKAPI_ATTR void VKAPI_CALL vl_GetPhysicalDeviceProperties2KHR(VkPhysicalDevice pd, VkPhysicalDeviceProperties2* p) {
+  Inst* in = inst_of_pd(pd); if (!in || !in->gpdp2khr) return;
+  in->gpdp2khr(pd, p); spoof_props(pd, &p->properties, p->pNext, "vkGetPhysicalDeviceProperties2KHR");
+}
+
+// Build 15: the device extensions an NVIDIA driver lists and a DLSS integration checks before it offers DLSS (Unity's NVIDIA
+// module in Haste Demo stops after NGX init without them). Same three names and the same idea as OptiScaler's own Vulkan
+// extension spoof (Vulkan_Spoofing.cpp:599-727 lists them, 443-446 removes them again in vkCreateDevice): listed here when
+// the driver lacks them, never passed to the driver.
+static const VkExtensionProperties kNvxExt[] = {
+  {VK_NVX_BINARY_IMPORT_EXTENSION_NAME, VK_NVX_BINARY_IMPORT_SPEC_VERSION},
+  {VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME, VK_NVX_IMAGE_VIEW_HANDLE_SPEC_VERSION},
+  {VK_NVX_MULTIVIEW_PER_VIEW_ATTRIBUTES_EXTENSION_NAME, VK_NVX_MULTIVIEW_PER_VIEW_ATTRIBUTES_SPEC_VERSION}};
+static bool is_nvx_fake(const char* n) { for (auto& e : kNvxExt) if (!strcmp(n, e.extensionName)) return true; return false; }
+static VKAPI_ATTR VkResult VKAPI_CALL vl_EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char* layer, uint32_t* cnt, VkExtensionProperties* props) {
+  Inst* in = inst_of_pd(pd); if (!in || !in->edep) return VK_ERROR_INITIALIZATION_FAILED;
+  if (layer) return in->edep(pd, layer, cnt, props);
+  uint32_t n = 0; VkResult r = in->edep(pd, nullptr, &n, nullptr); if (r != VK_SUCCESS) return r;
+  std::vector<VkExtensionProperties> all(n); r = in->edep(pd, nullptr, &n, all.data()); if (r < 0) return r; all.resize(n);
+  for (auto& e : kNvxExt) { bool have = false; for (auto& a : all) have |= !strcmp(a.extensionName, e.extensionName); if (!have) all.push_back(e); }
+  static std::atomic<bool> once{false};
+  if (!once.exchange(true)) vline("GPU identity override: device extensions %u -> %u (NVX binary_import, image_view_handle, multiview_per_view_attributes listed)", n, uint32_t(all.size()));
+  if (!props) { *cnt = uint32_t(all.size()); return VK_SUCCESS; }
+  uint32_t w = *cnt < all.size() ? *cnt : uint32_t(all.size());
+  for (uint32_t i = 0; i < w; i++) props[i] = all[i];
+  *cnt = w; return w < all.size() ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
 // ---------------------------------------------------------------- instance / device plumbing
 static VKAPI_ATTR VkResult VKAPI_CALL vl_CreateInstance(const VkInstanceCreateInfo* ci, const VkAllocationCallbacks* a, VkInstance* out) {
   auto* li = (VkLayerInstanceCreateInfo*)ci->pNext;
@@ -819,8 +991,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL vl_CreateInstance(const VkInstanceCreateIn
   if (!li) return VK_ERROR_INITIALIZATION_FAILED;
   PFN_vkGetInstanceProcAddr gipa = li->u.pLayerInfo->pfnNextGetInstanceProcAddr; li->u.pLayerInfo = li->u.pLayerInfo->pNext;
   auto create = (PFN_vkCreateInstance)gipa(VK_NULL_HANDLE, "vkCreateInstance");
-  VkResult r = create(ci, a, out); if (r != VK_SUCCESS) return r;
-  { std::lock_guard<std::mutex> l(g_mtx); g_inst[key_of(*out)] = new Inst{gipa, *out}; }
+  VkInstanceCreateInfo ci2 = *ci; VkApplicationInfo ai2{};   // build 20: VELA_VK_FSR4=1 raises the app's Vulkan 1.1 / 1.2 to 1.3 when the loader has it (the provider's SPIR-V is 1.5)
+  { const char* fv = getenv("VELA_VK_FSR4"); const char* nv = getenv("VELA_VK_APIUP");
+    if (fv && !strcmp(fv, "1") && (nv && !strcmp(nv, "1")) && ci->pApplicationInfo && ci->pApplicationInfo->apiVersion >= VK_API_VERSION_1_1 && ci->pApplicationInfo->apiVersion < VK_API_VERSION_1_3) {
+      uint32_t iv = VK_API_VERSION_1_0; auto eiv = (PFN_vkEnumerateInstanceVersion)gipa(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"); if (eiv) eiv(&iv);
+      vline("instance: the app asks for %u.%u, loader offers %u.%u", VK_VERSION_MAJOR(ci->pApplicationInfo->apiVersion), VK_VERSION_MINOR(ci->pApplicationInfo->apiVersion), VK_VERSION_MAJOR(iv), VK_VERSION_MINOR(iv));
+      if (iv >= VK_API_VERSION_1_3) { ai2 = *ci->pApplicationInfo; ai2.apiVersion = VK_API_VERSION_1_3; ci2.pApplicationInfo = &ai2; vline("instance: apiVersion raised to 1.3"); } } }
+  VkResult r = create(&ci2, a, out); if (r != VK_SUCCESS) return r;
+  Inst* ni = new Inst{gipa, *out};
+  { const char* fv = getenv("VELA_VK_FSR4"); if (fv && !strcmp(fv, "1")) { const uint32_t av = ci->pApplicationInfo ? ci->pApplicationInfo->apiVersion : 0; vline("instance %p: the app asks for Vulkan %u.%u.%u (engine '%s')", (void*)*out, VK_VERSION_MAJOR(av), VK_VERSION_MINOR(av), VK_VERSION_PATCH(av), ci->pApplicationInfo && ci->pApplicationInfo->pEngineName ? ci->pApplicationInfo->pEngineName : ""); } }  // build 18: log only
+  if (spoof_on()) {   // GPU identity override: the next layer's physical-device functions (off: nothing asked, as build 12)
+    ni->gpdp = (PFN_vkGetPhysicalDeviceProperties)gipa(*out, "vkGetPhysicalDeviceProperties");
+    ni->gpdp2 = (PFN_vkGetPhysicalDeviceProperties2)gipa(*out, "vkGetPhysicalDeviceProperties2");
+    ni->gpdp2khr = (PFN_vkGetPhysicalDeviceProperties2KHR)gipa(*out, "vkGetPhysicalDeviceProperties2KHR");
+    ni->edep = (PFN_vkEnumerateDeviceExtensionProperties)gipa(*out, "vkEnumerateDeviceExtensionProperties");
+  }
+  { std::lock_guard<std::mutex> l(g_mtx); g_inst[key_of(*out)] = ni; }
   static std::atomic<bool> once{false};
   if (enabled() && !once.exchange(true)) vline("loaded v%u", VL_BUILD);
   return r;
@@ -837,6 +1023,151 @@ static bool bda_enabled(const VkDeviceCreateInfo* ci) {  // the app enabled buff
   }
   return false;
 }
+// ---------------------------------------------------------------- build 17: the FSR 4 device set (VELA_VK_FSR4=1)
+// The FSR 4 provider (amd_fidelityfx_upscaler_vk.dll, round 11 design AUDIT/r11/NOTES.md 4.1) needs extensions and features that can only be
+// switched on at vkCreateDevice. vkd3d-proton does that for a DX12 game; a native Vulkan game (Unity) does not, and no hook of the fork sees
+// its vkCreateDevice. Here, under winevulkan, every caller is seen. Everything is find-or-add so the pNext chain stays valid; structs of the
+// app's chain are const, their bits are set through a cast and put back right after the next layer's vkCreateDevice returned.
+// The 1.3.275 headers of the build image predate VK_KHR_compute_shader_derivatives; its features struct has the NV one's sType (1000201000) and fields.
+static const char kKhrCsDerivName[] = "VK_KHR_compute_shader_derivatives";
+static int g_fsr4 = -1;
+static bool fsr4_on() { if (g_fsr4 < 0) { const char* v = getenv("VELA_VK_FSR4"); g_fsr4 = v && !strcmp(v, "1"); } return g_fsr4; }
+struct Fsr4Set {
+  VkPhysicalDeviceFeatures core{};
+  VkPhysicalDeviceShaderFloat16Int8Features f16{};
+  VkPhysicalDevice8BitStorageFeatures s8{};
+  VkPhysicalDeviceDescriptorIndexingFeatures di{};
+  VkPhysicalDeviceBufferDeviceAddressFeatures bda{};
+  VkPhysicalDeviceSynchronization2Features s2{};
+  VkPhysicalDeviceShaderIntegerDotProductFeatures dot{};
+  VkPhysicalDeviceDescriptorBufferFeaturesEXT db{};
+  VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mut{};
+  VkPhysicalDeviceComputeShaderDerivativesFeaturesNV cd{};
+  VkPhysicalDeviceSubgroupSizeControlFeatures ssc{};   // build 19: the provider's pipelines carry a required subgroup size (Khronos validation, k2r11c/d)
+  std::vector<std::pair<VkBool32*, VkBool32>> undo;   // the app's own struct bits changed, with their old values
+  std::vector<const char*> exts;                       // final extension list (the caller's plus the added ones)
+  std::string addedExt, setFeat, structs;
+  void undoAll() { for (auto& u : undo) *u.first = u.second; undo.clear(); }
+};
+// Fills S and the create info `dci` (a copy of the caller's). false: nothing usable, `why` says what is missing.
+static bool fsr4_build(Inst* in, VkPhysicalDevice pd, PFN_vkGetInstanceProcAddr gipa, const VkDeviceCreateInfo* ci, const std::vector<const char*>& have,
+                       Fsr4Set& S, VkDeviceCreateInfo& dci, std::string& why) {
+  auto enumExt = (PFN_vkEnumerateDeviceExtensionProperties)gipa(in->inst, "vkEnumerateDeviceExtensionProperties");
+  auto gpdf2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(in->inst, "vkGetPhysicalDeviceFeatures2");
+  if (!gpdf2) gpdf2 = (PFN_vkGetPhysicalDeviceFeatures2)gipa(in->inst, "vkGetPhysicalDeviceFeatures2KHR");
+  if (!enumExt || !gpdf2) { why = "no vkEnumerateDeviceExtensionProperties / vkGetPhysicalDeviceFeatures2"; return false; }
+  uint32_t ne = 0; enumExt(pd, nullptr, &ne, nullptr); std::vector<VkExtensionProperties> ep(ne); enumExt(pd, nullptr, &ne, ep.data()); ep.resize(ne);
+  auto listed = [&](const char* n) { for (auto& e : ep) if (!strcmp(e.extensionName, n)) return true; return false; };
+  auto enabled_ = [&](const char* n) { for (auto* e : have) if (!strcmp(e, n)) return true; return false; };
+  // extensions: the three unpromoted ones must exist; the rest is added when listed (promoted ones are core on a 1.2 / 1.3 driver)
+  const char* must[] = {VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME, kKhrCsDerivName};
+  std::string miss;
+  for (const char* m : must) {
+    bool ok = listed(m) || (!strcmp(m, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME) && (listed("VK_VALVE_mutable_descriptor_type") || enabled_("VK_VALVE_mutable_descriptor_type")));
+    if (!ok) miss += std::string(miss.empty() ? "" : " ") + m;
+  }
+  if (!miss.empty()) { why = "driver lacks " + miss; return false; }
+  if (enabled_("VK_EXT_buffer_device_address")) { why = "the app enabled VK_EXT_buffer_device_address (invalid together with the KHR / core one)"; return false; }
+  const char* add[] = {VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME, kKhrCsDerivName,
+    VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
+    VK_KHR_8BIT_STORAGE_EXTENSION_NAME, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+    VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME, VK_KHR_MAINTENANCE_3_EXTENSION_NAME, VK_KHR_STORAGE_BUFFER_STORAGE_CLASS_EXTENSION_NAME,
+    VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME};
+  const bool valveMut = enabled_("VK_VALVE_mutable_descriptor_type");
+  S.exts = have;
+  for (const char* w : add) {
+    if (valveMut && !strcmp(w, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME)) continue;
+    if (!listed(w) || enabled_(w)) continue;
+    S.exts.push_back(w); S.addedExt += (S.addedExt.empty() ? "" : " "); S.addedExt += w;
+  }
+  // support of every feature
+  VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  VkPhysicalDeviceShaderFloat16Int8Features qf16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
+  VkPhysicalDevice8BitStorageFeatures qs8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES};
+  VkPhysicalDeviceDescriptorIndexingFeatures qdi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
+  VkPhysicalDeviceBufferDeviceAddressFeatures qbda{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+  VkPhysicalDeviceSynchronization2Features qs2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES};
+  VkPhysicalDeviceShaderIntegerDotProductFeatures qdot{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES};
+  VkPhysicalDeviceDescriptorBufferFeaturesEXT qdb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+  VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT qmut{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT};
+  VkPhysicalDeviceComputeShaderDerivativesFeaturesNV qcd{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV};
+  VkPhysicalDeviceSubgroupSizeControlFeatures qssc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+  q.pNext = &qf16; qf16.pNext = &qs8; qs8.pNext = &qdi; qdi.pNext = &qbda; qbda.pNext = &qs2; qs2.pNext = &qdot; qdot.pNext = &qdb; qdb.pNext = &qmut; qmut.pNext = &qcd; qcd.pNext = &qssc;
+  gpdf2(pd, &q);
+  struct { const char* n; VkBool32 v; } need[] = {
+    {"shaderInt16", q.features.shaderInt16}, {"shaderStorageImageReadWithoutFormat", q.features.shaderStorageImageReadWithoutFormat},
+    {"shaderStorageImageWriteWithoutFormat", q.features.shaderStorageImageWriteWithoutFormat}, {"shaderFloat16", qf16.shaderFloat16},
+    {"shaderInt8", qf16.shaderInt8}, {"storageBuffer8BitAccess", qs8.storageBuffer8BitAccess}, {"runtimeDescriptorArray", qdi.runtimeDescriptorArray},
+    {"descriptorBindingVariableDescriptorCount", qdi.descriptorBindingVariableDescriptorCount}, {"bufferDeviceAddress", qbda.bufferDeviceAddress},
+    {"synchronization2", qs2.synchronization2}, {"shaderIntegerDotProduct", qdot.shaderIntegerDotProduct}, {"descriptorBuffer", qdb.descriptorBuffer},
+    {"mutableDescriptorType", qmut.mutableDescriptorType}, {"computeDerivativeGroupLinear", qcd.computeDerivativeGroupLinear}};
+  for (auto& n : need) if (!n.v) miss += std::string(miss.empty() ? "" : " ") + n.n;
+  if (!miss.empty()) { why = "driver lacks features " + miss; return false; }
+
+  auto on = [&](VkBool32& b, const char* nm) { if (!b) { S.undo.push_back({&b, b}); b = VK_TRUE; S.setFeat += (S.setFeat.empty() ? "" : " "); S.setFeat += nm; } };
+  auto fresh = [&](VkBool32& b, const char* nm) { b = VK_TRUE; S.setFeat += (S.setFeat.empty() ? "" : " "); S.setFeat += nm; };
+  // walk the app's chain (const in the API; restored by the caller)
+  bool hSSC = false, hF2 = false, h12 = false, h13 = false, hF16 = false, hS8 = false, hDI = false, hBDA = false, hS2 = false, hDOT = false, hDB = false, hMUT = false, hCD = false;
+  for (auto* n = (VkBaseOutStructure*)ci->pNext; n; n = n->pNext) {
+    switch (n->sType) {
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2: { auto* x = (VkPhysicalDeviceFeatures2*)n; hF2 = true;
+        on(x->features.shaderInt16, "shaderInt16"); on(x->features.shaderStorageImageReadWithoutFormat, "shaderStorageImageReadWithoutFormat");
+        on(x->features.shaderStorageImageWriteWithoutFormat, "shaderStorageImageWriteWithoutFormat"); break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: { auto* x = (VkPhysicalDeviceVulkan12Features*)n; h12 = true;
+        on(x->shaderFloat16, "shaderFloat16"); on(x->shaderInt8, "shaderInt8"); on(x->storageBuffer8BitAccess, "storageBuffer8BitAccess");
+        on(x->descriptorIndexing, "descriptorIndexing"); on(x->runtimeDescriptorArray, "runtimeDescriptorArray");
+        on(x->descriptorBindingVariableDescriptorCount, "descriptorBindingVariableDescriptorCount"); on(x->bufferDeviceAddress, "bufferDeviceAddress"); break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: { auto* x = (VkPhysicalDeviceVulkan13Features*)n; h13 = true;
+        on(x->synchronization2, "synchronization2"); on(x->shaderIntegerDotProduct, "shaderIntegerDotProduct");
+        if (qssc.subgroupSizeControl) { on(x->subgroupSizeControl, "subgroupSizeControl"); if (qssc.computeFullSubgroups) on(x->computeFullSubgroups, "computeFullSubgroups"); } break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: { auto* x = (VkPhysicalDeviceSubgroupSizeControlFeatures*)n; hSSC = true;
+        if (qssc.subgroupSizeControl) { on(x->subgroupSizeControl, "subgroupSizeControl"); if (qssc.computeFullSubgroups) on(x->computeFullSubgroups, "computeFullSubgroups"); } break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: { auto* x = (VkPhysicalDeviceShaderFloat16Int8Features*)n; hF16 = true;
+        on(x->shaderFloat16, "shaderFloat16"); on(x->shaderInt8, "shaderInt8"); break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: { auto* x = (VkPhysicalDevice8BitStorageFeatures*)n; hS8 = true; on(x->storageBuffer8BitAccess, "storageBuffer8BitAccess"); break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES: { auto* x = (VkPhysicalDeviceDescriptorIndexingFeatures*)n; hDI = true;
+        on(x->runtimeDescriptorArray, "runtimeDescriptorArray"); on(x->descriptorBindingVariableDescriptorCount, "descriptorBindingVariableDescriptorCount"); break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: { auto* x = (VkPhysicalDeviceBufferDeviceAddressFeatures*)n; hBDA = true; on(x->bufferDeviceAddress, "bufferDeviceAddress"); break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES: { auto* x = (VkPhysicalDeviceSynchronization2Features*)n; hS2 = true; on(x->synchronization2, "synchronization2"); break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: { auto* x = (VkPhysicalDeviceShaderIntegerDotProductFeatures*)n; hDOT = true; on(x->shaderIntegerDotProduct, "shaderIntegerDotProduct"); break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT: { auto* x = (VkPhysicalDeviceDescriptorBufferFeaturesEXT*)n; hDB = true; on(x->descriptorBuffer, "descriptorBuffer"); break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT: { auto* x = (VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT*)n; hMUT = true; on(x->mutableDescriptorType, "mutableDescriptorType"); break; }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV: { auto* x = (VkPhysicalDeviceComputeShaderDerivativesFeaturesNV*)n; hCD = true; on(x->computeDerivativeGroupLinear, "computeDerivativeGroupLinear"); break; }
+      default: break;
+    }
+    S.structs += (S.structs.empty() ? "" : ",") + std::to_string((unsigned)n->sType);
+  }
+  // core features without a Features2 struct: pEnabledFeatures (a local copy)
+  if (!hF2) {
+    if (ci->pEnabledFeatures) S.core = *ci->pEnabledFeatures;
+    fresh(S.core.shaderInt16, "shaderInt16(core)"); fresh(S.core.shaderStorageImageReadWithoutFormat, "shaderStorageImageReadWithoutFormat(core)");
+    fresh(S.core.shaderStorageImageWriteWithoutFormat, "shaderStorageImageWriteWithoutFormat(core)");
+    dci.pEnabledFeatures = &S.core;
+  }
+  // new structs, prepended; the loader's link info stays in the chain behind them
+  const void* head = dci.pNext;
+  auto pre = [&](auto& st) { st.pNext = const_cast<void*>(head); head = &st; };
+  if (!h12) {   // with a 1.2 struct in the chain it covers these; a separate struct of the same feature next to it would be invalid
+    if (!hF16) { S.f16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES; fresh(S.f16.shaderFloat16, "shaderFloat16"); fresh(S.f16.shaderInt8, "shaderInt8"); pre(S.f16); }
+    if (!hS8) { S.s8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES; fresh(S.s8.storageBuffer8BitAccess, "storageBuffer8BitAccess"); pre(S.s8); }
+    if (!hDI) { S.di.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES; fresh(S.di.runtimeDescriptorArray, "runtimeDescriptorArray");
+      fresh(S.di.descriptorBindingVariableDescriptorCount, "descriptorBindingVariableDescriptorCount"); pre(S.di); }
+    if (!hBDA) { S.bda.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES; fresh(S.bda.bufferDeviceAddress, "bufferDeviceAddress"); pre(S.bda); }
+  }
+  if (!h13) {
+    if (!hS2) { S.s2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES; fresh(S.s2.synchronization2, "synchronization2"); pre(S.s2); }
+    if (!hDOT) { S.dot.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES; fresh(S.dot.shaderIntegerDotProduct, "shaderIntegerDotProduct"); pre(S.dot); }
+  }
+  if (!hDB) { S.db.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT; fresh(S.db.descriptorBuffer, "descriptorBuffer"); pre(S.db); }
+  if (!hMUT) { S.mut.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT; fresh(S.mut.mutableDescriptorType, "mutableDescriptorType"); pre(S.mut); }
+  if (!h13 && !hSSC && qssc.subgroupSizeControl) { S.ssc.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES; fresh(S.ssc.subgroupSizeControl, "subgroupSizeControl"); if (qssc.computeFullSubgroups) fresh(S.ssc.computeFullSubgroups, "computeFullSubgroups"); pre(S.ssc); }
+  if (!hCD) { S.cd.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_NV; fresh(S.cd.computeDerivativeGroupLinear, "computeDerivativeGroupLinear"); pre(S.cd); }
+  dci.pNext = head;
+  dci.enabledExtensionCount = uint32_t(S.exts.size()); dci.ppEnabledExtensionNames = S.exts.data();
+  vlog("FSR 4 device set: app chain sTypes [%s]", S.structs.c_str());
+  return true;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL vl_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci, const VkAllocationCallbacks* a, VkDevice* out) {
   auto* li = (VkLayerDeviceCreateInfo*)ci->pNext;
   while (li && !(li->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO && li->function == VK_LAYER_LINK_INFO)) li = (VkLayerDeviceCreateInfo*)li->pNext;
@@ -848,6 +1179,35 @@ static VKAPI_ATTR VkResult VKAPI_CALL vl_CreateDevice(VkPhysicalDevice pd, const
   const bool on = enabled();
   std::vector<const char*> exts(ci->ppEnabledExtensionNames, ci->ppEnabledExtensionNames + ci->enabledExtensionCount);
   int have = 0;
+  if (spoof_on()) {  // build 15: the listed-only NVIDIA extensions never reach the driver (it has none of them)
+    size_t before = exts.size();
+    exts.erase(std::remove_if(exts.begin(), exts.end(), [](const char* e) { return is_nvx_fake(e); }), exts.end());
+    if (exts.size() != before) vline("GPU identity override: %u listed-only NVX extension(s) removed from vkCreateDevice", unsigned(before - exts.size()));
+    // Build 16: the device extensions OptiScaler's own vkCreateDevice hook adds for its upscalers (FT9/fx24/src/OptiScaler/
+    // spoofing/Vulkan_Spoofing.cpp hkvkCreateDevice: push_descriptor, get_memory_requirements2, external memory / semaphore,
+    // timeline semaphore, dedicated allocation, float16_int8, integer dot product, mutable descriptor type, synchronization2).
+    // A game whose Vulkan calls bypass OptiScaler's hooks (Unity x64 under FEX) never gets them, and SGSR 2 / FSR 3 / FSR 2
+    // then fail to create or draw nothing (Haste k2lsp4). Added here only when the driver has them and the game did not.
+    // Not added: OptiScaler's EXT_buffer_device_address (the game may use the core/KHR one; both together are invalid) and
+    // the Win32 / NV / AMD ones the host driver does not have.
+    auto enumExt = (PFN_vkEnumerateDeviceExtensionProperties)gipa(in->inst, "vkEnumerateDeviceExtensionProperties");
+    uint32_t ne = 0; enumExt(pd, nullptr, &ne, nullptr); std::vector<VkExtensionProperties> ep(ne); enumExt(pd, nullptr, &ne, ep.data()); ep.resize(ne);
+    const char* add[] = {VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+      VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
+      VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME,
+      VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+    bool valveMut = false; for (auto* e : exts) valveMut |= !strcmp(e, "VK_VALVE_mutable_descriptor_type");
+    std::string added;
+    for (const char* w : add) {
+      if (valveMut && !strcmp(w, VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME)) continue;
+      bool sup = false, en = false;
+      for (auto& e : ep) sup |= !strcmp(e.extensionName, w);
+      for (auto* e : exts) en |= !strcmp(e, w);
+      if (sup && !en) { exts.push_back(w); added += added.empty() ? "" : " "; added += w; }
+    }
+    vline("GPU identity override: vkCreateDevice gets OptiScaler's upscaler extensions: %s", added.empty() ? "none missing" : added.c_str());
+  }
   if (on) {  // add the dma-buf import extensions when the driver has them and the app did not enable them (vkd3d does not)
     auto enumExt = (PFN_vkEnumerateDeviceExtensionProperties)gipa(in->inst, "vkEnumerateDeviceExtensionProperties");
     uint32_t ne = 0; enumExt(pd, nullptr, &ne, nullptr); std::vector<VkExtensionProperties> ep(ne); enumExt(pd, nullptr, &ne, ep.data());
@@ -862,8 +1222,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL vl_CreateDevice(VkPhysicalDevice pd, const
   }
   VkDeviceCreateInfo dci = *ci; dci.enabledExtensionCount = uint32_t(exts.size()); dci.ppEnabledExtensionNames = exts.data();
   auto create = (PFN_vkCreateDevice)gipa(in->inst, "vkCreateDevice");
-  VkResult r = create(pd, &dci, a, out); if (r != VK_SUCCESS) return r;
-  Dev* d = new Dev; d->dev = *out; d->gdpa = gdpa; d->on = on; d->extOk = have == 2; d->bda = bda_enabled(ci);
+  // Build 17: the FSR 4 device set. Off (VELA_VK_FSR4 unset): nothing below runs and this is build 16.
+  Fsr4Set fs; VkDeviceCreateInfo dciF = dci; bool fsr4 = false; VkResult r = VK_ERROR_INITIALIZATION_FAILED;
+  if (fsr4_on()) {
+    std::string why;
+    if (fsr4_build(in, pd, gipa, ci, exts, fs, dciF, why)) {
+      r = create(pd, &dciF, a, out); fs.undoAll();
+      if (r == VK_SUCCESS) {
+        fsr4 = true; { std::lock_guard<std::mutex> l(g_fsr4m); g_fsr4pd.push_back(pd); }
+        { std::string all; for (uint32_t k = 0; k < dciF.enabledExtensionCount; k++) { all += dciF.ppEnabledExtensionNames[k]; all += ' '; } vline("device %p: all %u enabled extensions: %s", (void*)*out, dciF.enabledExtensionCount, all.c_str()); }  // build 18: log only
+        vline("device %p: FSR 4 device set: added extensions: %s; features set: %s", (void*)*out, fs.addedExt.empty() ? "none" : fs.addedExt.c_str(), fs.setFeat.empty() ? "none" : fs.setFeat.c_str());
+      } else vline("FSR 4 device set refused by the driver (vkCreateDevice %d); retrying with the app's own create info: no FSR 4 on this device (extensions %s; features %s)", (int)r, fs.addedExt.c_str(), fs.setFeat.c_str());
+    } else { fs.undoAll(); vline("FSR 4 device set not available: %s", why.c_str()); }
+  }
+  if (!fsr4) { r = create(pd, &dci, a, out); if (r != VK_SUCCESS) return r; }
+  const VkDeviceCreateInfo& made = fsr4 ? dciF : dci;
+  Dev* d = new Dev; d->fsr4 = fsr4; for (uint32_t k = 0; k < made.enabledExtensionCount; k++) d->exts.push_back(made.ppEnabledExtensionNames[k]);
+  d->dev = *out; d->gdpa = gdpa; d->on = on; d->extOk = have == 2; d->bda = fsr4 || bda_enabled(&made);   // build 24: the FSR 4 device set always enables bufferDeviceAddress (undoAll had put the app's bits back)
   ((PFN_vkGetPhysicalDeviceMemoryProperties)gipa(in->inst, "vkGetPhysicalDeviceMemoryProperties"))(pd, &d->mp);
 #define F(n) d->n = (PFN_vk##n)gdpa(*out, "vk" #n);
   F(DestroyDevice) F(CreateBuffer) F(DestroyBuffer) F(GetBufferMemoryRequirements) F(AllocateMemory) F(FreeMemory)
@@ -874,7 +1249,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL vl_CreateDevice(VkPhysicalDevice pd, const
   F(ResetCommandPool) F(DeviceWaitIdle) F(GetBufferDeviceAddress)
   F(CreateShaderModule) F(DestroyShaderModule) F(CreatePipelineLayout) F(DestroyPipelineLayout) F(CreateComputePipelines) F(DestroyPipeline)
   F(CmdBindPipeline) F(CmdDispatchIndirect)
+  F(CmdDispatch) F(EndCommandBuffer) F(CmdBeginRenderPass) F(CmdBeginRenderPass2) F(CmdBeginRenderPass2KHR) F(CmdEndRenderPass) F(CmdEndRenderPass2) F(CmdEndRenderPass2KHR)
+  F(CmdBeginRendering) F(CmdBeginRenderingKHR) F(CmdEndRendering) F(CmdEndRenderingKHR) F(CmdPipelineBarrier2) F(CmdPipelineBarrier2KHR) F(UpdateDescriptorSets) F(CmdPushDescriptorSetKHR)
 #undef F
+  if (!d->GetBufferDeviceAddress) { d->GetBufferDeviceAddress = (PFN_vkGetBufferDeviceAddress)gdpa(*out, "vkGetBufferDeviceAddressKHR"); vline("device %p: vkGetBufferDeviceAddress core name NULL, KHR %s", (void*)*out, d->GetBufferDeviceAddress ? "used" : "NULL too"); }   // build 24: an API 1.1 device (Unity) answers NULL for the core name -> no CAP_BDA -> the provider's 'badargs'
   if (!d->GetMemoryFdPropertiesKHR) d->extOk = false;
   bool placed = false;
   { std::lock_guard<std::mutex> l(g_mtx); for (auto& e : g_dev) if (!e.key.load()) { e.d = d; e.key.store(key_of(*out), std::memory_order_release); placed = true; break; } }
@@ -883,7 +1261,95 @@ static VKAPI_ATTR VkResult VKAPI_CALL vl_CreateDevice(VkPhysicalDevice pd, const
   return r;
 }
 
-VL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vl_GetDeviceProcAddr(VkDevice dev, const char* name) {
+// Build 22: the provider's SPIR-V 1.4+ modules (Unity's are older) are logged BEFORE the driver sees them (size, version, capabilities, extensions, execution modes), and every compute
+// pipeline from #50 on is logged BEFORE vkCreateComputePipelines (module, entry, flags, required subgroup size), flushed: the last such line before the death names the call that kills the process (build 21: the trace
+// after provider pipeline #63 stayed empty, so the death is inside the pipeline / module creation loop, not in command recording).
+static std::atomic<int> g_modn{0}, g_prel{0}; static std::unordered_map<uint64_t, int> g_modseq;
+static VKAPI_ATTR VkResult VKAPI_CALL vl_CreateShaderModule(VkDevice dev, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* a, VkShaderModule* out) {
+  Dev* d = dev_of(dev); const uint32_t* w = ci->pCode; const size_t nw = ci->codeSize / 4;
+  const bool big = nw > 5 && w[0] == 0x07230203u && w[1] >= 0x10400u; int seq = -1;
+  if (big) {
+    seq = g_modn.fetch_add(1);
+    if (seq < 300) {
+      std::string caps, exts, modes; size_t i = 5;
+      while (i < nw) { uint32_t op = w[i] & 0xffff, len = w[i] >> 16; if (!len || i + len > nw) break;
+        if (op == 17) { caps += std::to_string(w[i + 1]) + ' '; }
+        else if (op == 10) { exts += (const char*)&w[i + 1]; exts += ' '; }
+        else if (op == 16) { modes += "mode" + std::to_string(w[i + 2]); for (uint32_t j = 3; j < len; j++) modes += "." + std::to_string(w[i + j]); modes += ' '; }
+        else if (op != 11 && op != 14 && op != 15) break;
+        i += len; }
+      vlog("sm #%d PRE %zu words spirv 0x%x bound %u caps: %s| exts: %s| exec modes: %s", seq, nw, (unsigned)w[1], (unsigned)w[3], caps.c_str(), exts.c_str(), modes.c_str());
+    }
+  }
+  VkResult r = d->CreateShaderModule(dev, ci, a, out);
+  if (big && seq < 300) { vlog("sm #%d -> result %d module %p", seq, (int)r, r == VK_SUCCESS ? (void*)(uintptr_t)*out : nullptr); if (r == VK_SUCCESS) { std::lock_guard<std::mutex> l(g_dgm); g_modseq[(uint64_t)*out] = seq; } }
+  return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL vl_CreateComputePipelines(VkDevice dev, VkPipelineCache pc, uint32_t n, const VkComputePipelineCreateInfo* ci, const VkAllocationCallbacks* a, VkPipeline* out) {
+  Dev* d = dev_of(dev);
+  static std::atomic<int> cnt{0}; int k = cnt.fetch_add(1);
+  uint32_t ssz = 0;
+  for (uint32_t i = 0; i < n; i++) for (auto* p = (const VkBaseInStructure*)ci[i].stage.pNext; p; p = p->pNext)
+    if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO) ssz = ((const VkPipelineShaderStageRequiredSubgroupSizeCreateInfo*)p)->requiredSubgroupSize;
+  if (k >= 50 && g_prel.fetch_add(1) < 500) {
+    int ms = -1; { std::lock_guard<std::mutex> l(g_dgm); auto it = g_modseq.find((uint64_t)ci[0].stage.module); if (it != g_modseq.end()) ms = it->second; }
+    vlog("cp #%d PRE count %u flags0 0x%x module %p (sm #%d) entry %s stageflags 0x%x requiredSubgroupSize %u layout %p", k, n, (unsigned)ci[0].flags, (void*)(uintptr_t)ci[0].stage.module, ms, ci[0].stage.pName ? ci[0].stage.pName : "?", (unsigned)ci[0].stage.flags, ssz, (void*)(uintptr_t)ci[0].layout);
+  }
+  VkResult r = d->CreateComputePipelines(dev, pc, n, ci, a, out);
+  if (ssz && !g_prov.load()) { g_prov.store(1); vlog("dg trace on: first provider pipeline (#%d, required subgroup size %u)", k, ssz); }
+  if (k >= 50 && g_prel.load() <= 500) vlog("cp #%d -> result %d", k, (int)r);
+  if (k < 60 || r != VK_SUCCESS) { int nn = 0; for (uint32_t i = 0; r == VK_SUCCESS && i < n; i++) if (!out[i]) nn++; vline("vkCreateComputePipelines #%d: count %u result %d null pipelines %d flags0 0x%x", k, n, (int)r, nn, n ? (unsigned)ci[0].flags : 0u); }
+  return r;
+}
+
+// ---------------------------------------------------------------- build 23: core 1.2 / 1.3 names answered with the KHR / EXT pointer
+// The Unity device is API 1.1; winevulkan answers NULL for the core names of later versions but not for their KHR names. A provider that asks
+// vkGetDeviceProcAddr("vkGetBufferDeviceAddress") then calls a null pointer. Under VELA_VK_FSR4=1 the layer answers the core name with the
+// KHR / EXT pointer when the extension is enabled on the device (same semantics: these are the promoted functions).
+struct Alias { const char* core; const char* ext; const char* extname; };
+static const Alias kAliases[] = {
+  {"vkGetBufferDeviceAddress", "vkGetBufferDeviceAddressKHR", "VK_KHR_buffer_device_address"},
+  {"vkGetBufferOpaqueCaptureAddress", "vkGetBufferOpaqueCaptureAddressKHR", "VK_KHR_buffer_device_address"},
+  {"vkGetDeviceMemoryOpaqueCaptureAddress", "vkGetDeviceMemoryOpaqueCaptureAddressKHR", "VK_KHR_buffer_device_address"},
+  {"vkCmdPipelineBarrier2", "vkCmdPipelineBarrier2KHR", "VK_KHR_synchronization2"},
+  {"vkCmdWriteTimestamp2", "vkCmdWriteTimestamp2KHR", "VK_KHR_synchronization2"},
+  {"vkQueueSubmit2", "vkQueueSubmit2KHR", "VK_KHR_synchronization2"},
+  {"vkCmdSetEvent2", "vkCmdSetEvent2KHR", "VK_KHR_synchronization2"},
+  {"vkCmdResetEvent2", "vkCmdResetEvent2KHR", "VK_KHR_synchronization2"},
+  {"vkCmdWaitEvents2", "vkCmdWaitEvents2KHR", "VK_KHR_synchronization2"},
+  {"vkCmdBeginRendering", "vkCmdBeginRenderingKHR", "VK_KHR_dynamic_rendering"},
+  {"vkCmdEndRendering", "vkCmdEndRenderingKHR", "VK_KHR_dynamic_rendering"},
+  {"vkCmdCopyBuffer2", "vkCmdCopyBuffer2KHR", "VK_KHR_copy_commands2"},
+  {"vkCmdCopyImage2", "vkCmdCopyImage2KHR", "VK_KHR_copy_commands2"},
+  {"vkCmdCopyBufferToImage2", "vkCmdCopyBufferToImage2KHR", "VK_KHR_copy_commands2"},
+  {"vkCmdCopyImageToBuffer2", "vkCmdCopyImageToBuffer2KHR", "VK_KHR_copy_commands2"},
+  {"vkCmdBlitImage2", "vkCmdBlitImage2KHR", "VK_KHR_copy_commands2"},
+  {"vkCmdResolveImage2", "vkCmdResolveImage2KHR", "VK_KHR_copy_commands2"},
+  {"vkGetDeviceBufferMemoryRequirements", "vkGetDeviceBufferMemoryRequirementsKHR", "VK_KHR_maintenance4"},
+  {"vkGetDeviceImageMemoryRequirements", "vkGetDeviceImageMemoryRequirementsKHR", "VK_KHR_maintenance4"},
+  {"vkGetDeviceImageSparseMemoryRequirements", "vkGetDeviceImageSparseMemoryRequirementsKHR", "VK_KHR_maintenance4"},
+  {"vkCmdPushDescriptorSet", "vkCmdPushDescriptorSetKHR", "VK_KHR_push_descriptor"},
+  {"vkCmdPushDescriptorSetWithTemplate", "vkCmdPushDescriptorSetWithTemplateKHR", "VK_KHR_push_descriptor"},
+  {"vkResetQueryPool", "vkResetQueryPoolEXT", "VK_EXT_host_query_reset"},
+  {"vkGetSemaphoreCounterValue", "vkGetSemaphoreCounterValueKHR", "VK_KHR_timeline_semaphore"},
+  {"vkWaitSemaphores", "vkWaitSemaphoresKHR", "VK_KHR_timeline_semaphore"},
+  {"vkSignalSemaphore", "vkSignalSemaphoreKHR", "VK_KHR_timeline_semaphore"},
+  {"vkCreateRenderPass2", "vkCreateRenderPass2KHR", "VK_KHR_create_renderpass2"},
+  {"vkCmdBeginRenderPass2", "vkCmdBeginRenderPass2KHR", "VK_KHR_create_renderpass2"},
+  {"vkCmdNextSubpass2", "vkCmdNextSubpass2KHR", "VK_KHR_create_renderpass2"},
+  {"vkCmdEndRenderPass2", "vkCmdEndRenderPass2KHR", "VK_KHR_create_renderpass2"},
+  {"vkCmdDrawIndirectCount", "vkCmdDrawIndirectCountKHR", "VK_KHR_draw_indirect_count"},
+  {"vkCmdDrawIndexedIndirectCount", "vkCmdDrawIndexedIndirectCountKHR", "VK_KHR_draw_indirect_count"},
+};
+static const Alias* alias_of(const char* name) { for (auto& a : kAliases) if (!strcmp(a.core, name)) return &a; return nullptr; }
+static bool dev_has_ext(const Dev* d, const char* e) { for (auto& x : d->exts) if (x == e) return true; return false; }
+static void alias_log(const char* via, const Alias* a) {
+  static std::mutex m; static std::set<std::string> seen; std::string k = std::string(via) + a->core;
+  { std::lock_guard<std::mutex> l(m); if (!seen.insert(k).second) return; }
+  vlog("alias %s: %s -> %s (%s enabled)", via, a->core, a->ext, a->extname);
+}
+VL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vl_GetDeviceProcAddr(VkDevice dev, const char* name);
+static PFN_vkVoidFunction gdpa_impl(VkDevice dev, const char* name) {
   if (!strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)vl_GetDeviceProcAddr;
   Dev* d = dev_of(dev); if (!d) return nullptr;
   if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)vl_DestroyDevice;
@@ -891,6 +1357,18 @@ VL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vl_GetDeviceProcAddr(VkDevice
 #define H(n, f) if (!strcmp(name, n)) return (PFN_vkVoidFunction)(f);
     H(VELA_NPU_ENTRY_NAME, vl_CmdVelaNpuUpscale)  // private: answered before asking the next layer
     H("vkCmdUpdateBuffer", vl_CmdUpdateBuffer) H("vkQueueSubmit", vl_QueueSubmit) H("vkBeginCommandBuffer", vl_BeginCommandBuffer)
+    if (fsr4_on() && d->CreateComputePipelines && !strcmp(name, "vkCreateComputePipelines")) return (PFN_vkVoidFunction)vl_CreateComputePipelines;
+    if (fsr4_on() && d->CreateShaderModule && !strcmp(name, "vkCreateShaderModule")) return (PFN_vkVoidFunction)vl_CreateShaderModule;
+    if (fsr4_on()) {   // build 21: provider trace hooks (only where the next layer has the function, else null as it would answer)
+#define HD(n, f, fld) if (d->fld && !strcmp(name, n)) return (PFN_vkVoidFunction)(f);
+      HD("vkCmdDispatch", vl_CmdDispatch, CmdDispatch) HD("vkEndCommandBuffer", vl_EndCommandBuffer, EndCommandBuffer) HD("vkCmdPipelineBarrier", vl_CmdPipelineBarrier, CmdPipelineBarrier)
+      HD("vkCmdBeginRenderPass", vl_CmdBeginRenderPass, CmdBeginRenderPass) HD("vkCmdBeginRenderPass2", vl_CmdBeginRenderPass2, CmdBeginRenderPass2) HD("vkCmdBeginRenderPass2KHR", vl_CmdBeginRenderPass2KHR, CmdBeginRenderPass2KHR)
+      HD("vkCmdEndRenderPass", vl_CmdEndRenderPass, CmdEndRenderPass) HD("vkCmdEndRenderPass2", vl_CmdEndRenderPass2, CmdEndRenderPass2) HD("vkCmdEndRenderPass2KHR", vl_CmdEndRenderPass2KHR, CmdEndRenderPass2KHR)
+      HD("vkCmdBeginRendering", vl_CmdBeginRendering, CmdBeginRendering) HD("vkCmdBeginRenderingKHR", vl_CmdBeginRenderingKHR, CmdBeginRenderingKHR) HD("vkCmdEndRendering", vl_CmdEndRendering, CmdEndRendering) HD("vkCmdEndRenderingKHR", vl_CmdEndRenderingKHR, CmdEndRenderingKHR)
+      HD("vkCmdPipelineBarrier2", vl_CmdPipelineBarrier2, CmdPipelineBarrier2) HD("vkCmdPipelineBarrier2KHR", vl_CmdPipelineBarrier2KHR, CmdPipelineBarrier2KHR)
+      HD("vkUpdateDescriptorSets", vl_UpdateDescriptorSets, UpdateDescriptorSets) HD("vkCmdPushDescriptorSetKHR", vl_CmdPushDescriptorSetKHR, CmdPushDescriptorSetKHR)
+#undef HD
+    }
     H("vkCmdBindPipeline", vl_CmdBindPipeline)   // remembers the app's compute pipeline
     H("vkAllocateCommandBuffers", vl_AllocateCommandBuffers) H("vkFreeCommandBuffers", vl_FreeCommandBuffers) H("vkResetCommandPool", vl_ResetCommandPool)
     if (!strcmp(name, "vkQueueSubmit2")) return d->QueueSubmit2 ? (PFN_vkVoidFunction)vl_QueueSubmit2 : nullptr;
@@ -899,7 +1377,14 @@ VL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vl_GetDeviceProcAddr(VkDevice
   }
   return d->gdpa(dev, name);
 }
-VL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vl_GetInstanceProcAddr(VkInstance inst, const char* name) {
+VL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vl_GetDeviceProcAddr(VkDevice dev, const char* name) {
+  PFN_vkVoidFunction r = gdpa_impl(dev, name);
+  if (!r && name && fsr4_on()) { Dev* d = dev_of(dev); const Alias* a = d && d->fsr4 ? alias_of(name) : nullptr;
+    if (a && dev_has_ext(d, a->extname)) { r = gdpa_impl(dev, a->ext); if (r) alias_log("gdpa", a); } }
+  dg_gp("dev", name, r == nullptr); return r;
+}
+VL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vl_GetInstanceProcAddr(VkInstance inst, const char* name);
+static PFN_vkVoidFunction gipa_impl(VkInstance inst, const char* name) {
   if (!strcmp(name, "vkGetInstanceProcAddr")) return (PFN_vkVoidFunction)vl_GetInstanceProcAddr;
   if (!strcmp(name, "vkCreateInstance")) return (PFN_vkVoidFunction)vl_CreateInstance;
   if (!strcmp(name, "vkDestroyInstance")) return (PFN_vkVoidFunction)vl_DestroyInstance;
@@ -907,7 +1392,20 @@ VL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vl_GetInstanceProcAddr(VkInst
   if (!strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)vl_GetDeviceProcAddr;
   if (!inst) return nullptr;
   Inst* in; { std::lock_guard<std::mutex> l(g_mtx); auto it = g_inst.find(key_of(inst)); in = it == g_inst.end() ? nullptr : it->second; }
+  if (in && spoof_on()) {   // GPU identity override: only where the next layer has the function (else null, as it would answer)
+    if (!strcmp(name, "vkGetPhysicalDeviceProperties")) return in->gpdp ? (PFN_vkVoidFunction)vl_GetPhysicalDeviceProperties : nullptr;
+    if (!strcmp(name, "vkGetPhysicalDeviceProperties2")) return in->gpdp2 ? (PFN_vkVoidFunction)vl_GetPhysicalDeviceProperties2 : nullptr;
+    if (!strcmp(name, "vkGetPhysicalDeviceProperties2KHR")) return in->gpdp2khr ? (PFN_vkVoidFunction)vl_GetPhysicalDeviceProperties2KHR : nullptr;
+    if (!strcmp(name, "vkEnumerateDeviceExtensionProperties")) return in->edep ? (PFN_vkVoidFunction)vl_EnumerateDeviceExtensionProperties : nullptr;
+  }
   return in ? in->gipa(inst, name) : nullptr;
+}
+VL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vl_GetInstanceProcAddr(VkInstance inst, const char* name) {
+  PFN_vkVoidFunction r = gipa_impl(inst, name);
+  if (!r && inst && name && fsr4_on()) { const Alias* a = alias_of(name);
+    if (a) { bool ok = false; for (auto& e : g_dev) { Dev* d = e.key.load(std::memory_order_acquire) ? e.d : nullptr; if (d && d->fsr4 && dev_has_ext(d, a->extname)) { ok = true; break; } }
+      if (ok) { r = gipa_impl(inst, a->ext); if (r) alias_log("gipa", a); } } }
+  dg_gp("inst", name, r == nullptr); return r;
 }
 VL_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v) {
   if (v->loaderLayerInterfaceVersion > 2) v->loaderLayerInterfaceVersion = 2;
