@@ -293,6 +293,7 @@ class QualityContext {
     bool x_k1h_ok=false;   // pass-27 = K2P k1x and pass-28 = K2P k2lu: K2 can read the HTP k1 tensor itself (nf4_k1h)
     VkPipeline x_pre_fx{};   // pipelines[0] when it is the fx1 pre (no reprojected store)
     VkPipeline x_pre_fpx{};   // pipelines[0] when it is an X0-flag Fast pre
+    VkPipeline x_pre_wg{};    // pipelines[0] when it is the exact pre without the empty odd group rows (half the rows dispatched)
     VkPipeline x_k1{}, x_k2{}, x_pre_fused{};   // x_pre_fused = pipelines[0] when it is the f1g pre
     VkPipeline x_pre_b1080{};   // pipelines[0] when it is the plain baked 1080-tier pre (0x067a3d15, ultraperf without a fused pre)
     Buffer x_inter{};
@@ -702,6 +703,7 @@ public:
             if(fsr411 && index==0) { fv::g_fast=fv::fast_setting(); std::fprintf(stderr,"Fast: mode %s\n",fv::g_fast==1 ? "fsr4fast" : fv::g_fast==2 ? "fsr4fast-rha (legacy)" : "fsr4 (exact)");
                 if(!std::getenv("VELA_FP_PRE") && !std::getenv("VELA_LR") && !std::getenv("VELA_R3")) vela_ff_pre(code,read_bytes(initializer_path),fv::g_fast.load()); }   // Embedded (experimental env switches win)
             if(fsr411 && index==0) vela_r3_select(code,shader_dir,initializer_path);   // baked-weight prepass (guarded, default off)
+            if(fsr411 && index==0) fv::g_fpx=(vela_exact_pre(code,fv::g_fast.load())&1) ? 1 : 0;   // exact pl -> X0 flag / half group rows (VELA_FP=0 turns the X0 flag off; half group rows only with VELA_WG=1, off by default since 0.8.25)
             if(!fsr411 && index==11) fsr4::guard_model11_rows(code);
             if(fsr411 && index==0 && !std::getenv("FSR4_J_NOGUARD") && !vela_baked_pre(code))fsr4::guard_fsr411_prepass_quads(code);
             jobs.push_back({std::move(code),spd ? "auto_exposure" : fsr411 ? name : std::string(kPasses[index].name)});
@@ -734,6 +736,7 @@ public:
             pipelines.push_back(jobs[index].pipeline);
             if(fsr411 && index==0 && vela_fused_pre(jobs[index].code)) x_pre_fused=pipelines.back();
             if(fsr411 && index==0 && vela_fp_x0f(vela_fnv(jobs[index].code))) x_pre_fpx=pipelines.back();   // X0-flag prepass
+            if(fsr411 && index==0 && vela_wg_pre(vela_fnv(jobs[index].code))) x_pre_wg=pipelines.back();   // half group rows
             if(fsr411 && index==0 && vela_fx_pre(vela_fnv(jobs[index].code))) x_pre_fx=pipelines.back();   // no-reprojected-store prepass
             if(fsr411 && index==0 && vela_fnv(jobs[index].code)==0x067a3d152a1be205ull) x_pre_b1080=pipelines.back();   // baked 1080-tier prepass
         }
@@ -1077,7 +1080,7 @@ public:
                 bind_descriptor_buffers,set_descriptor_offsets,bind_embedded_samplers,profile_queries,profile_base+2,
                 main_constants.width,main_constants.height,model_capacity_width,model_capacity_height,
                 dispatch.cmd_pipeline_barrier2,dispatch.cmd_write_timestamp2,x_k2,x_inter.buffer ? buffer_address(x_inter) : 0,
-                fv_bridge,buffer_address(scratch),dl_case==1 ? 2 : 3,fx,(x_u15==1 || x_u15==2) ? 14u : 0u);
+                fv_bridge,buffer_address(scratch),dl_case==1 ? 2 : 3,fx,(x_u15==1 || x_u15==2) ? 14u : 0u,x_pre_wg && pipelines[0]==x_pre_wg);
             dl_open=false;
             if(fx && dl_case==1) fx_lat^=1;   // The TAIL's K2 wrote O
         }
@@ -1215,7 +1218,7 @@ public:
             main_constants.width,main_constants.height,model_capacity_width,model_capacity_height,
             dispatch.cmd_pipeline_barrier2,dispatch.cmd_write_timestamp2,
             x_split && pipelines[26]==x_k1 ? x_k2 : VK_NULL_HANDLE, x_inter.buffer ? buffer_address(x_inter) : 0,
-            fv_bridge,buffer_address(scratch),dl_case==1 ? 1 : dl_case==3 ? 4 : 0,fx,(x_u15==1 || x_u15==2) ? 14u : 0u);
+            fv_bridge,buffer_address(scratch),dl_case==1 ? 1 : dl_case==3 ? 4 : 0,fx,(x_u15==1 || x_u15==2) ? 14u : 0u,x_pre_wg && pipelines[0]==x_pre_wg);
         else fsr4::record_quality_frame(command_buffer,pipeline_layout,std::span<const VkPipeline>(pipelines).first(kPasses.size()),addresses,
             buffer_address(frame.constants),history.image,recurrent.image,reprojected.image,
             bind_descriptor_buffers,set_descriptor_offsets,bind_embedded_samplers,profile_queries,profile_base+(nms_inputs ? 2 : 0),

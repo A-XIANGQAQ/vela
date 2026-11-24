@@ -1,7 +1,17 @@
 # Vela FSR 4 provider for Vulkan: complete corresponding source
 
-`upscale/assets/sgsr3/amd_fidelityfx_upscaler_vk.dll` in the Vela 0.8.21 zip is built from this folder. The build is reproducible: it fixes the image
-base of the DLL, pins the MinGW packages and checks the Vulkan-Headers commit. `build.sh` prints the md5 of the DLL; it must be `d230a1208c5ad78b6ea573536d41184f`.
+`upscale/assets/sgsr3/amd_fidelityfx_upscaler_vk.dll` in the Vela 0.8.25 zip is built from this folder. The build is reproducible: it fixes the image
+base of the DLL, pins the MinGW packages and checks the Vulkan-Headers commit. `build.sh` prints the md5 of the DLL; it must be `221a16478be0ebc6a0949383ecee5e35`.
+
+## What changed in 0.8.25 (G2, lighter frames)
+
+Against the 0.8.24 provider (md5 `d230a1208c5ad78b6ea573536d41184f`, the sources are in this repository's history at the 0.8.24 commits) five files changed
+(`overlay/ov/fsr411-recorder.hpp`, `fv_npu.hpp`, `quality-context.hpp`, `vela-baked-pre.hpp`, new `spirv-sources/exact/plx_gen.py`).
+In exact FSR 4 with the NPU, the pre-pass loads a variant (flag X0) and, on frames where the NPU answers, the GPU skips the X0 store, the
+`border_0` pass and 26 GPU-network dispatches ("slim frames": only after 8 OK acknowledgements from the NPU, full frames for 16 frames after a
+failed one). The picture is the same bit for bit: 240 of 240 frames equal to the 0.8.24 DLL on the PC stand, and 119 of 119 on the
+Retroid Pocket 6 with the slim path engaged; the GPU part is about 0.1 ms shorter per frame. `VELA_FP=0` gives the 0.8.24 behaviour;
+`VELA_WG=1` also halves the pre-pass group rows (not recommended: no gain). FSR 4 Fast is unchanged.
 
 ## License
 - Provider code (fsr4vk's own code and the Vela changes in `overlay/`): **GPL-3.0** (`fsr4vk/LICENSES/GPL-3.0.txt`).
@@ -32,7 +42,7 @@ base of the DLL, pins the MinGW packages and checks the Vulkan-Headers commit. `
 ## Build
 1. Install Docker. From this folder run `sh build.sh` (Linux, macOS or Git Bash on Windows; ~10 min, network needed).
 2. The build log must end with `PASS: frozen inputs, AMD64 exports, asset identities and normal/debug modes`.
-3. `md5sum out/amd_fidelityfx_upscaler_vk.dll` must print `d230a1208c5ad78b6ea573536d41184f`. What makes the result the same on every run:
+3. `md5sum out/amd_fidelityfx_upscaler_vk.dll` must print `221a16478be0ebc6a0949383ecee5e35`. What makes the result the same on every run:
    - base image `ubuntu:24.04` with the MinGW packages pinned in `build/dll_build_prv.sh` (`g++-mingw-w64-x86-64-posix 13.2.0-6ubuntu1+26.1`,
      `binutils-mingw-w64-x86-64 2.41.90.20240122-1ubuntu1+11.4`; the versions are printed at the top of `out/build.log`);
    - Vulkan-Headers `v1.4.367`, checked against commit `9fbc2a782ee3f8a4db64e7d991e23da75e893f44`;

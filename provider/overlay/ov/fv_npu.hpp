@@ -128,7 +128,10 @@ inline int u15_setting() { const char* e = std::getenv("VELA_FAST_UP15"); int m 
     if (!e || !*e) m = live_int("fastup15=") == 0 ? 0 : 3;
     if ((m == 1 || m == 2) && fast_setting() != 2) m = 0;
     return m; }
-inline int fp_bits() { return g_fast.load() ? 7 : env_i("VELA_FP", 0); }   // VELA_FP bits: 1 slim, 2 history 10 bit, 4 reprojected 10 bit
+// Vela r5: g_fpx = the context's pass-01 is the exact X0-flag prepass (plx / plxw, vela-baked-pre.hpp): then slim (bit 1) is the default
+// of exact mode; VELA_FP set = that value as before (VELA_FP=0: no slim, and the context keeps pl without the flag)
+inline std::atomic<int> g_fpx{0};
+inline int fp_bits() { return g_fast.load() ? 7 : env_i("VELA_FP", g_fpx.load() ? 1 : 0); }   // VELA_FP bits: 1 slim, 2 history 10 bit, 4 reprojected 10 bit
 inline int fx_bits() { const int f = g_fast.load(); return f == 2 ? 2 : f ? 0 : env_i("VELA_FX", 0); }   // VELA_FX bit 2: half-size recurrent (legacy Fast only)
 inline bool exact_setting() { const int lv = live_int("npuexact="); if (lv >= 0) return lv != 0; return env_i("VELA_NPU_EXACT", 1) != 0; }
 inline bool kick_setting() { const int lv = live_kick(); if (lv >= 0) return lv == 1; return kick_word(std::getenv("VELA_NPU_KICK")) != 0; }
@@ -185,6 +188,11 @@ struct Bridge {
     // last recorded HEAD skipped X0 (its TAIL must not run the GPU network). Slim only after 8 OK acks and 2*NR frames after a failed one.
     int fp_mode = 0; bool fp_pre = false, fp_prev_head = false; uint64_t fp_last_fb = 0, fp_fb_seen = 0, fp_heads = 0, fp_tails = 0;
     bool fp_allow() { fp_mode = fp_bits(); if (fb != fp_fb_seen) { fp_fb_seen = fb; fp_last_fb = frame; } return (fp_mode & 1) && fp_pre && ok >= 8 && frame > fp_last_fb + 2 * NR; }
+    // One log line per change of the slim state of a recorded HEAD (the first 16 changes, then every 256th)
+    bool fp_on = false; uint64_t fp_changes = 0;
+    void fp_say(bool on) { if (on == fp_on) return; fp_on = on; if (++fp_changes > 16 && (fp_changes & 255)) return;
+        std::fprintf(stderr, "Vela NPU: slim frames %s (frame %llu, OK acks %llu, fallbacks %llu, %s)\n", on ? "on" : "off", (unsigned long long)frame,
+                     (unsigned long long)ok, (unsigned long long)fb, g_fast.load() ? "Fast" : "exact"); }
     VkDeviceAddress k1_other() const { return zbase + VkDeviceAddress(tail_oslot ? qout : qout1) * 16; }   // k1 slot of N-2
     std::vector<std::string> lines; std::string last_key;
 

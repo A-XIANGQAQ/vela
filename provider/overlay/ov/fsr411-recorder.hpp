@@ -61,7 +61,7 @@ inline void record_fsr411_frame(
     PFN_vkCmdPipelineBarrier2 pipeline_barrier2,
     PFN_vkCmdWriteTimestamp2 write_timestamp2,
     VkPipeline post_k2=VK_NULL_HANDLE, VkDeviceAddress inter_address=0,
-    fv::Bridge* fvb=nullptr, VkDeviceAddress fv_sadr=0, int part=0, bool fx=false, uint32_t k2t=0) {
+    fv::Bridge* fvb=nullptr, VkDeviceAddress fv_sadr=0, int part=0, bool fx=false, uint32_t k2t=0, bool pre_wg=false) {   // pre_wg: pipelines[0] reads gl_WorkGroupID.y as 2*y (vela_wg_pre)
     bool fv_ind=false;
     // History = L (K2 samples it, already READ_ONLY), reprojected = O (K2 writes it, already GENERAL): before K2 only recurrent moves;
     // a dropped TAIL (part 3) moves all three as before (L -> GENERAL, O -> READ_ONLY = the state after a K2 + swap)
@@ -111,7 +111,10 @@ inline void record_fsr411_frame(
         }
         push[count++]=i==26 ? 51 : 0;
         if(!border) push[count++]=i==26 ? 63 : 12;
-        const auto groups=fsr411_dispatch(i,width,height,capacity_width,capacity_height);
+        auto groups=fsr411_dispatch(i,width,height,capacity_width,capacity_height);
+        if(i==0 && pre_wg) groups[1]=divide_up(groups[1],2);   // G1: only the even group rows did work; the edited pre maps row y to 2*y
+        if(i==0) { static uint32_t said[3]{~0u,~0u,0}; if((said[0]!=groups[0] || said[1]!=groups[1]) && said[2]<8) { said[0]=groups[0]; said[1]=groups[1]; ++said[2];   // the grid really dispatched (at most 8 lines)
+            std::fprintf(stderr,"Vela pre: dispatch %ux%u groups (%s) for output %ux%u\n",groups[0],groups[1],pre_wg ? "half group rows" : "full grid",width,height); } }
         const bool split=(i==26 && post_k2!=VK_NULL_HANDLE);
         if(split){ const bool kh=fv_ind && fvb && fvb->k1h_frame;   // K1 (fallback only) and K2b always use the scratch InterBuf; K2a the HTP k1 slot of N-1
             const VkDeviceAddress ia=inter_address;
@@ -140,7 +143,7 @@ inline void record_fsr411_frame(
         }
         vkCmdBindPipeline(command_buffer,VK_PIPELINE_BIND_POINT_COMPUTE,pipelines[i]);
         if(i==0){ const VkDeviceAddress pd0=fvb?fvb->pf_din():0; if(!pd0) fp_hs=false; const VkDeviceAddress pd=pd0 | (fp_hs ? 1u : 0u);   // Bit 0 = pre skips X0
-            if(fvb && (part==1 || part==4)) { fvb->fp_prev_head=fp_hs; if(fp_hs) ++fvb->fp_heads; }   // pass-01 (fused) always gets 24 bytes; 0 = no HTP-input store
+            if(fvb && (part==1 || part==4)) { fvb->fp_prev_head=fp_hs; if(fp_hs) ++fvb->fp_heads; fvb->fp_say(fp_hs); }   // pass-01 (fused) always gets 24 bytes; 0 = no HTP-input store
             std::array<uint32_t,6> q6{push[0],push[1],push[2],push[3],uint32_t(pd),uint32_t(pd>>32)};
             vkCmdPushConstants(command_buffer,pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,24,q6.data()); }
         else vkCmdPushConstants(command_buffer,pipeline_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,count*4,push.data());
