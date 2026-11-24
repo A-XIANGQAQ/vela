@@ -30,6 +30,11 @@ LIB = "libVkLayer_VELA_npu.so"
 MANIFEST = "VkLayer_VELA_npu.json"
 ENABLE_ENV = ("VELA_NPU", "1")
 DISABLE_ENV = ("DISABLE_VELA_NPU", "1")
+# Vulkan GPU spoof, every native Vulkan game (owner 2026-11-24: no per-game list; AUDIT/vkreach/NOTES.md): while the player has a
+# model on the DLSS path picked (presets.VK_DLSS_MODELS: FSR 4, FSR 4 Fast) the layer answers vendor 0x10de, the game offers DLSS,
+# and the DLSS path is what Vela's FSR 4 rides on. Any other model, or Vela off: the tokens are out again.
+VK_TOKENS = ("VELA_VK_SPOOF_GPU=nvidia", "VELA_VK_FSR4=1")
+
 # 0.8.21: package 14: one daemon holds the sockets of all graphs
 UNIT = "vela-npu.service"
 # 0.8.3: the full FSR 4.1.1 network, graph nf4_exact, socket @fsr4npud_nf4_exact (the layer picks it from the provider's PROBE,
@@ -50,6 +55,10 @@ K1H450_UNIT = UNIT
 OLD_UNITS = {"full_unit": "vela-npu@nf4_exact.service", "k1h_unit": "vela-npu@nf4_k1h.service",
              "k1h360_unit": "vela-npu@nf4_k1h_360.service", "k1h450_unit": "vela-npu@nf4_k1h_450.service"}
 GRAPH_DIR = "/usr/lib64/vela-npu"
+# ANF (package 18 candidate): the one daemon also serves the ANF families, sockets fsr4npud_anf<canvas>s32 (canvas = 2 x the render height:
+# 360, 480, 540, 648, 720), graph files <family>.bin next to the FSR 4 graphs, 32 phase graphs each; a family loads when the game asks for it
+# (--max-loaded-graphs 48). The graph files tell package 18 from 17.
+ANF_FAMILIES = ("anf360s32", "anf480s32", "anf540s32", "anf648s32", "anf720s32")
 K1H450_GRAPH = "nf4_k1h_450.bin"
 # 0.8.14: FSR 4 Ultra Performance (render 1/3 of the window) runs its own graphs nf4up_k1h / _450 / _360 (sockets
 # fsr4npud_nf4up_k1h*). The graph file tells v9 from v8.
@@ -213,6 +222,8 @@ class Npu:
                          "k1h450_graph": os.path.isfile(os.path.join(self._graph_dir, K1H450_GRAPH)),
                          "up_graph": os.path.isfile(os.path.join(self._graph_dir, UP_GRAPH)),
                          "up_running": {o: socket_listening(self._proc, s) for o, s in UP_SOCKETS.items()},
+                         "anf_graphs": [f for f in ANF_FAMILIES if os.path.isfile(os.path.join(self._graph_dir, f + ".bin"))],
+                         "anf_running": [f for f in ANF_FAMILIES if socket_listening(self._proc, "fsr4npud_" + f)],
                          **units, "sizes_graph": pkg14,
                          "size_running": {o: socket_listening(self._proc, s) for o, s in SIZE_SOCKETS.items()}}
             self._svc_at = now
@@ -317,8 +328,10 @@ class Npu:
     def layer_log(self, appid):
         return os.path.join(self.dir, f"layer-{appid}.log")
 
-    def tokens(self, appid):
-        return [f"{ENABLE_ENV[0]}={ENABLE_ENV[1]}", f"VELA_NPU_LOG_FILE={self.layer_log(appid)}"]
+    def tokens(self, appid, vk=False):
+        """The layer's tokens; vk (a native Vulkan game with a DLSS-path model picked) adds the GPU-spoof pair."""
+        out = [f"{ENABLE_ENV[0]}={ENABLE_ENV[1]}", f"VELA_NPU_LOG_FILE={self.layer_log(appid)}"]
+        return out + list(VK_TOKENS) if vk else out
 
     @staticmethod
     def strip(options, tokens):
@@ -327,13 +340,15 @@ class Npu:
             out = re.sub(rf"(?<!\S){re.escape(tok)}(?!\S)", " ", out)
         return re.sub(r"\s+", " ", out).strip()
 
-    def enable(self, appid, launch_options):
-        """Launch options with the layer on (it loads at the next start of the game)."""
+    def enable(self, appid, launch_options, vk=None):
+        """Launch options with the layer on (it loads at the next start of the game). vk: the Vulkan GPU-spoof tokens (True: in,
+        False: out, None: as the state has them; the caller passes True only for a native Vulkan game)."""
         if not self.layer_found():
             raise RuntimeError(f"plugin files assets/npu ({LIB}, {MANIFEST}) are missing")
         st = self.read(appid) or {}
-        tokens = self.tokens(appid)
-        if st.get("on") and launch_options is not None and launch_options == st.get("launch_set"):
+        vk = bool(st.get("vk")) if vk is None else bool(vk)
+        tokens = self.tokens(appid, vk)
+        if st.get("on") and launch_options is not None and launch_options == st.get("launch_set") and                 list(st.get("tokens") or []) == tokens:
             return launch_options
         # 0.8.17: the layer's own tokens in front, exactly those out again (launchopts); the player's stay as they are
         if st.get("on"):
@@ -343,7 +358,7 @@ class Npu:
         else:
             st = {"on": True, "launch_prev": launch_options, "installed_at": time.time()}
             new, rec = launchopts.add(launch_options or "", tokens)
-        st.update({"tokens": tokens, "launch_set": new, "added": rec, "updated_at": time.time()})
+        st.update({"tokens": tokens, "vk": vk, "launch_set": new, "added": rec, "updated_at": time.time()})
         self._write(appid, st)
         self.sync_manifest()
         self.log(f"npu: {appid} on, launch: {new}")

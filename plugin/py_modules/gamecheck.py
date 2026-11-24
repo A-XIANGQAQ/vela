@@ -25,6 +25,7 @@ Pure standard library; the reads are bounded (READ_BUDGET) and cached by (path, 
 """
 import json
 import os
+import re
 
 READ_BUDGET = 512 * 1024 * 1024   # bytes read per game at most (a UE shipping exe is 60-200 MB)
 CHUNK = 8 * 1024 * 1024
@@ -166,8 +167,9 @@ class GameCheck:
             self._save()
         return found
 
-    def check(self, scan, static=False, s3_assets=True, ag_assets=True, appid=None):
-        return verdict(scan, self.markers(scan) if scan.get("exe_dir") else set(), static, s3_assets, ag_assets, appid)
+    def check(self, scan, static=False, s3_assets=True, ag_assets=True, appid=None, launch_options=None, observed=None):
+        return verdict(scan, self.markers(scan) if scan.get("exe_dir") else set(), static, s3_assets, ag_assets, appid,
+                       launch_options, observed)
 
 
 def _is_pe(path):
@@ -192,8 +194,39 @@ def is_shortcut(appid):
     return n >= 2 ** 31 or n < 0
 
 
-def verdict(scan, markers, static=False, s3_assets=True, ag_assets=True, appid=None):
-    """{"kind", "reason", "api": [...], "inputs": [...], "inputs_from": "files" | "exe" | None}; pure (tested)."""
+# 0.9.0: which API a game that names both Direct3D and Vulkan (Unity, Unreal ...) RUNS. Proton runs Direct3D unless a switch asks for
+# Vulkan; a standalone token in the launch options (Steam appends them to the game's command line) is the player's word, the last
+# API token wins. -force-glcore / -force-gles are OpenGL, not Vulkan. No game list.
+_RX_VK_SWITCH = re.compile(r"(?<!\S)--?(?:force-)?vulkan(?!\S)", re.I)
+_RX_API_SWITCH = re.compile(r"(?<!\S)(--?(?:force-)?vulkan|--?force-d3d1[12](?:-[\w-]+)?|--?(?:dx|d3d)1[12])(?!\S)", re.I)
+
+
+def switch_api(launch_options):
+    """"vulkan" / "d3d" by the last API switch in the launch options (-force-vulkan, -vulkan, --vulkan | -force-d3d11, -dx12 ...), else None."""
+    if not isinstance(launch_options, str):
+        return None
+    last = None
+    for m in _RX_API_SWITCH.finditer(launch_options):
+        last = "vulkan" if _RX_VK_SWITCH.fullmatch(m.group(1)) else "d3d"
+    return last
+
+
+def runs_vulkan(api, launch_options=None, observed=None):
+    """Will the game run Vulkan? Only a game whose binary names Vulkan can. No Direct3D named: yes (native Vulkan). Both named: the
+    launch options' last API switch decides, else what the last run showed (observed "vulkan" / "dx11" / "dx12"), else Direct3D."""
+    if "vulkan" not in api:
+        return False
+    if "dx12" not in api and "dx11" not in api:
+        return True
+    sw = switch_api(launch_options)
+    if sw:
+        return sw == "vulkan"
+    return observed == "vulkan"
+
+
+def verdict(scan, markers, static=False, s3_assets=True, ag_assets=True, appid=None, launch_options=None, observed=None):
+    """{"kind", "reason", "api": [...], "inputs": [...], "inputs_from": "files" | "exe" | None}; pure (tested).
+    launch_options / observed (0.9.0): what the game will run when its binary names Direct3D and Vulkan (runs_vulkan)."""
     api = [a for a in API_ORDER if a in markers]
     inputs = list(scan.get("inputs") or [])
     inputs_from = "files" if inputs else None
@@ -220,12 +253,13 @@ def verdict(scan, markers, static=False, s3_assets=True, ag_assets=True, appid=N
         return {**out, "kind": "none", "reason": "godot"}
     windows = bool(scan.get("exe_dir"))
     d3d = "dx12" in api or "dx11" in api
+    if windows and s3_assets and inputs and runs_vulkan(api, launch_options, observed):
+        # VK1: Vulkan is what the game runs (native Vulkan, or Direct3D + Vulkan with a Vulkan switch / a Vulkan last run):
+        # kind fsr4 with vulkan; FSR 4 through the DLSS path (0.9.0 VK spoof)
+        return {**out, "kind": "fsr4", "dx11_only": False, "vulkan": True}
     if windows and s3_assets and inputs and (d3d or not api):
         # no API marker read (a packed exe): DX12 is assumed, the first run's log tells the truth
         return {**out, "kind": "fsr4", "dx11_only": bool(api) and "dx12" not in api}
-    if windows and s3_assets and inputs and "vulkan" in api:
-        # VK1: native Vulkan (no Direct3D named): kind fsr4 with vulkan, the fork's Vulkan live models (no FSR 4 yet)
-        return {**out, "kind": "fsr4", "dx11_only": False, "vulkan": True}
     reason = "no_exe" if not windows else "vulkan_native" if api and not d3d else "no_inputs"
     if ag_assets:
         return {**out, "kind": "any", "reason": reason}

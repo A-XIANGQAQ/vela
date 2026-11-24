@@ -83,6 +83,10 @@ export function statusOf(gs: StatusIn): Status {
   }
   const model = runName(L.mode);
   if (L.mode && MODEL_NAME[L.mode] && want !== L.mode) return { dot: GREEN, text: t("st.switching", { from: model, to: wantName }), sub: sizes };
+  if (L.mode === "anf") {
+    // ANF's network runs on the NPU; until the NPU answers (the first frames) SGSR 2 draws, which the log shows as another mode
+    return s3.live?.npu ? { dot: GREEN, text: `${t("st.works")} · ${model} ${t("st.onNpu")}`, sub: sizes } : { dot: GREEN, text: `${t("st.works")} · ${model} ${t("st.onGpu")}`, sub: sizes };
+  }
   if (L.mode === "fsr4" || L.mode === "fsr4fast") {
     const n = L.npu;
     if (n?.state === "on") return { dot: GREEN, text: `${t("st.works")} · ${model} ${t("st.onNpu")}`, sub: sizes };

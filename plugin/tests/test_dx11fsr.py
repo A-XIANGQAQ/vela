@@ -46,7 +46,7 @@ v12 = gamecheck.verdict(base, {"dx12", "dx11"})
 assert v12["kind"] == "fsr4" and not v12["dx11_only"], v12
 assert not gamecheck.verdict(base, set())["dx11_only"], "nothing read: DX12 assumed"
 assert presets.models_for(v11["kind"]) == presets.models_for(v12["kind"]) == \
-    [("fsr4", True), ("fsr4fast", True), ("fsr3", True), ("dittosr", True), ("sgsr2", True)]  # DITTO: + DittoSR
+    [("fsr4", True), ("fsr4fast", True), ("anf", False), ("fsr3", True), ("dittosr", True), ("sgsr2", True)]  # DITTO: + DittoSR; ANF: listed, not offered unless P._anf_offered
 NPU_ON = {"layer_found": True, "service": {"installed": True}}
 assert presets.default_model(v11["kind"], True, NPU_ON) == "fsr4"
 assert presets.default_model(v11["kind"], True, None) == "fsr4fast"
@@ -67,7 +67,8 @@ en = json.load(open(os.path.join(ROOT, "src", "i18n", "en.json"), encoding="utf-
 assert "dx11.only" not in en
 bad = [k for k, s in en.items() if "only SGSR 2" in s or "need DirectX 12" in s or "needs DirectX 12" in s]
 assert not bad, bad
-assert en["st.dx11"] == "The game ran in DirectX 11 and did not use its upscaler there.", en["st.dx11"]
+assert en["st.dx11"] == "The game ran in DirectX 11 and Vela's upscaler did not start.", en["st.dx11"]
+assert "DirectX 11" in en["hint.dx11_run"] and "-dx12" not in en["hint.dx11_run"] and "another model" in en["hint.dx11_run"], en["hint.dx11_run"]
 tsx = open(os.path.join(ROOT, "src", "index.tsx"), encoding="utf-8").read()
 st_ts = open(os.path.join(ROOT, "src", "status.ts"), encoding="utf-8").read()
 assert 'kind === "sgsr2"' not in tsx and 'c.kind !== "sgsr2"' not in st_ts and "!c.dx11_only" in st_ts

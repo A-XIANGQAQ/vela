@@ -1,0 +1,42 @@
+From 48c30cb32df4adb4660783cd3d3c2cb137a46795 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 14:54:29 +0100
+Subject: [PATCH] 0049-vela-dx11-ffx-ignore-d3d11-fsr2-masks: FFX backend (FSR
+ 3, DittoSR) under the Dx11->Dx12 bridge ignores FSR.reactive /
+ FSR.transparencyAndComposition, which the FSR 2 input path leaves as D3D11
+ resources (Bright Memory -dx11: vkd3d assertion iface->lpVtbl ==
+ &d3d12_resource_vtbl)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
+index a585f2c..d858f45 100644
+--- a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
++++ b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
+@@ -343,12 +343,18 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+         }
+     }
+ 
++    // Vela 0049: under the Dx11 -> Dx12 bridge the game's FSR 2 inputs (FSR2_Dx11.cpp, UE RHI) hand over D3D11 resources
++    // as "FSR.reactive" / "FSR.transparencyAndComposition"; they are never converted to D3D12 (only the NGX exposure and
++    // bias masks are), and the FFX backend (FSR 3, DittoSR) made descriptors of them: vkd3d-proton "Assertion failed:
++    // iface->lpVtbl == &d3d12_resource_vtbl" (Bright Memory -dx11, FSR 3 and DittoSR). Not used there.
++    const bool dx11Bridge = State::Instance().api == DX11;
++
+     ID3D12Resource* paramTransparency = nullptr;
+-    if (InParameters->Get("FSR.transparencyAndComposition", &paramTransparency) == NVSDK_NGX_Result_Success)
++    if (!dx11Bridge && InParameters->Get("FSR.transparencyAndComposition", &paramTransparency) == NVSDK_NGX_Result_Success)
+         InParameters->Get("FSR.transparencyAndComposition", (void**) &paramTransparency);
+ 
+     ID3D12Resource* paramReactiveMask = nullptr;
+-    if (InParameters->Get("FSR.reactive", &paramReactiveMask) == NVSDK_NGX_Result_Success)
++    if (!dx11Bridge && InParameters->Get("FSR.reactive", &paramReactiveMask) == NVSDK_NGX_Result_Success)
+         InParameters->Get("FSR.reactive", (void**) &paramReactiveMask);
+ 
+     ID3D12Resource* paramReactiveMask2 = nullptr;
+-- 
+2.54.0.windows.1
+

@@ -150,7 +150,7 @@ P4.s3 = types.SimpleNamespace(scan=lambda appid, fresh=False: {}, status=lambda 
 P4.ag = types.SimpleNamespace(status=lambda *a, **k: {"installed": False})
 P4.npu = types.SimpleNamespace(status=lambda appid: {})
 P4._check = lambda *a, **k: {"kind": "fsr4"}
-P4._models = lambda kind, s3, vulkan=False: [("fsr4", True)]
+P4._models = lambda kind, s3, vulkan=False, appid=None: [("fsr4", True)]
 P4._win_restart = set()
 
 
@@ -166,7 +166,7 @@ def s3_undo(appid, launch):
 
 
 P4._s3_enable, P4._s3_disable = s3_enable, s3_undo
-P4._launch_keep = lambda appid, launch: launch
+P4._launch_keep = lambda appid, launch, vk=None: launch
 
 
 class LiveFull:

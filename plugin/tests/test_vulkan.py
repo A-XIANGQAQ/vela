@@ -1,4 +1,4 @@
-"""VK1 (fork patch 0040): native Vulkan games get Vela's Vulkan live models (FSR 3, DittoSR, SGSR 2; no FSR 4 yet)."""
+"""VK1 (fork patch 0040): native Vulkan games get Vela's Vulkan live models (FSR 3, DittoSR, SGSR 2; FSR 4 via the DLSS path since 2026-11-24)."""
 import os
 import sys
 import tempfile
@@ -30,17 +30,18 @@ none = gamecheck.verdict({**base, "inputs": []}, {"vulkan"}, ag_assets=False)
 assert none["reason"] == "vulkan_native" and none["kind"] == "none", none
 assert gamecheck.verdict(base, {"opengl"})["kind"] == "none"
 
-# ---- 3. the panel's models: FSR 3, DittoSR, SGSR 2 offered; FSR 4 / FSR 4 Fast shown, not offered
+# ---- 3. the panel's models: everything but ANF offered (FSR 4 / FSR 4 Fast ride the game's DLSS path)
 m = dict(presets.models_for("fsr4", True, True, True, vulkan=True))
-assert m == {"fsr4": False, "fsr4fast": False, "fsr3": True, "dittosr": True, "sgsr2": True}, m
+assert m == {"fsr4": True, "fsr4fast": True, "anf": False, "fsr3": True, "dittosr": True, "sgsr2": True}, m  # ANF: never in a Vulkan game
+assert not dict(presets.models_for("fsr4", True, True, True, vulkan=True, anf=True))["anf"]
 assert [x for x, _ in presets.models_for("fsr4", vulkan=True)] == [x for x, _ in presets.models_for("fsr4")]
 assert dict(presets.models_for("fsr4"))["fsr4"], "D3D games keep FSR 4"
 src = open(os.path.join(ROOT, "main.py"), encoding="utf-8").read()
-assert 'self._models(v["kind"], s3, bool(v.get("vulkan")))' in src, "_model_state passes the Vulkan verdict"
+assert 'self._models(v["kind"], s3, bool(v.get("vulkan")), appid)' in src, "_model_state passes the Vulkan verdict"
 
 # ---- 4. the ini: VulkanUpscaler follows the live model (no FSR 4 on Vulkan: SGSR 2); Vulkan spoofing only when asked
 VK = ("Upscalers", "VulkanUpscaler")
-for model, up in (("fsr3", "ffx"), ("dittosr", "ffx"), ("sgsr2", "sgsr2"), ("fsr4", "sgsr2"), ("fsr4fast", "sgsr2"),
+for model, up in (("fsr3", "ffx"), ("dittosr", "ffx"), ("sgsr2", "sgsr2"), ("fsr4", "sgsr2"), ("fsr4fast", "sgsr2"), ("anf", "sgsr2"),
                   ("fsr4lite", "sgsr2"), (None, "sgsr2")):
     assert sgsr3.ini_values({"live_model": model})[VK] == up, (model, up)
 assert set(sgsr3.VULKAN_UPSCALER) == set(presets.MODELS), "every panel model has a Vulkan upscaler"

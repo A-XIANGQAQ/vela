@@ -505,13 +505,13 @@ class Plugin:
 
     # ---- 0.8.13: the model by hand ----
 
-    def _check(self, appid, scan, s3, ag):
+    def _check(self, appid, scan, s3, ag, launch_options=None):
         # 0.8.13: no any-game layer (ag_assets=False): a game without DLSS / FSR / XeSS is "Not supported"
         # NOFG (owner 2026-11-15): again so -- kind "any" (0.8.22's layer for a game without an upscaler input) is gone with frame
         # generation; Vela replaces a game's own upscaler only
         v = self.check.check(scan, static=bool(profiles.static_fsr2(appid)),
                              s3_assets=os.path.isfile(os.path.join(ASSETS, "sgsr3", "OptiScaler.dll")),
-                             ag_assets=False, appid=appid)
+                             ag_assets=False, appid=appid, launch_options=launch_options, observed=(s3 or {}).get("api"))
         if v.get("kind") == "sgsr2":  # DX11FSR: a 0.8.22 verdict of a DirectX 11 game; its models are FSR 4's now
             v = {**v, "kind": "fsr4", "dx11_only": True}
         if s3.get("installed") and v["kind"] not in presets.KINDS and v["reason"] != "anticheat":
@@ -519,11 +519,19 @@ class Plugin:
             v = {**v, "kind": "static" if s3.get("static_fsr2") else "fsr4", "reason": None}
         return v
 
-    def _models(self, kind, s3, vulkan=False):
-        # VK1: vulkan = a native Vulkan game (gamecheck verdict "vulkan"): no FSR 4 there yet
-        models = presets.models_for(kind, s3.get("fsr4_available"), s3.get("fsr3_available"), s3.get("dittosr_available"),
-                                    vulkan=vulkan)
+    def _anf_offered(self, s3, chip):
+        """ANF: the plugin's DLL has it, this chip may (SM8550, v73 graphs), the NPU is ready and the system package carries an ANF
+        family (package 18 or newer). Anything else: not in the panel at all."""
+        if not s3.get("anf_available") or chip is None or not chip.get("anf") or not chip.get("fsr4", True):
+            return False
+        st = s3.get("npu")
+        return bool(presets.npu_ready(st) and ((st or {}).get("service") or {}).get("anf_graphs"))
+
+    def _models(self, kind, s3, vulkan=False, appid=None):
+        # VK1: vulkan = a native Vulkan game (gamecheck verdict "vulkan"): FSR 4 is offered there too (DLSS path)
         chip = getattr(self, "chip", None)
+        models = presets.models_for(kind, s3.get("fsr4_available"), s3.get("fsr3_available"), s3.get("dittosr_available"),
+                                    vulkan=vulkan, anf=self._anf_offered(s3, chip))
         if chip is not None and not chip["fsr4fast"]:  # 0.8.16: FSR 4 Fast is tuned for the A740 + v73 NPU
             models = [(m, ok and m != "fsr4fast") for m, ok in models]
         if chip is not None and not chip.get("fsr4", True):  # no FSR 4 at all without a supported NPU
@@ -537,26 +545,26 @@ class Plugin:
             return "chip_no_fsr4"
         return None
 
-    def _default_model(self, kind, s3, npu_st, vulkan=False):
+    def _default_model(self, kind, s3, npu_st, vulkan=False, appid=None):
         """presets.default_model, but never a model this chip does not offer (0.8.16: without the NPU and FSR 4 Fast
         the cheap GPU path is FSR 3, then SGSR 2)."""
         model = presets.default_model(kind, s3.get("fsr4_available"), npu_st)
-        ok = dict(self._models(kind, s3, vulkan))
+        ok = dict(self._models(kind, s3, vulkan, appid))
         if not ok.get(model):
             model = next((m for m in ("fsr3", "sgsr2") if ok.get(m)), model)
         return model
 
     def _model_state(self, appid, gs, window=None):
         s3, ag = gs["sgsr3"], gs["anygame"]
-        v = self._check(appid, gs["scan"], s3, ag)
+        v = self._check(appid, gs["scan"], s3, ag, getattr(self, "_launch_seen", {}).get(appid))
         on = bool(s3.get("installed"))
         npu_st = s3.get("npu")
-        models = self._models(v["kind"], s3, bool(v.get("vulkan")))
+        models = self._models(v["kind"], s3, bool(v.get("vulkan")), appid)
         win = presets.window_size(window)
         out = {"check": v, "models": [{"id": m, "ok": ok, "why": None if ok else self._chip_off(m)} for m, ok in models],
                "model": "off", "plan": None, "hint": None,
                # 0.8.16: what apply_model "auto" would set up (None: Vela cannot set this game up)
-               "auto_model": self._default_model(v["kind"], s3, npu_st, bool(v.get("vulkan"))),
+               "auto_model": self._default_model(v["kind"], s3, npu_st, bool(v.get("vulkan")), appid),
                "window": win, "window_fix": False,
                # a launcher's shortcut (Xodus Nexus ...): the game folder Vela saw it run (the panel names it; picking a model
                # confirms a folder that carried no id of its own), and whether an already open launcher started this run
@@ -570,6 +578,8 @@ class Plugin:
             self._win_restart.discard(appid)
         # PANELWHY: a DirectX 11 game: whether its own Steam launch entries offer DX12 (the panel's hint)
         out["dx12_choice"] = bool(v.get("dx11_only")) and sgsr3.has_dx12_entry(self.s3.api_args(appid))
+        # a native Vulkan game with a DLSS-path model picked: the player picks DLSS in the game's own graphics settings
+        out["vk_dlss"] = False
         if on and v["kind"] in presets.KINDS:
             lv = self._live_migrate(appid, v["kind"], s3, npu_st)
             p = presets.plan(v["kind"], lv)
@@ -580,8 +590,9 @@ class Plugin:
                   "dx12_choice": sgsr3.has_dx12_entry(self.s3.api_args(appid)), "dx11_only": bool(v.get("dx11_only"))}
             out["dx12_choice"] = st["dx12_choice"]
             out.update({"model": p["model"], "plan": p, "hint": presets.hint(p, st)})
+            out["vk_dlss"] = bool(v.get("vulkan")) and p["model"] in presets.VK_DLSS_MODELS
             chip = getattr(self, "chip", None)
-            if chip is not None and not chip["npu"] and p["model"] in presets.FSR4_MODELS and                     (out["hint"] is None or str(out["hint"].get("id", "")).startswith("npu_")):
+            if chip is not None and not chip["npu"] and p["model"] in presets.NPU_MODELS and                     (out["hint"] is None or str(out["hint"].get("id", "")).startswith("npu_")):
                 # 0.8.16: no "install Vela NPU" on a chip the NPU graphs are not built for; the panel prints an
                 # unknown hint id as it is, so the id is the sentence
                 out["hint"] = {"id": chip["note"], "code": "chip_no_npu", "soc": self.dev.get("soc") or "",
@@ -664,7 +675,7 @@ class Plugin:
     async def llfg_off(self, appid, launch_options):
         return await self._run(self._llfg_off, str(appid), launch_options)
 
-    def _launch_keep(self, appid, launch_options):
+    def _launch_keep(self, appid, launch_options, vk=None):
         """0.8.15: the launch options of a game Vela is set up in, as they are meant to be: the NPU layer's tokens in
         (whenever the layer is in the plugin and the system component is installed; a console without them gets none) and no
         VELA_FSR2_ALGO (0.8.13 / 0.8.14 wrote =ai after Vela AI had left). The states of sgsr3 / npu forget the token too,
@@ -688,7 +699,7 @@ class Plugin:
             launch = launchopts.remove(launch, ours)
             self.npu.rewrite_state(appid, lambda t: launchopts.remove(t, ours))
         if self.npu.ready():
-            return self.npu.enable(appid, launch)
+            return self.npu.enable(appid, launch, vk)  # vk: the Vulkan GPU-spoof tokens of an allow-listed game (None: as they are)
         return self.npu.disable(appid, launch)
 
     def _launch_pending(self, appid, s3):
@@ -863,11 +874,13 @@ class Plugin:
         mode = self._kit_mode(appid, model, launch_options)
         if mode is None:
             return self._apply_model_opts(appid, model, launch_options, resolution)
-        res = self._apply_model_opts(appid, model, self.s3.kit_options(appid), resolution, mode)
+        # the kit's options are what is edited, but the API check reads the PLAYER's (Steam's) options: -force-vulkan is in
+        # those, not in the kit's (found on the console 2026-11-24: the check saw the kit's options and never the switch)
+        res = self._apply_model_opts(appid, model, self.s3.kit_options(appid), resolution, mode, steam_options=launch_options)
         res["launch_options"] = self._kit_out(appid, launch_options, res["launch_options"], mode)
         return res
 
-    def _apply_model_opts(self, appid, model, launch_options, resolution, mode=None):
+    def _apply_model_opts(self, appid, model, launch_options, resolution, mode=None, steam_options=None):
         """The model picked by hand: fsr4, fsr3, dittosr, sgsr2 or "off". The first pick puts the files in (resolution =
         Steam's override as it is, for the undo); a change in a game that is on is live (model=) plus the NPU layer in
         the launch options. FSR 4 gets the NPU when it is ready (picking it again keeps the choice);
@@ -892,12 +905,12 @@ class Plugin:
             raise ValueError(f"unknown model {model}")
         if ag["installed"]:
             raise RuntimeError("the old any-game layer is on for this game: pick «Off» first")
-        v = self._check(appid, scan, s3, ag)
+        v = self._check(appid, scan, s3, ag, steam_options if isinstance(steam_options, str) else launch_options)
         if v["kind"] not in presets.KINDS:
             raise RuntimeError(f"not supported: {v['reason']}")
         if model == "auto":  # 0.8.16: the device's best model for this game (presets.default_model)
-            model = self._default_model(v["kind"], s3, self.npu.status(appid), bool(v.get("vulkan")))
-        if not dict(self._models(v["kind"], s3, bool(v.get("vulkan")))).get(model):
+            model = self._default_model(v["kind"], s3, self.npu.status(appid), bool(v.get("vulkan")), appid)
+        if not dict(self._models(v["kind"], s3, bool(v.get("vulkan")), appid)).get(model):
             raise RuntimeError(f"{model} is not available for this game")
         override = None
         if not s3["installed"]:
@@ -911,7 +924,9 @@ class Plugin:
         # 0.8.15: FSR 4 always on the NPU when it is ready, exact; the layer's tokens stay in the launch options of a
         # set-up game whatever the model, so FSR 3 -> FSR 4 needs no restart
         try:
-            launch = self._launch_keep(appid, launch)
+            # the Vulkan GPU spoof: every native Vulkan game, only while a DLSS-path model is the pick (presets.VK_DLSS_MODELS)
+            vk = bool(v.get("vulkan")) and model in presets.VK_DLSS_MODELS
+            launch = self._launch_keep(appid, launch, vk)
             self.live.set(appid, presets.live_wanted(model, self.npu.status(appid)))
         except Exception:
             # V09 (audit 2026-11-09): a FIRST setup that fails here (for example /tmp full: the live file) had its files in

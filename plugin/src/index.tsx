@@ -28,6 +28,7 @@ type GameState = {
   not_in_launch?: "wrapped" | "left_out" | null;  // V03c: set up, but Vela is not in the game's launch
   report?: ReportPanel | null;
   run_secs?: number | null;  // PANELWHY: how long this run has been going
+  vk_dlss?: boolean;         // a native Vulkan game on a DLSS-path model (FSR 4): the player picks DLSS in the game's graphics settings
   dx12_choice?: boolean;     // PANELWHY: a DirectX 11 game whose own Steam launch entries offer DirectX 12
 };
 // 0.8.16: «Report a problem» (py_modules/report.py)
@@ -522,6 +523,8 @@ function GameContent({ visible }: { visible: boolean }) {
             {supported && MODEL_IDS.filter((m) => offered.has(m)).map(modelButton)}
           </Focusable>
         </PanelSectionRow>
+        {/* VK allow-list: an allow-listed native Vulkan game on FSR 4 (npu.VK_ALLOW) */}
+        {on && gs.vk_dlss && <Small>{t("vk.dlss")}</Small>}
         {/* PANELWHY: a DirectX 11 game: the DX12 start only when its own launch entries offer one (DX11FSR: every model runs in DX11) */}
         {gs.check.dx11_only && gs.dx12_choice && !(on && gs.hint?.id === "dx12_choice") && <Small>{t("dx11.dx12Entry")}</Small>}
         {busy && <Small>{t("t.busy")}</Small>}

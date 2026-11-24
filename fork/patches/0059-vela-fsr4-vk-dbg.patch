@@ -1,0 +1,115 @@
+diff --git a/OptiScaler/upscalers/sgsr3/Fsr4Feature_Vk.cpp b/OptiScaler/upscalers/sgsr3/Fsr4Feature_Vk.cpp
+index 0ed9420..54bd067 100644
+--- a/OptiScaler/upscalers/sgsr3/Fsr4Feature_Vk.cpp
++++ b/OptiScaler/upscalers/sgsr3/Fsr4Feature_Vk.cpp
+@@ -5,6 +5,9 @@
+ #include <upscalers/sgsr3/VelaLive.h>
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <string>
+ #include <cstdlib>
+ #include <cstring>
+ 
+@@ -25,10 +28,57 @@ bool Fsr4FeatureVk::Refuse(const char* why)
+     return false;
+ }
+ 
++// 0051 debug: one line per error exception (code, address, module + offset, a short stack), so a crash in the provider, in
++// winevulkan's thunks or in our own code shows where it is. Installed once, first handler, never handles anything.
++static LONG CALLBACK Fsr4Veh(PEXCEPTION_POINTERS ep)
++{
++    static std::atomic<int> logged { 0 };
++    const DWORD c = ep->ExceptionRecord->ExceptionCode;
++    if ((c & 0xC0000000u) != 0xC0000000u || logged.fetch_add(1) >= 12)
++        return EXCEPTION_CONTINUE_SEARCH;
++    auto where = [](const void* a) -> std::string
++    {
++        HMODULE m = nullptr;
++        char buf[MAX_PATH] = {};
++        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                               (LPCWSTR) a, &m) &&
++            m != nullptr)
++        {
++            GetModuleFileNameA(m, buf, MAX_PATH);
++            const char* base = buf;
++            for (const char* q = buf; *q; q++)
++                if (*q == '/' || *q == 92)
++                    base = q + 1;
++            char out[MAX_PATH + 32];
++            std::snprintf(out, sizeof out, "%s+0x%llx", base, (unsigned long long) ((const char*) a - (const char*) m));
++            return out;
++        }
++        char out[32];
++        std::snprintf(out, sizeof out, "%p", a);
++        return out;
++    };
++    std::string s = where(ep->ExceptionRecord->ExceptionAddress);
++    void* frames[20] = {};
++    const USHORT n = RtlCaptureStackBackTrace(0, 20, frames, nullptr);
++    std::string st;
++    for (USHORT i = 0; i < n; i++)
++        st += (i ? " < " : "") + where(frames[i]);
++    LOG_ERROR("Vela FSR 4 VK dbg: EXCEPTION {:08X} at {} (info {:X} {:X}); stack {}", (unsigned) c, s,
++              (unsigned long long) ep->ExceptionRecord->ExceptionInformation[0],
++              (unsigned long long) ep->ExceptionRecord->ExceptionInformation[1], st);
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++
+ bool Fsr4FeatureVk::InitInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InParameters)
+ {
+     if (IsInited())
+         return true;
++    static bool vehSet = false;
++    if (!vehSet)
++    {
++        vehSet = true;
++        AddVectoredExceptionHandler(1, Fsr4Veh);
++    }
+     // 1. the switch
+     const char* sw = std::getenv("VELA_VK_FSR4");
+     if (sw == nullptr || std::strcmp(sw, "1") != 0)
+@@ -75,6 +125,9 @@ bool Fsr4FeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Para
+ {
+     if (!IsInited() || !_core.Ready())
+         return false;
++    static int evalDbg = 0;
++    if (evalDbg < 4)
++        LOG_INFO("Vela FSR 4 VK dbg: EvaluateInternal #{} cmd {}", evalDbg++, (void*) InCmdBuffer);
+     NVSDK_NGX_Resource_VK *color = nullptr, *depth = nullptr, *mv = nullptr, *output = nullptr;
+     InParameters->Get(NVSDK_NGX_Parameter_Color, (void**) &color);
+     InParameters->Get(NVSDK_NGX_Parameter_Depth, (void**) &depth);
+diff --git a/OptiScaler/upscalers/sgsr3/Fsr4VkCore.h b/OptiScaler/upscalers/sgsr3/Fsr4VkCore.h
+index bfff282..cc38819 100644
+--- a/OptiScaler/upscalers/sgsr3/Fsr4VkCore.h
++++ b/OptiScaler/upscalers/sgsr3/Fsr4VkCore.h
+@@ -531,12 +531,28 @@ class Fsr4VkCore
+ 
+     bool Dispatch(VkCommandBuffer cb, const Img in[3], const Img& out, const Frame& f, bool transition)
+     {
++        // 0051 debug: the first frames log every step (flushed at once), so a crash or hang shows where it stops
++        const bool dbg = _dbgFrames < 4;
++        if (dbg)
++            LOG_INFO("Vela FSR 4 VK dbg: frame {} enter: cb {}, colour {} {} / depth {} {} / mv {} {} / out {} {}", _dbgFrames,
++                     (void*) cb, (int) in[0].fmt, (int) in[0].layout, (int) in[1].fmt, (int) in[1].layout, (int) in[2].fmt,
++                     (int) in[2].layout, (int) out.fmt, (int) out.layout);
+         Prepared p;
+         if (!Prepare(in, out, f, p))
++        {
++            LOG_WARN("Vela FSR 4 VK dbg: frame {} Prepare failed", _dbgFrames);
+             return false;
++        }
++        if (dbg)
++            LOG_INFO("Vela FSR 4 VK dbg: frame {} Prepare ok (mvPass {}), calling ffxDispatch (ctx {}, fn {})", _dbgFrames,
++                     p.mvPass, (void*) _ctx, (void*) _dispatch);
+         const auto r = Record(cb, in, out, f, p, transition);
++        if (dbg)
++            LOG_INFO("Vela FSR 4 VK dbg: frame {} ffxDispatch returned {}", _dbgFrames, (unsigned) r);
++        _dbgFrames++;
+         return Done(r, in, out, p);
+     }
++    int _dbgFrames = 0;
+ 
+     // the provider and MV part of the former Release. waitIdle: the provider keeps up to eight frames in flight
+     void ReleaseCore(bool waitIdle)

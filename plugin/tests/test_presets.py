@@ -20,10 +20,10 @@ import presets  # noqa: E402
 import upscale  # noqa: E402
 
 # ---- presets
-assert presets.MODELS == ("fsr4", "fsr4fast", "fsr3", "dittosr", "sgsr2")  # 0.8.16: + FSR 4 Fast; DITTO: + DittoSR
+assert presets.MODELS == ("fsr4", "fsr4fast", "anf", "fsr3", "dittosr", "sgsr2")  # 0.8.16: + FSR 4 Fast; DITTO: + DittoSR
 assert presets.legacy_model(True) == "fsr4" and presets.legacy_model(False) == "sgsr2"
-assert presets.models_for("fsr4") == [("fsr4", True), ("fsr4fast", True), ("fsr3", True), ("dittosr", True), ("sgsr2", True)]
-assert presets.models_for("static", fsr4=True, fsr3=False)[2] == ("fsr3", False)
+assert presets.models_for("fsr4") == [("fsr4", True), ("fsr4fast", True), ("anf", False), ("fsr3", True), ("dittosr", True), ("sgsr2", True)]
+assert presets.models_for("static", fsr4=True, fsr3=False)[3] == ("fsr3", False)
 assert presets.models_for("sgsr2") == []  # DX11FSR: no kind sgsr2; a DX11 game is kind fsr4 (tests/test_dx11fsr.py)
 assert presets.models_for("none") == [] and presets.models_for("any") == []
 NPU_ON = {"layer_found": True, "service": {"installed": True, "k1h_running": True, "k1h360_running": True}}
@@ -187,8 +187,8 @@ write(os.path.join(exe_dir, "OptiScaler.log"), "a log of the game's own OptiScal
 gs = P._game_state(A)
 assert gs["check"]["kind"] == "fsr4" and gs["model"] == "off" and gs["hint"] is None and not gs["window_fix"], gs
 # DITTO: + DittoSR (offered as the plugin's assets allow: tests/test_dittosr.py checks that part)
-assert [m["id"] for m in gs["models"]] == ["fsr4", "fsr4fast", "fsr3", "dittosr", "sgsr2"] and \
-    all(m["ok"] for m in gs["models"] if m["id"] != "dittosr")
+assert [m["id"] for m in gs["models"]] == ["fsr4", "fsr4fast", "anf", "fsr3", "dittosr", "sgsr2"] and \
+    all(m["ok"] for m in gs["models"] if m["id"] not in ("dittosr", "anf"))
 for gone in ("steps", "post", "modes", "mode", "captures"):
     assert gone not in gs, gone
 

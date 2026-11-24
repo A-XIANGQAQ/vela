@@ -1,0 +1,211 @@
+diff --git a/OptiScaler/upscalers/sgsr3/AnfVkBridge.h b/OptiScaler/upscalers/sgsr3/AnfVkBridge.h
+index 5bc819f..afdc362 100644
+--- a/OptiScaler/upscalers/sgsr3/AnfVkBridge.h
++++ b/OptiScaler/upscalers/sgsr3/AnfVkBridge.h
+@@ -10,6 +10,7 @@
+ #include <Util.h>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+@@ -86,6 +87,7 @@ class AnfVkBridge
+         }
+         if (!MakeFlush(device) || !MakeGpu())
+             return false;
++        ProfInit();
+         _hdr = hdr;
+         LOG_INFO("Vela ANF: ready, render {}x{} -> {}x{}, canvas {}x{}, family {} resample {} (NPU after the layer PROBE; SGSR 2 until then)",
+                  rw, rh, dw, dh, _cw, _ch, _family, _resample ? "2R->D" : "none");
+@@ -123,6 +125,7 @@ class AnfVkBridge
+                           (int) in[2].fmt, (int) out.fmt);
+             return false;
+         }
++        const auto cpu0 = std::chrono::steady_clock::now();
+         cl->CopyBufferRegion(_flush[1], 0, _flush[0], 0, 4);
+         VkCommandBuffer cb = VK_NULL_HANDLE;
+         if (FAILED(_interop->BeginVkCommandBufferInterop(cl, &cb)) || cb == VK_NULL_HANDLE)
+@@ -130,11 +133,22 @@ class AnfVkBridge
+             LOG_ERROR("Vela ANF: BeginVkCommandBufferInterop failed");
+             return false;
+         }
++        const auto cpu1 = std::chrono::steady_clock::now();
++        ProfBegin(cb);
+         Transition(cb, in, 3, out, true);
++        Ts(cb, 1);
+         Record(cb, vc, vd, vm, vo, f);
+         Transition(cb, in, 3, out, false);
++        Ts(cb, 6);
+         _interop->EndVkCommandBufferInterop(cl);
+         HandHeapsBack(cl);
++        if (_prof)
++        {
++            const auto cpu2 = std::chrono::steady_clock::now();
++            _cpuBegin += std::chrono::duration<double, std::milli>(cpu1 - cpu0).count();
++            _cpuRec += std::chrono::duration<double, std::milli>(cpu2 - cpu1).count();
++            ++_cpuN;
++        }
+         ++_frames;
+         return true;
+     }
+@@ -170,6 +184,9 @@ class AnfVkBridge
+                 vkDestroyDescriptorSetLayout(_vk, _postDsl, nullptr);
+             if (_pool)
+                 vkDestroyDescriptorPool(_vk, _pool, nullptr);
++            if (_qp)
++                vkDestroyQueryPool(_vk, _qp, nullptr);
++            _qp = VK_NULL_HANDLE;
+             for (Own* im : { &_hist[0], &_hist[1], &_feat[0], &_feat[1], &_colLR, &_mvLR, &_t2R, &_tmpR })
+                 if (im->img)
+                 {
+@@ -685,8 +702,87 @@ class AnfVkBridge
+             _lineHtp = 0;
+         }
+     }
++    // ---- GPU pass timing (OPTI_ANF_PROF=1): 7 timestamps per frame around the passes, read NR-2 frames later
++    //   0 cb start, 1 after transition-in, 2 after pre, 3 after the NPU markers (the WAIT spin), 4 after post, 5 after resample, 6 after transition-out
++    void ProfInit()
++    {
++        const char* e = std::getenv("OPTI_ANF_PROF");
++        _prof = e && e[0] == '1';
++        if (!_prof || _qp)
++            return;
++        VkQueryPoolCreateInfo qi { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
++        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
++        qi.queryCount = NR * 8;
++        VkPhysicalDeviceProperties pr {};
++        vkGetPhysicalDeviceProperties(_physical, &pr);
++        _tsPeriod = pr.limits.timestampPeriod;
++        if (vkCreateQueryPool(_vk, &qi, nullptr, &_qp) != VK_SUCCESS)
++        {
++            _qp = VK_NULL_HANDLE;
++            _prof = false;
++            LOG_WARN("Vela ANF: GPU timestamp pool failed, profiling off");
++            return;
++        }
++        LOG_INFO("Vela ANF: GPU pass profiling on (timestamp period {} ns)", _tsPeriod);
++    }
++    void ProfBegin(VkCommandBuffer cb)
++    {
++        if (!_qp)
++            return;
++        vkCmdResetQueryPool(cb, _qp, uint32_t(_frames % NR) * 8, 8);
++        Ts(cb, 0);
++    }
++    void Ts(VkCommandBuffer cb, uint32_t k)
++    {
++        if (_qp)
++            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, _qp, uint32_t(_frames % NR) * 8 + k);
++    }
++    void ProfRead(uint64_t f)
++    {
++        if (!_qp)
++            return;
++        uint64_t r[7 * 2] {};
++        const VkResult rc = vkGetQueryPoolResults(_vk, _qp, uint32_t(f % NR) * 8, 7, sizeof r, r, 16,
++                                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
++        if (rc != VK_SUCCESS && rc != VK_NOT_READY)
++            return;
++        for (int i = 0; i < 7; i++)
++            if (!r[i * 2 + 1])
++                return;
++        if (f < 30)
++            return;
++        double d[7] {};
++        for (int i = 1; i < 7; i++)
++            d[i] = r[i * 2] > r[(i - 1) * 2] ? double(r[i * 2] - r[(i - 1) * 2]) * _tsPeriod * 1e-6 : 0.0;
++        const bool up = _profNpu[f % NR];
++        ProfAcc& a = _acc[up ? 1 : 0];
++        for (int i = 1; i < 7; i++)
++            a.sum[i] += d[i];
++        const double tot = r[12] > r[0] ? double(r[12] - r[0]) * _tsPeriod * 1e-6 : 0.0;
++        a.tot += tot;
++        a.waitMax = std::max(a.waitMax, d[3]);
++        ++a.n;
++        if (a.n >= 600)
++            ProfLog(up);
++    }
++    void ProfLog(bool up)
++    {
++        ProfAcc& a = _acc[up ? 1 : 0];
++        if (!a.n)
++            return;
++        const double n = double(a.n);
++        LOG_INFO("ANFGPU npu_up {} frames {} ms mean: transin {:.3f} pre {:.3f} npu_wait {:.3f} (max {:.3f}) post {:.3f} resample {:.3f} transout {:.3f} "
++                 "gpu_total {:.3f} | cpu evaluate: begin {:.3f} record {:.3f} ({} frames)",
++                 up ? 1 : 0, a.n, a.sum[1] / n, a.sum[2] / n, a.sum[3] / n, a.waitMax, a.sum[4] / n, a.sum[5] / n, a.sum[6] / n, a.tot / n,
++                 _cpuN ? _cpuBegin / double(_cpuN) : 0.0, _cpuN ? _cpuRec / double(_cpuN) : 0.0, _cpuN);
++        a = ProfAcc {};
++        _cpuBegin = _cpuRec = 0;
++        _cpuN = 0;
++    }
+     void Stats()
+     {
++        ProfLog(true);
++        ProfLog(false);
+         std::string h;
+         for (int i = 0; i < 32; i++)
+             if (_phaseHist[i])
+@@ -719,7 +815,10 @@ class AnfVkBridge
+         const uint32_t par = (uint32_t) (_frames & 1), prv = par ^ 1;
+         // acks of NR-2 frames ago; probe state machine
+         if (_frames >= NR - 2)
++        {
+             Drain(_frames - (NR - 2));
++            ProfRead(_frames - (NR - 2));
++        }
+         _ring[ri].mask = 0;
+         std::memset(_markers.map + ri * 512, 0, 512);
+         if (_layer == -2 && _frames - _probeFrame > 300)
+@@ -808,6 +907,7 @@ class AnfVkBridge
+         vkCmdPushConstants(cb, _preLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pp, &pp);
+         vkCmdDispatch(cb, (_rw + 7) / 8, (_rh + 7) / 8, 1);
+         Bar(cb);
++        Ts(cb, 2);
+         if (npu)
+         {
+             // the kick (layer E1, with the family phase) and the wait for the same frame: pre -> NPU -> post in order
+@@ -821,6 +921,7 @@ class AnfVkBridge
+         }
+         else
+             ++_standIn;
++        Ts(cb, 3);
+         PostPush qp {};
+         qp.net = outAddr;
+         qp.hw = (int32_t) (2 * _rw);
+@@ -835,6 +936,7 @@ class AnfVkBridge
+         vkCmdPushConstants(cb, _postLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof qp, &qp);
+         vkCmdDispatch(cb, (2 * _rw + 7) / 8, (2 * _rh + 7) / 8, 1);
+         Bar(cb);
++        Ts(cb, 4);
+         if (_resample)
+         {
+             // 2R -> D: horizontal (t2R -> tmp, 2R rows), then vertical + inverse tonemap (tmp -> game output)
+@@ -871,6 +973,8 @@ class AnfVkBridge
+             vkCmdDispatch(cb, (_dw + 7) / 8, (_dh + 7) / 8, 1);
+             Bar(cb);
+         }
++        Ts(cb, 5);
++        _profNpu[ri] = npu;
+         if (_frames == 0 || (_frames % 600) == 0)
+             LOG_INFO("Vela ANF: frame {} phase {} (ix {} iy {}) npu {} stand-in frames {} layer state {}", _frames, phase, ix, iy, npu,
+                      _standIn, _layer);
+@@ -907,4 +1011,17 @@ class AnfVkBridge
+     VkDeviceAddress _zbase = 0;
+     RingSlot _ring[NR];
+     uint64_t _phaseHist[32] {};
++    struct ProfAcc
++    {
++        double sum[7] {};
++        double tot = 0, waitMax = 0;
++        uint64_t n = 0;
++    };
++    bool _prof = false;
++    VkQueryPool _qp = VK_NULL_HANDLE;
++    float _tsPeriod = 1.0f;
++    ProfAcc _acc[2];
++    bool _profNpu[NR] {};
++    double _cpuBegin = 0, _cpuRec = 0;
++    uint64_t _cpuN = 0;
+ };

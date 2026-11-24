@@ -132,7 +132,7 @@ s3 = {"fsr4_available": True, "fsr3_available": True, "dittosr_available": True}
 ready = {"ready": True, "layer_found": True, "service": {"installed": True}}
 P = main.Plugin()
 offered = P._models("fsr4", s3)
-assert offered == presets.models_for("fsr4", True, True) and all(ok for _, ok in offered), offered  # no chip: nothing is taken away
+assert offered == presets.models_for("fsr4", True, True) and all(ok for m, ok in offered if m != "anf"), offered  # no chip: nothing is taken away (ANF: hidden without the DLL key and the NPU package)
 assert P._default_model("fsr4", s3, ready) == presets.default_model("fsr4", True, ready)
 P.dev, P.chip = d, p  # SM8550
 assert P._models("fsr4", s3) == offered and P._models("sgsr2", s3) == presets.models_for("sgsr2", True, True)
@@ -141,11 +141,11 @@ for kind in ("fsr4", "sgsr2", "static"):
         assert P._default_model(kind, s3, nst) == presets.default_model(kind, True, nst), (kind, nst)
 P.dev, P.chip = d8, p8  # SM8750, no v79 graphs
 m8 = dict(P._models("fsr4", s3))
-assert m8 == {"fsr4": True, "fsr4fast": False, "fsr3": True, "dittosr": True, "sgsr2": True}, m8  # DITTO: any chip
+assert m8 == {"fsr4": True, "fsr4fast": False, "anf": False, "fsr3": True, "dittosr": True, "sgsr2": True}, m8  # DITTO: any chip
 assert P._default_model("fsr4", s3, {"ready": False}) == "fsr3"  # not fsr4fast
 assert P._default_model("fsr4", {"fsr4_available": True, "fsr3_available": False}, None) == "sgsr2"
 P.dev, P.chip = d8, p8g  # SM8750 with v79 graphs: all models
-assert all(dict(P._models("fsr4", s3)).values())
+assert all(ok for m, ok in P._models("fsr4", s3) if m != "anf")
 P.dev, P.chip = du, pu  # unknown chip
-assert dict(P._models("fsr4", s3)) == {"fsr4": False, "fsr4fast": False, "fsr3": True, "dittosr": True, "sgsr2": True}  # no FSR 4
+assert dict(P._models("fsr4", s3)) == {"fsr4": False, "fsr4fast": False, "anf": False, "fsr3": True, "dittosr": True, "sgsr2": True}  # no FSR 4
 print("test_device: OK")

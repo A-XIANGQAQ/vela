@@ -8,6 +8,8 @@ The `OptiScaler.dll` in Vela 0.8.24 (md5 `3a02ef78a479ab4bd9a4ec6a3b5415d1`, 18 
 **0001–0008, 0010–0021, 0023, 0024, 0024b–0024d and 0025–0040** (patch 0009 and the experimental upstream-sync patch 0000 are not part of this build and are not
 included). Checksums of the patch files: `patches.md5`.
 
+**Vela 0.9.0** (`OptiScaler.dll` md5 `bbb10a0b536c621ccbfb356fd4815ccc`) is the same base with patches **0001–0008, 0010–0021, 0023, 0024, 0024b–0024d and 0025–0059**; the new ones, 0049–0059, are in the table below.
+
 | patch | what |
 |---|---|
 | 0001 | SGSR 2 input dumper; motion-vector scale and sampling fixes for full-resolution MV |
@@ -38,6 +40,18 @@ included). Checksums of the patch files: `patches.md5`.
 | 0036 | live model `dittosr`: DittoSR (github.com/Vancete/DittoSR) as the FFX upscaler, loaded from `dittosr/` next to OptiScaler, FSR 3 when it cannot run |
 | 0037 | the log says which input API (DLSS, XeSS, FFX, Streamline) created each upscaler context |
 | 0038 | Unreal Engine XeSS without a depth input: takes the engine's scene depth (port of upstream OptiScaler 7e94156), on by default, `VELA_UE_XESS_DEPTH=0` turns it off |
+| 0039–0048 | see the file names in `patches/` (flat no-depth frames, Vulkan live settings and fallback, SGSR 2 depth view, deferred Vulkan setup, Unity Vulkan outside the render pass, pre-exposure, Vulkan shaders) |
+| 0049 | DirectX 11 games whose own FSR 2 hands the FFX backend (FSR 3, DittoSR) D3D11 resources as FSR.reactive / FSR.transparencyAndComposition: they are ignored, the game no longer crashes (Bright Memory: Infinite) |
+| 0050 | the model `anf`: ANF as GPU passes (SPIR-V in `AnfSpv.h`, written by us) and the Vulkan bridge `AnfVkBridge.h` that feeds the NPU family graph per frame |
+| 0051 | SGSR 2 is shown until the ANF family answers on the NPU (a family loads on its first use) |
+| 0052 | resampling for render sizes that are not the 2x canvas (Quality, Balanced, custom ratios) |
+| 0053 | GPU timing of the ANF passes for the log |
+| 0054 | late NPU: a frame whose NPU answer is not there is finished without it |
+| 0055 | faster ANF passes |
+| 0056 | the feature channel travels in the alpha of the history |
+| 0057 | the FSR 4 Vulkan bridge is split so that native Vulkan games can use the same core |
+| 0058 | FSR 4 and FSR 4 Fast in native Vulkan games (NGX Vulkan entry points), chosen by the Vela live file |
+| 0059 | FSR 4 Vulkan debug log lines |
 | 0039 | `VELA_NODEPTH_FLAT=1` test switch (off by default): FSR 4 with a flat depth instead of FSR 1 for contexts without depth |
 | 0040 | Vela live models in native Vulkan games: SGSR 2, FSR 3 (AMD's `amd_fidelityfx_vk.dll`) and DittoSR; FSR 4 picks fall back to SGSR 2 |
 

@@ -63,7 +63,7 @@ P = main.Plugin()
 P.dev, P.chip = d5, device.policy(d5, ())
 for kind in ("fsr4", "static"):
     # DITTO: DittoSR on any chip, not in a static (RE4 interceptor) game
-    assert dict(P._models(kind, s3)) == {"fsr4": False, "fsr4fast": False, "fsr3": True, "sgsr2": True,
+    assert dict(P._models(kind, s3)) == {"fsr4": False, "fsr4fast": False, "anf": False, "fsr3": True, "sgsr2": True,
                                          **({} if kind == "static" else {"dittosr": True})}, kind
     for nst in (None, {"ready": False}, {"ready": True, "layer_found": True, "service": {"installed": True}}):
         assert P._default_model(kind, s3, nst) == "fsr3", (kind, nst)
@@ -107,5 +107,5 @@ P.live = Live({"model": "fsr4"})
 gs = {"scan": {}, "running": False, "anygame": {},
       "sgsr3": {**s3, "installed": True, "npu": None, "live": {"model": "fsr4"}, "opts": {"ratio": "game"}}}
 out = P._model_state("1", gs)
-assert all(m["ok"] and m["why"] is None for m in out["models"]) and out["model"] == "fsr4", out
+assert all(m["ok"] and m["why"] is None for m in out["models"] if m["id"] != "anf") and out["model"] == "fsr4", out
 print("test_sm8250: OK")

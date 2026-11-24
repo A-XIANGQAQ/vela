@@ -49,3 +49,14 @@ e00f52f0014d0aef9ce97c4f613bdf54 *0044-vela-unity-vk-outside-pass.patch
 d601e38511aef02904d429bc1c56ad27 *0046-vela-sgsr2-preexposure.patch
 c2f1f2e6ac4bf9de859b0dc49de8fc62 *0047-vela-ffx-vk-debug.patch
 a895f1471224a86968014265a1b22de5 *0048-vela-vk-shaders.patch
+22944788877a2e8656a32f1472697dc3 *0049-vela-dx11-ffx-ignore-d3d11-fsr2-masks.patch
+ef6c6043c105c5d0ee7e1f836333ef0a *0050-vela-anf-model.patch
+bb71b386931402e220071ec8d72e2eef *0051-vela-anf-sgsr2-until-npu.patch
+54d6d5c2152cb5d9ddd68df8eb401931 *0052-vela-anf-resample.patch
+fce1b60bd42e7c46e3e875e85d7204d7 *0053-vela-anf-gpu-prof.patch
+3f25adcaba16b6368a792f0f74388180 *0054-vela-anf-late-npu.patch
+882982b207c6aec305729b5f9e96ceb2 *0055-vela-anf-fast-passes.patch
+6fa93f2e7d78511b192c69c460387864 *0056-vela-anf-feat-in-alpha.patch
+b3ac2a0d6acfa32c583e028a8ba94370 *0057-vela-fsr4-core-split.patch
+31d1f33c717ea879acb64270dec17ff1 *0058-vela-fsr4-native-vulkan.patch
+f0fee60ce4a0040d2dfab6016ea20d27 *0059-vela-fsr4-vk-dbg.patch

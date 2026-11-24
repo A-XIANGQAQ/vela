@@ -1,0 +1,317 @@
+diff --git a/OptiScaler/upscalers/sgsr3/AnfVkBridge.h b/OptiScaler/upscalers/sgsr3/AnfVkBridge.h
+index afdc362..368bc2a 100644
+--- a/OptiScaler/upscalers/sgsr3/AnfVkBridge.h
++++ b/OptiScaler/upscalers/sgsr3/AnfVkBridge.h
+@@ -236,6 +236,7 @@ class AnfVkBridge
+         _kicks = 0;
+         _layer = 0;
+         _zbase = 0;
++        _pend = false;
+         _cleared = false;
+     }
+ 
+@@ -706,6 +707,9 @@ class AnfVkBridge
+     //   0 cb start, 1 after transition-in, 2 after pre, 3 after the NPU markers (the WAIT spin), 4 after post, 5 after resample, 6 after transition-out
+     void ProfInit()
+     {
++        const char* sy = std::getenv("OPTI_ANF_SYNC");
++        _sync = sy && sy[0] == '1';
++        LOG_INFO("Vela ANF: NPU order {}", _sync ? "synchronous (pre, kick, wait, post in one frame)" : "late (post of frame N-1 in frame N, +1 frame latency)");
+         const char* e = std::getenv("OPTI_ANF_PROF");
+         _prof = e && e[0] == '1';
+         if (!_prof || _qp)
+@@ -756,11 +760,12 @@ class AnfVkBridge
+             d[i] = r[i * 2] > r[(i - 1) * 2] ? double(r[i * 2] - r[(i - 1) * 2]) * _tsPeriod * 1e-6 : 0.0;
+         const bool up = _profNpu[f % NR];
+         ProfAcc& a = _acc[up ? 1 : 0];
++        static const int lateMap[7] = { 0, 1, 3, 4, 5, 2, 6 };  // late record order: transin, wait, post, resample, pre, transout
+         for (int i = 1; i < 7; i++)
+-            a.sum[i] += d[i];
++            a.sum[_profLate[f % NR] ? lateMap[i] : i] += d[i];
+         const double tot = r[12] > r[0] ? double(r[12] - r[0]) * _tsPeriod * 1e-6 : 0.0;
+         a.tot += tot;
+-        a.waitMax = std::max(a.waitMax, d[3]);
++        a.waitMax = std::max(a.waitMax, _profLate[f % NR] ? d[2] : d[3]);
+         ++a.n;
+         if (a.n >= 600)
+             ProfLog(up);
+@@ -868,112 +873,172 @@ class AnfVkBridge
+             _probeFrame = _frames;
+         }
+         const bool npu = _layer == 2 && _zbase != 0;
++        // anf3 (late NPU result, DESIGN.md 'one-frame-late machinery', as FSR 4): frame N waits for the kick of frame N-1 (long done: the
++        // rest of N-1 and the game's work up to the upscale ran meanwhile), runs post(N-1) into frame N's output (+1 frame latency),
++        // then pre(N) and the kick of N. The math per frame is the same as the synchronous order; only the output is one frame older.
++        // OPTI_ANF_SYNC=1 keeps the synchronous order (pre, kick, wait, post of the same frame).
++        const bool late = npu && !_sync;
++        const bool hadPend = late && _pend;  // a reset still waits for the kick in flight (the layer holds its slot until the WAIT)
+         const VkDeviceAddress inAddr = npu ? _zbase + VkDeviceAddress(_qin) * 16 : _dummy.addr;
+         const VkDeviceAddress outAddr = npu ? _zbase + VkDeviceAddress(_qout) * 16 : _dummy.addr + _dummyOut;
++        const VkDeviceAddress zeroNet = _dummy.addr + _dummyOut;
+         const uint32_t si = (uint32_t) (_frames % Ring);
+         VkDescriptorSet ps = _preSet[si], qs = _postSet[si];
+-        VkWriteDescriptorSet w[7] {};
+-        VkDescriptorImageInfo ii[7] {};
+-        // pre: colour, depth, mv (game), history/feature of the previous frame, LR colour + chosen MV out
+-        Write(ps, 0, vc, false, w, ii);
+-        Write(ps, 1, vd, false, w, ii);
+-        Write(ps, 2, vm, false, w, ii);
+-        Write(ps, 3, _hist[prv].view, false, w, ii);
+-        Write(ps, 4, _feat[prv].view, false, w, ii);
+-        Write(ps, 5, _colLR.view, true, w, ii);
+-        Write(ps, 6, _mvLR.view, true, w, ii);
+-        vkUpdateDescriptorSets(_vk, 7, w, 0, nullptr);
+-        VkWriteDescriptorSet w2[6] {};
+-        VkDescriptorImageInfo i2[6] {};
+-        Write(qs, 0, _colLR.view, false, w2, i2);
+-        Write(qs, 1, _mvLR.view, false, w2, i2);
+-        Write(qs, 2, _hist[prv].view, false, w2, i2);
+-        Write(qs, 3, _hist[par].view, true, w2, i2);
+-        Write(qs, 4, _feat[par].view, true, w2, i2);
+-        Write(qs, 5, _resample ? _t2R.view : vo, true, w2, i2);
+-        vkUpdateDescriptorSets(_vk, 6, w2, 0, nullptr);
+ 
+-        PrePush pp {};
+-        pp.net = inAddr;
+-        pp.lw = (int32_t) _rw;
+-        pp.lh = (int32_t) _rh;
+-        pp.canvasW = (int32_t) _cw;
+-        pp.invDepth = _depthInverted ? 0 : 1;  // the pre pass wants larger = nearer
+-        pp.e = 1.0f;
+-        pp.mvsx = -f.mvScaleX;  // FFX MV (prev - curr) x MV scale -> ANF curr - prev in render px
+-        pp.mvsy = -f.mvScaleY;
+-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _prePipe);
+-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _preLayout, 0, 1, &ps, 0, nullptr);
+-        vkCmdPushConstants(cb, _preLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pp, &pp);
+-        vkCmdDispatch(cb, (_rw + 7) / 8, (_rh + 7) / 8, 1);
+-        Bar(cb);
+-        Ts(cb, 2);
+-        if (npu)
++        auto pre = [&]()
+         {
+-            // the kick (layer E1, with the family phase) and the wait for the same frame: pre -> NPU -> post in order
+-            const uint32_t kfl = VELA_NPU_F_TENSORS | VELA_NPU_F_ASYNC | VELA_NPU_F_ZEROCOPY | VELA_NPU_F_PHASE;
+-            const uint64_t s = ++_seq;
+-            Marker(cb, ri, 1, VELA_NPU_OP_UPSCALE, s, kfl, phase);
+-            Marker(cb, ri, 0, VELA_NPU_OP_WAIT, s, 0, 0);
+-            ++_kicks;
+-            ++_phaseHist[phase & 31];
++            VkWriteDescriptorSet w[7] {};
++            VkDescriptorImageInfo ii[7] {};
++            // pre: colour, depth, mv (game), history/feature of the previous frame, LR colour + chosen MV out
++            Write(ps, 0, vc, false, w, ii);
++            Write(ps, 1, vd, false, w, ii);
++            Write(ps, 2, vm, false, w, ii);
++            Write(ps, 3, _hist[prv].view, false, w, ii);
++            Write(ps, 4, _feat[prv].view, false, w, ii);
++            Write(ps, 5, _colLR.view, true, w, ii);
++            Write(ps, 6, _mvLR.view, true, w, ii);
++            vkUpdateDescriptorSets(_vk, 7, w, 0, nullptr);
++            PrePush pp {};
++            pp.net = inAddr;
++            pp.lw = (int32_t) _rw;
++            pp.lh = (int32_t) _rh;
++            pp.canvasW = (int32_t) _cw;
++            pp.invDepth = _depthInverted ? 0 : 1;  // the pre pass wants larger = nearer
++            pp.e = 1.0f;
++            pp.mvsx = -f.mvScaleX;  // FFX MV (prev - curr) x MV scale -> ANF curr - prev in render px
++            pp.mvsy = -f.mvScaleY;
++            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _prePipe);
++            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _preLayout, 0, 1, &ps, 0, nullptr);
++            vkCmdPushConstants(cb, _preLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pp, &pp);
++            vkCmdDispatch(cb, (_rw + 7) / 8, (_rh + 7) / 8, 1);
++            Bar(cb);
++        };
++        // the post pass (+ resample) of the frame with history parity pPar, network output at net, jitter quantum (qx, qy)
++        auto post = [&](uint32_t pPar, VkDeviceAddress net, float qx, float qy, uint32_t tsPost, uint32_t tsRes)
++        {
++            const uint32_t pPrv = pPar ^ 1;
++            VkWriteDescriptorSet w2[6] {};
++            VkDescriptorImageInfo i2[6] {};
++            Write(qs, 0, _colLR.view, false, w2, i2);
++            Write(qs, 1, _mvLR.view, false, w2, i2);
++            Write(qs, 2, _hist[pPrv].view, false, w2, i2);
++            Write(qs, 3, _hist[pPar].view, true, w2, i2);
++            Write(qs, 4, _feat[pPar].view, true, w2, i2);
++            Write(qs, 5, _resample ? _t2R.view : vo, true, w2, i2);
++            vkUpdateDescriptorSets(_vk, 6, w2, 0, nullptr);
++            PostPush qp {};
++            qp.net = net;
++            qp.hw = (int32_t) (2 * _rw);
++            qp.hh = (int32_t) (2 * _rh);
++            qp.canvasW = (int32_t) _cw;
++            qp.writeT = _resample ? 1 : 0;
++            qp.qx = qx;
++            qp.qy = qy;
++            qp.e = 1.0f;
++            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _postPipe);
++            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _postLayout, 0, 1, &qs, 0, nullptr);
++            vkCmdPushConstants(cb, _postLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof qp, &qp);
++            vkCmdDispatch(cb, (2 * _rw + 7) / 8, (2 * _rh + 7) / 8, 1);
+             Bar(cb);
++            Ts(cb, tsPost);
++            if (_resample)
++            {
++                // 2R -> D: horizontal (t2R -> tmp, 2R rows), then vertical + inverse tonemap (tmp -> game output)
++                VkDescriptorSet r0 = _rsSet[si][0], r1 = _rsSet[si][1];
++                VkWriteDescriptorSet w3[2] {};
++                VkDescriptorImageInfo i3[2] {};
++                Write(r0, 0, _t2R.view, false, w3, i3);
++                Write(r0, 1, _tmpR.view, true, w3, i3);
++                vkUpdateDescriptorSets(_vk, 2, w3, 0, nullptr);
++                VkWriteDescriptorSet w4[2] {};
++                VkDescriptorImageInfo i4[2] {};
++                Write(r1, 0, _tmpR.view, false, w4, i4);
++                Write(r1, 1, vo, true, w4, i4);
++                vkUpdateDescriptorSets(_vk, 2, w4, 0, nullptr);
++                RsPush rp {};
++                rp.axis = 0;
++                rp.nOut = (int32_t) _dw;
++                rp.dw = (int32_t) _dw;
++                rp.dh = (int32_t) (2 * _rh);
++                rp.inv = 0;
++                rp.e = 1.0f;
++                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _rsPipe);
++                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _rsLayout, 0, 1, &r0, 0, nullptr);
++                vkCmdPushConstants(cb, _rsLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof rp, &rp);
++                vkCmdDispatch(cb, (_dw + 7) / 8, (2 * _rh + 7) / 8, 1);
++                Bar(cb);
++                rp.axis = 1;
++                rp.nOut = (int32_t) _dh;
++                rp.dw = (int32_t) _dw;
++                rp.dh = (int32_t) _dh;
++                rp.inv = 1;
++                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _rsLayout, 0, 1, &r1, 0, nullptr);
++                vkCmdPushConstants(cb, _rsLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof rp, &rp);
++                vkCmdDispatch(cb, (_dw + 7) / 8, (_dh + 7) / 8, 1);
++                Bar(cb);
++            }
++            Ts(cb, tsRes);
++        };
++        const float qxNow = ((float) ix + 0.5f) / 8.0f - 0.5f, qyNow = ((float) iy + 0.5f) / 8.0f - 0.5f;
++        const uint32_t kfl = VELA_NPU_F_TENSORS | VELA_NPU_F_ASYNC | VELA_NPU_F_ZEROCOPY | VELA_NPU_F_PHASE;
++        if (!late)
++        {
++            // synchronous order (no NPU yet, or OPTI_ANF_SYNC=1): pre -> kick -> wait -> post of the same frame
++            pre();
++            Ts(cb, 2);
++            if (npu)
++            {
++                const uint64_t sq = ++_seq;
++                Marker(cb, ri, 1, VELA_NPU_OP_UPSCALE, sq, kfl, phase);
++                Marker(cb, ri, 0, VELA_NPU_OP_WAIT, sq, 0, 0);
++                ++_kicks;
++                ++_phaseHist[phase & 31];
++                Bar(cb);
++            }
++            else
++                ++_standIn;
++            Ts(cb, 3);
++            post(par, outAddr, qxNow, qyNow, 4, 5);
++            _pend = false;
+         }
+         else
+-            ++_standIn;
+-        Ts(cb, 3);
+-        PostPush qp {};
+-        qp.net = outAddr;
+-        qp.hw = (int32_t) (2 * _rw);
+-        qp.hh = (int32_t) (2 * _rh);
+-        qp.canvasW = (int32_t) _cw;
+-        qp.writeT = _resample ? 1 : 0;
+-        qp.qx = ((float) ix + 0.5f) / 8.0f - 0.5f;
+-        qp.qy = ((float) iy + 0.5f) / 8.0f - 0.5f;
+-        qp.e = 1.0f;
+-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _postPipe);
+-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _postLayout, 0, 1, &qs, 0, nullptr);
+-        vkCmdPushConstants(cb, _postLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof qp, &qp);
+-        vkCmdDispatch(cb, (2 * _rw + 7) / 8, (2 * _rh + 7) / 8, 1);
+-        Bar(cb);
+-        Ts(cb, 4);
+-        if (_resample)
+         {
+-            // 2R -> D: horizontal (t2R -> tmp, 2R rows), then vertical + inverse tonemap (tmp -> game output)
+-            VkDescriptorSet r0 = _rsSet[si][0], r1 = _rsSet[si][1];
+-            VkWriteDescriptorSet w3[2] {};
+-            VkDescriptorImageInfo i3[2] {};
+-            Write(r0, 0, _t2R.view, false, w3, i3);
+-            Write(r0, 1, _tmpR.view, true, w3, i3);
+-            vkUpdateDescriptorSets(_vk, 2, w3, 0, nullptr);
+-            VkWriteDescriptorSet w4[2] {};
+-            VkDescriptorImageInfo i4[2] {};
+-            Write(r1, 0, _tmpR.view, false, w4, i4);
+-            Write(r1, 1, vo, true, w4, i4);
+-            vkUpdateDescriptorSets(_vk, 2, w4, 0, nullptr);
+-            RsPush rp {};
+-            rp.axis = 0;
+-            rp.nOut = (int32_t) _dw;
+-            rp.dw = (int32_t) _dw;
+-            rp.dh = (int32_t) (2 * _rh);
+-            rp.inv = 0;
+-            rp.e = 1.0f;
+-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _rsPipe);
+-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _rsLayout, 0, 1, &r0, 0, nullptr);
+-            vkCmdPushConstants(cb, _rsLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof rp, &rp);
+-            vkCmdDispatch(cb, (_dw + 7) / 8, (2 * _rh + 7) / 8, 1);
+-            Bar(cb);
+-            rp.axis = 1;
+-            rp.nOut = (int32_t) _dh;
+-            rp.dw = (int32_t) _dw;
+-            rp.dh = (int32_t) _dh;
+-            rp.inv = 1;
+-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, _rsLayout, 0, 1, &r1, 0, nullptr);
+-            vkCmdPushConstants(cb, _rsLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof rp, &rp);
+-            vkCmdDispatch(cb, (_dw + 7) / 8, (_dh + 7) / 8, 1);
++            if (hadPend)
++            {
++                // frame N-1's result: wait (done long ago), post(N-1) into this frame's output
++                Marker(cb, ri, 0, VELA_NPU_OP_WAIT, _pendSeq, 0, 0);
++                Bar(cb);
++                Ts(cb, 2);
++                if (!f.reset)
++                    post(_pendPar, outAddr, _pendQx, _pendQy, 3, 4);
++                else
++                {
++                    post(par, zeroNet, qxNow, qyNow, 3, 4);
++                    ++_standIn;
++                }
++            }
++            else
++            {
++                // nothing pending (first frame after the NPU came up, reset): a plain-upscale stand-in for this frame; its history
++                // write is replaced by the real post(N) one frame later
++                Ts(cb, 2);
++                post(par, zeroNet, qxNow, qyNow, 3, 4);
++                ++_standIn;
++            }
++            pre();
++            Ts(cb, 5);
++            const uint64_t sq = ++_seq;
++            Marker(cb, ri, 1, VELA_NPU_OP_UPSCALE, sq, kfl, phase);
++            ++_kicks;
++            ++_phaseHist[phase & 31];
+             Bar(cb);
++            _pend = true;
++            _pendSeq = sq;
++            _pendPar = par;
++            _pendQx = qxNow;
++            _pendQy = qyNow;
+         }
+-        Ts(cb, 5);
++        _profLate[ri] = late;
+         _profNpu[ri] = npu;
+         if (_frames == 0 || (_frames % 600) == 0)
+             LOG_INFO("Vela ANF: frame {} phase {} (ix {} iy {}) npu {} stand-in frames {} layer state {}", _frames, phase, ix, iy, npu,
+@@ -1017,7 +1082,11 @@ class AnfVkBridge
+         double tot = 0, waitMax = 0;
+         uint64_t n = 0;
+     };
+-    bool _prof = false;
++    bool _prof = false, _sync = false, _pend = false;
++    uint64_t _pendSeq = 0;
++    uint32_t _pendPar = 0;
++    float _pendQx = 0, _pendQy = 0;
++    bool _profLate[NR] {};
+     VkQueryPool _qp = VK_NULL_HANDLE;
+     float _tsPeriod = 1.0f;
+     ProfAcc _acc[2];

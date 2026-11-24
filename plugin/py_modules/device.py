@@ -81,7 +81,8 @@ def policy(dev, v79_dirs=V79_DIRS):
     fsr4: FSR 4 is offered at all (not on chips without a supported NPU); fsr4fast: FSR 4 Fast is offered; unavailable: English lines (logged, in game_state["device"]); note: one line, or None."""
     soc = dev.get("soc")
     if soc in (SM8550, SM8650):  # SM8650: the v73 graphs on the V75 runtime
-        return {"npu": True, "npu_graphs": "v73", "fsr4": True, "fsr4fast": True, "unavailable": [], "note": None}
+        # anf: the ANF families were built for HTP v73 and measured on the SM8550 only
+        return {"npu": True, "npu_graphs": "v73", "fsr4": True, "fsr4fast": True, "anf": soc == SM8550, "unavailable": [], "note": None}
     if soc == SM8750:
         d = v79_graphs(v79_dirs)
         if d:
@@ -113,5 +114,5 @@ def refresh(owner, v79_dirs=V79_DIRS, log=None):
 def state(dev, pol):
     """game_state["device"]"""
     return {"soc": dev.get("soc") or "unknown", "gpu": dev.get("gpu"), "npu_arch": dev.get("npu_arch"),
-            "npu": pol["npu"], "npu_graphs": pol["npu_graphs"], "fsr4": pol.get("fsr4", True), "fsr4fast": pol["fsr4fast"],
+            "npu": pol["npu"], "npu_graphs": pol["npu_graphs"], "fsr4": pol.get("fsr4", True), "fsr4fast": pol["fsr4fast"], "anf": pol.get("anf", False),
             "unavailable": list(pol["unavailable"]), "note": pol["note"]}

@@ -947,12 +947,12 @@ def pick_exe(exes, unity_dirs):
 # amd_fidelityfx_dx12.dll (the DX12 path's FFX backend), sgsr2_12 = SGSR 2. The fork also follows the live file at run time
 # (a model change re-creates the upscaler, as in DX12); the ini only decides the first one. No model known: sgsr3_12
 # DITTO: DittoSR is the FFX backend with DittoSR's DLL (ffx_12, as FSR 3)
-DX11_UPSCALER = {"fsr4": "sgsr3_12", "fsr4fast": "sgsr3_12", "fsr3": "ffx_12", "dittosr": "ffx_12", "sgsr2": "sgsr2_12"}
+DX11_UPSCALER = {"fsr4": "sgsr3_12", "fsr4fast": "sgsr3_12", "anf": "sgsr3_12", "fsr3": "ffx_12", "dittosr": "ffx_12", "sgsr2": "sgsr2_12"}
 # VK1 (fork patch 0040): OptiScaler's VulkanUpscaler for the live model in a native Vulkan game. ffx = FSR 3.1 from
 # amd_fidelityfx_vk.dll (FFXVK_DLL), DittoSR on the same backend through its own module; sgsr2 = SGSR 2 (Vulkan). FSR 4 has
 # no Vulkan route yet: SGSR 2 (the fork says "cannot run in this Vulkan game yet"). The fork follows the live file at run
 # time; the ini decides the first upscaler. No model known: sgsr2
-VULKAN_UPSCALER = {"fsr4": "sgsr2", "fsr4fast": "sgsr2", "fsr3": "ffx", "dittosr": "ffx", "sgsr2": "sgsr2"}
+VULKAN_UPSCALER = {"fsr4": "sgsr2", "fsr4fast": "sgsr2", "anf": "sgsr2", "fsr3": "ffx", "dittosr": "ffx", "sgsr2": "sgsr2"}
 
 
 def dx11_upscaler(model):
@@ -1206,7 +1206,9 @@ _RX_FSR3 = re.compile(r"Vela: FFX upscaler index \d+ \(([\d.]+)\) for FSR 3")
 # (labelled DittoSR, or FSR 3 by a fork that names the backend only) and no fallback line = DittoSR runs. The fork cannot load
 # dittosr/amd_fidelityfx_upscaler_dx12.dll (or DittoSR refuses): "Vela live: dittosr cannot run in this game; FSR 3 instead",
 # then FSR 3 runs (its upscaler line after that one)
-_RX_FFX_UP = re.compile(r"Vela: FFX upscaler index \d+ \(([\d.]+)\) for (?:FSR 3|DittoSR)")
+# PANELFIX: the real lines are "(3.1.4) for FSR 3" and "(DittoSR (FSR 3.1.5 API) 0.5.4) for DittoSR": the label inside the
+# brackets has brackets of its own, so take everything up to the last ") for" on the line
+_RX_FFX_UP = re.compile(r"Vela: FFX upscaler index \d+ \((.+)\) for (?:FSR 3|DittoSR)")
 _RX_DITTO_DOWN = re.compile(r"Vela live: dittosr cannot run[^\n]*? instead")
 # 0.8.13: "Vela live: fsr4 cannot run in this game; SGSR 2 instead" (provider refused, a frame
 # failed); the handles are then re-created on SGSR 2 until the panel picks another model
@@ -1305,6 +1307,9 @@ def log_summary(path, since=0.0):
     # 0.8.16 (fork patch 0018): FSR 4 Fast is the same FSR 4 VK context line; the live model the feature was made for names it
     if mode == "fsr4" and want and want[-1] == "fsr4fast":
         mode = "fsr4fast"
+    # ANF (fork patch 0050): the last live model is anf and the fork's ANF init line is in this run
+    if want and want[-1] == "anf" and "Vela ANF: ready" in seg:
+        mode = "anf"
     # FSR 3.1 (live fsr3): the last switch asked for it; it runs when the FFX backend took a 3.x upscaler after it
     lives = list(_RX_LIVE.finditer(text))
     fsr3_want = bool(lives) and lives[-1].group(1) == "fsr3"
@@ -1827,6 +1832,11 @@ class Sgsr3:
         return self.fsr3_available() and bool(self.version.get("dittosr_live")) and \
             all(os.path.isfile(os.path.join(self.assets, *rel.split("/"))) for rel in DITTO_FILES)
 
+    def anf_available(self):
+        """ANF (branch anf-model): the DLL the plugin carries has the model (VERSION.json "anf_live": fork patches 0050-0054). The NPU side
+        (package 18 families, chip, NPU ready) is checked by main._models; without this key ANF stays hidden."""
+        return bool(self.version.get("anf_live"))
+
     def ffxvk_available(self):
         """VK1: AMD's FidelityFX SDK 1.1.4 Vulkan DLL (FSR 3.1 in a native Vulkan game) is in the plugin."""
         return os.path.isfile(os.path.join(self.assets, FFXVK_DLL))
@@ -2198,7 +2208,7 @@ class Sgsr3:
         out = {"scan": sc, "available": bool(sc["exe_dir"]) and not sc["anticheat"], "installed": st is not None,
                "opts": dict(DEFAULT_OPTS), "version": self.version.get("dll", ""), "intact": None, "log": None,
                "fsr4_available": self.fsr4_available(), "fsr3_available": self.fsr3_available(),
-               "dittosr_available": self.dittosr_available(), "other_optiscaler": other, "menu_hint": menu_hint(sc),
+               "dittosr_available": self.dittosr_available(), "anf_available": self.anf_available(), "other_optiscaler": other, "menu_hint": menu_hint(sc),
                "profile": profiles.public(sc["appid"]),
                "kit_missing": self.kit_missing(sc["appid"]) if st is not None and self._is_kit(d) else []}  # KIT1
         out["opts"] = resolve_mode({**DEFAULT_OPTS, **profiles.defaults(sc["appid"])}, sc["appid"])
@@ -2211,6 +2221,7 @@ class Sgsr3:
             # 0.8.3-re: the interceptor's live models; FSR 3.1 needs only the SDK DLL (no fork patch)
             out["fsr3_available"] = self.ffx_available()
             out["dittosr_available"] = False  # DITTO: the interceptor has no DittoSR
+            out["anf_available"] = False      # ANF: the interceptor has no ANF
             out["live_models"] = ["fsr4", "fsr4fast", "fsr3", "sgsr2"]  # 0.8.13: no Vela AI / SR in the panel
         if st:
             opts = dict(DEFAULT_OPTS)

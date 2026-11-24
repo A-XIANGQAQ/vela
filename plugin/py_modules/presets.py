@@ -15,8 +15,15 @@ Pure functions; main.py applies them.
 # the fork / the RE4 interceptor run it like fsr4 and re-create the context on fsr4 <-> fsr4fast. Same NPU graphs as fsr4.
 # DITTO (0.8.23, owner 2026-11-22): dittosr = DittoSR 0.5.4 (MIT), a FidelityFX-API upscaler without a neural network, loaded
 # by the fork's FFX backend like FSR 3 (FSR 3 is its fallback); OptiScaler games only (the RE4 interceptor has no DittoSR)
-MODELS = ("fsr4", "fsr4fast", "fsr3", "dittosr", "sgsr2")
-FSR4_MODELS = ("fsr4", "fsr4fast")  # the NPU, exact mode
+# ANF (0.8.28 candidate, branch anf-model): "ANF" = Vela's own small NPU upscaler (fork patch 0050+: two GPU passes around a network of
+# ours on the NPU, one graph family per canvas, 32 jitter-phase graphs each). Offered only where the NPU is ready, the system package carries
+# the ANF families (npu.Npu.service()["anf_graphs"]), the plugin's DLL has the model (VERSION.json "anf_live") and the chip is the SM8550
+# the families were measured on; hidden otherwise. DX12 / DX11 (the bridge) games of OptiScaler kits only: not in a Vulkan or static game.
+MODELS = ("fsr4", "fsr4fast", "anf", "fsr3", "dittosr", "sgsr2")
+FSR4_MODELS = ("fsr4", "fsr4fast")
+VK_DLSS_MODELS = FSR4_MODELS  # the models whose native-Vulkan route is the game's DLSS (NGX) hook: they need the GPU spoof  # the NPU, exact mode
+ANF_MODELS = ("anf",)               # the NPU too (live npu=2, npuexact=1), but its own graphs: never the FSR 4 ones
+NPU_MODELS = FSR4_MODELS + ANF_MODELS
 # 0.8.15: a model the panel no longer has -> the one that replaces it (stored settings, a stale panel's pick); never written again
 RETIRED_MODELS = {"fsr4lite": "fsr4"}
 # Vela AI / Vela SR / Vela AI P2b / the any-game layer (0.8.12 and older): out of the panel. A game that had one of them
@@ -49,7 +56,7 @@ def default_model(kind, fsr4=True, npu_state=None):
     return "fsr4" if npu_ready(npu_state) else "fsr4fast"
 
 
-def models_for(kind, fsr4=True, fsr3=True, dittosr=True, vulkan=False):
+def models_for(kind, fsr4=True, fsr3=True, dittosr=True, vulkan=False, anf=False):
     """[(model, offered)] for a game of this kind, in the panel's order; DX11 games the same as DX12 (DX11FSR: the fork
     runs every model over the D3D11 -> D3D12 bridge). fsr4 / fsr3 / dittosr: the plugin carries what the model needs (sgsr3.py
     fsr4_available, fsr3_available, dittosr_available). DITTO: DittoSR only where FSR 3 is offered, and not in a static
@@ -57,9 +64,9 @@ def models_for(kind, fsr4=True, fsr3=True, dittosr=True, vulkan=False):
     if kind not in KINDS:
         return []
     # VK1: a native Vulkan game (gamecheck vulkan): FSR 3, DittoSR and SGSR 2 on the game's Vulkan device (fork patch
-    # 0040); FSR 4 / FSR 4 Fast are shown, not offered (the fork logs "fsr4 cannot run in this Vulkan game yet")
-    fsr4 = fsr4 and not vulkan
-    out = [("fsr4", bool(fsr4)), ("fsr4fast", bool(fsr4)), ("fsr3", bool(fsr3))]
+    # 0040); FSR 4 / FSR 4 Fast are offered too (2026-11-24): in Vulkan they ride the game's DLSS path (npu.VK_TOKENS)
+    # ANF: a native Vulkan game and a static (FSR 2 inside the exe, the interceptor) game have no ANF
+    out = [("fsr4", bool(fsr4)), ("fsr4fast", bool(fsr4)), ("anf", bool(anf) and not vulkan and kind != "static"), ("fsr3", bool(fsr3))]
     if kind != "static":
         out.append(("dittosr", bool(fsr3) and bool(dittosr)))
     return out + [("sgsr2", True)]
@@ -152,12 +159,12 @@ def plan(kind, live):
     model = RETIRED_MODELS.get(model, model)
     if model not in MODELS:
         model = legacy_model(kind == "static")
-    return {"kind": kind, "model": model, "npu": bool(live.get("npu")) and model in FSR4_MODELS}
+    return {"kind": kind, "model": model, "npu": bool(live.get("npu")) and model in NPU_MODELS}
 
 
 def live_wanted(model, npu_state):
     """0.8.15: the live values of a model: FSR 4 always on the NPU when it is ready (exact), nothing else."""
-    on = model in FSR4_MODELS and npu_ready(npu_state)
+    on = model in NPU_MODELS and npu_ready(npu_state)
     return {"model": model, "npu": 2 if on else None, "npuexact": 1 if on else None}
 
 

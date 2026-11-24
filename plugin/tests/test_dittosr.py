@@ -153,8 +153,11 @@ def summary(text, name="OptiScaler.log"):
     return sgsr3.log_summary(p)
 
 
-for label in ("DittoSR", "FSR 3"):  # the fork may name the backend only
-    o = summary(HEAD + SWITCH + VERS + f"Vela: FFX upscaler index 0 (0.5.4) for {label}\n")
+# PANELFIX: the lines of real runs (b53122ed DittoSR log; FSR 3 lines of the KIT2 logs), not an invented "(0.5.4)"
+REAL_DITTO = "[12:34:52.299028] [I] InitFFX Vela: FFX upscaler index 0 (DittoSR (FSR 3.1.5 API) 0.5.4) for DittoSR\n"
+REAL_FSR3 = "[12:34:52.299028] [I] InitFFX Vela: FFX upscaler index 0 (3.1.4) for FSR 3\n"
+for label, line in (("DittoSR line", REAL_DITTO), ("FSR 3 line (a fork naming the backend only)", REAL_FSR3)):
+    o = summary(HEAD + SWITCH + VERS + line)
     ok(o["mode"] == "dittosr" and o["sgsr3"] and o["dittosr_fallback"] is None and o["render"] == "960x540", (label, o))
     ok(o["fsr3_fallback"] is None, o)
 down = SWITCH + "Vela: can't load Z:\\g\\dittosr\\amd_fidelityfx_upscaler_dx12.dll\n" \
