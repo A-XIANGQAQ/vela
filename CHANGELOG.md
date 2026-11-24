@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.9.0 — 2026-11-24
+
+Vela 0.9.0 adds ANF, our own upscaler for the NPU, and brings FSR 4 to native Vulkan games. It also fixes the DirectX 11 crash in Unreal games.
+
+New
+- **ANF, Vela's own upscaler on the NPU.** A new model in the panel. In quality it sits between SGSR 2 and FSR 4, and it is faster than FSR 4: in Deep Rock Galactic at 1920x1080 ANF runs at 41.5 fps, FSR 4 at 38.8 and SGSR 2 at 43.9. ANF needs the new Vela NPU package 18 (see How to update) and shows up in the panel only when the NPU is ready. For now it works on Snapdragon 8 Gen 2 only.
+- **FSR 4 in games running in Vulkan (e.g. Unity games started with -force-vulkan).** FSR 4 and FSR 4 Fast are now offered in games that draw with Vulkan. In Haste FSR 4 on the NPU runs at 46.2 fps (SGSR 2: 50.0); the same FSR 4 on the GPU gives 32.5 fps. Vela shows itself as an NVIDIA GPU to these games so they offer DLSS: pick **DLSS** in the game's graphics settings, and that is how Vela's FSR 4 starts. The panel shows a line about it. If a game misbehaves with this, tell us.
+
+Fixed
+- **FSR 3 and DittoSR in DirectX 11 games that use their own FSR 2 (Unreal).** The game crashed as soon as Vela's upscaler started. Vela now ignores the extra masks these games hand over and the game keeps running. Checked on Bright Memory: Infinite in DirectX 11: FSR 3 42.8 fps, DittoSR 40.0 fps.
+- **The panel shows DittoSR correctly.** The card now reads the DittoSR line of the game log, so a game running DittoSR no longer shows a wrong model.
+- **DirectX 11 texts in the panel.** The messages for a game that ran in DirectX 11 now say what is true: Vela's upscaler did not start, and you can try another model or DirectX 12 in the game's graphics settings.
+- **The NPU installer on units with a faulty NPU (#2).** When the NPU on a unit gives wrong results, the installer used to print "FAILED - vela-npu.service did not start". It now says that the NPU is off on this unit and Vela runs FSR 4 on the GPU, and links to test 8. The installer also checks the ANF graphs now.
+
+Steam games, our Retroid Pocket 6, average fps, same scene in both versions (Deep Rock Galactic: the game's space rig, 1920x1080 from a 960x540 render):
+
+| game | model | 0.8.26 | 0.9.0 |
+|---|---|---|---|
+| Deep Rock Galactic, DirectX 12 | FSR 4 | 39.0 | 38.8 |
+| Deep Rock Galactic, DirectX 12 | SGSR 2 | 43.9 | 43.9 |
+| Deep Rock Galactic, DirectX 12 | ANF | not in this version | 41.5 |
+| Haste, Vulkan | FSR 4 | not offered | 46.2 |
+| Bright Memory: Infinite, DirectX 11 | FSR 3 | crash | 42.8 |
+| Bright Memory: Infinite, DirectX 11 | DittoSR | crash | 40.0 |
+
+The Deep Rock Galactic numbers in the 0.8.25 and 0.8.26 notes were measured on the game's news window shown at start, which is much lighter to draw, so they are higher and not comparable with these.
+
+Known issues
+- ANF works on Snapdragon 8 Gen 2 only for now. On other chips it is not shown.
+- Vela shows itself as an NVIDIA GPU to native Vulkan games so they offer DLSS. We tested this end to end in one game (Haste); if a game misbehaves, tell us.
+- DirectX 12 through Engine.ini (#5) is covered by tests only; we have no Unreal game from a launcher on our device. Please report how it goes.
+- FSR 3 and DittoSR in native Vulkan games don't start on our device; Vela uses SGSR 2 there.
+- On some Retroid Pocket 6 units the NPU gives wrong results even with the smaller graphs (#2); there the NPU stays off and FSR 4 runs on the GPU. The installer now says so.
+- Scenes without a depth buffer still use FSR 1.
+- FSR 4 Fast: black rectangles in some games on 8 Elite. We don't see them on 8 Gen 2.
+
 ## 0.8.26 — 2026-11-24
 
 Games started from launchers: Heroic, Xodus Nexus and other non-Steam shortcuts. Contributed by indiesaudi (#3, #4, #5), tested on an Odin 2 mini by iloveswiming909.
