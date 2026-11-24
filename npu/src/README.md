@@ -1,7 +1,7 @@
 # Source of the Vela NPU daemon and its checker
 
-The Vela NPU system image (`vela-npu-sysext-15.raw`, release asset, sha256
-`5cdfc9c15180eb5c14ee4810f89d221a8d390d9459560c08346af6358c91ae73`) ships two programs of ours as binaries:
+The Vela NPU system image (`vela-npu-sysext-17.raw`, release asset, sha256
+`8795c509be690e643f6739112aa4033d4c1fff3a5e55a0c58ce4178963046bc6`) ships two programs of ours as binaries:
 `/usr/lib64/vela-npu/fsr4npud` (the NPU daemon) and `/usr/lib64/vela-npu/fsr4npu-check` (its checker). This folder is their
 complete source and build recipe (GPL-3.0-or-later, see [Licence](#licence)). Nothing from Qualcomm is in this folder.
 
@@ -51,6 +51,10 @@ library search path of `fsr4npud` with `patchelf --force-rpath --set-rpath /usr/
 - Built from the sources of this folder with the `Dockerfile` toolchain, `fsr4npu-check` is byte-identical to the file in the
   image, and `fsr4npud.stripped` with the `patchelf` call above is byte-identical to `fsr4npud` in the image. Two builds give
   the same files.
+- Package 17 ships the same daemon as package 16: `fsr4npud` in the image has md5 `7d0c16d250d5a386dd6e30c8214421d0`, built from
+  `fsr4npud.cpp` with md5 `7dfde51fee9250bd1423530b5dedc1e6` (the file in this folder). Compared with package 15, this source adds the
+  power governor (on by default), the start self-check and the graph-set choice (`--graph-set auto|released|low`, see
+  [`../graphs/pkg17/README.md`](../graphs/pkg17/README.md)).
 
 ## Licence
 

@@ -1,5 +1,7 @@
 #!/bin/sh
-# Builds the Vela NPU system part, package 15: the systemd system extension vela-npu-sysext-15.raw.
+# Builds the Vela NPU system part, package 17: the systemd system extension vela-npu-sysext-17.raw.
+# Since package 16: low4/: the 17 v73 graphs planned for a 4 MB VTCM window (GRAPHS_LOW: nf4*.bin + SELFCHECK), which the daemon
+# loads on units whose released graphs fail its start self-check.
 # Contents: the NPU daemon fsr4npud and its checker, the 17 FSR 4 graphs for HTP v73 (Snapdragon 8 Gen 2, SM8550) and the same
 # 17 graphs built for HTP v79 (Snapdragon 8 Elite, SM8750; in v79/), quic/fastrpc (commit a56e9d4, BSD-3-Clause, built from
 # source), the systemd units (units/ next to this script), two drop-ins that pick the v79 graphs on SM8750 (units/ next to this script), the udev rule,
@@ -31,7 +33,7 @@
 #     registry.fedoraproject.org/fedora:44 sh /npu/mk_public_sysext.sh
 set -e
 umask 022
-VER=15
+VER=17
 EPOCH=1761955200   # 2025-11-01 00:00 UTC
 SYSLIB=/usr/lib64/vela-npu
 dnf -y -q install squashfs-tools patchelf binutils >/dev/null 2>&1
@@ -56,10 +58,10 @@ bea936b4ab0d5d8a3d172a634cbeaba38ab6b59c103c23b4580191f95717707c usr/lib/rfsa/ad
 1229177eb5bc53220ddb5c77bb25e4025209e4c8ea0a46712aedd92e4f4e705e usr/lib/rfsa/adsp/libQairtHtpV75Skel.so lib/hexagon-v75/unsigned/libQairtHtpV75Skel.so
 14efadf5fdbac6116767d797394cb60454d252748895b284e24d2540b0560449 usr/lib/rfsa/adsp/libQnnHtpV75.so lib/hexagon-v75/unsigned/libQnnHtpV75.so"
 QNN_NAMES="libQnnHtp.so libQnnHtpV73Stub.so libQnnSystem.so libQnnHtpV73Skel.so libQairtHtpV73Skel.so libQnnHtpV73.so libQnnHtpV79Stub.so libQnnHtpV79Skel.so libQairtHtpV79Skel.so libQnnHtpV79.so libQnnHtpV75Stub.so libQnnHtpV75Skel.so libQairtHtpV75Skel.so libQnnHtpV75.so"
-G79=${GRAPHS_V79:?}; DROPIN=$P
+G79=${GRAPHS_V79:?}; DROPIN=$P; GLOW=${GRAPHS_LOW:?}
 T=$(mktemp -d /tmp/velapub.XXXXXX); chmod 0755 $T
 L=$T$SYSLIB; D=$T/usr/share/licenses/armada-vela-npu
-mkdir -p $L $L/v79 $T/usr/bin $T/usr/lib/udev/rules.d $T/usr/lib/systemd/system/vela-npu-setup.service.d $T/usr/lib/systemd/system/vela-npu.service.d $T/usr/lib/extension-release.d $T/usr/lib/modules-load.d $T/usr/lib/rfsa/adsp $D
+mkdir -p $L $L/v79 $L/low4 $T/usr/bin $T/usr/lib/udev/rules.d $T/usr/lib/systemd/system/vela-npu-setup.service.d $T/usr/lib/systemd/system/vela-npu.service.d $T/usr/lib/extension-release.d $T/usr/lib/modules-load.d $T/usr/lib/rfsa/adsp $D
 install -m 0755 $FR/lib/libcdsprpc.so.1.0.0 $FR/lib/libcdsp_default_listener.so.1.0.0 $L/
 ln -s libcdsprpc.so.1.0.0 $L/libcdsprpc.so.1; ln -s libcdsprpc.so.1 $L/libcdsprpc.so
 ln -s libcdsp_default_listener.so.1.0.0 $L/libcdsp_default_listener.so.1; ln -s libcdsp_default_listener.so.1 $L/libcdsp_default_listener.so
@@ -70,6 +72,7 @@ ln -s ../lib64/vela-npu/fsr4npu-check $T/usr/bin/fsr4npu-check
 GRAPH_LIST="nf4_k1h nf4_k1h_360 nf4_k1h_450 nf4up_k1h nf4up_k1h_450 nf4up_k1h_360 nf4_exact nf4_k1h_452 nf4up_k1h_452 nf4_k1h_405 nf4up_k1h_405 nf4_k1h_400 nf4up_k1h_400 nf4_k1h_324 nf4up_k1h_324 nf4_k1h_270 nf4up_k1h_270"
 for u in $GRAPH_LIST; do install -m 0644 $G/$u.bin $L/$u.bin; done
 for u in $GRAPH_LIST; do install -m 0644 $G79/$u.bin $L/v79/$u.bin; done
+for u in $GRAPH_LIST; do install -m 0644 $GLOW/$u.bin $L/low4/$u.bin; done; install -m 0644 $GLOW/SELFCHECK $L/low4/SELFCHECK
 # the Qualcomm runtime: host libraries 0755 (as on the tested device), DSP-side skels 0644; each sha256-checked
 echo "$QNN_FILES" | while read -r sha dst src; do
   case $dst in usr/lib64/*) m=0755;; *) m=0644;; esac
@@ -97,6 +100,8 @@ cat > $D/README.txt <<R
 Vela NPU system part, package $VER (public image).
 Ours: fsr4npud, fsr4npu-check (the NPU daemon and its checker), the 17 FSR 4 graphs nf4*.bin (HTP v73, Snapdragon 8 Gen 2 SM8550; on Snapdragon 8 Gen 3 SM8650 with the HTP v75 runtime)
 and v79/nf4*.bin (the same graphs for HTP v79, Snapdragon 8 Elite SM8750), the systemd units and drop-ins, the udev rule.
+low4/nf4*.bin: the 17 HTP v73 graphs planned for a 4 MB VTCM window, with the same outputs; fsr4npud checks one released graph at
+start (low4/SELFCHECK) and uses low4/ on units where it gives a wrong result (faulty upper VTCM window).
 quic/fastrpc (BSD-3-Clause, fastrpc-BSD-3-Clause.txt): cdsprpcd, libcdsprpc, libcdsp_default_listener, built from source.
 Qualcomm AI Engine Direct SDK runtime $QAIRT_VER, redistributed by the Vela author, unmodified:
   usr/lib64/vela-npu/libQnnHtp.so, libQnnHtpV73Stub.so, libQnnSystem.so;

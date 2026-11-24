@@ -32,8 +32,8 @@ Every file in the release zip, who wrote it and under which licence. Licence tex
 
 ## Not in the zip: the Vela NPU system part
 
-The NPU system extension `vela-npu-sysext-15.raw` (package 15, sha256
-`5cdfc9c15180eb5c14ee4810f89d221a8d390d9459560c08346af6358c91ae73`, its own release asset, installed as
+The NPU system extension `vela-npu-sysext-17.raw` (package 17, sha256
+`8795c509be690e643f6739112aa4033d4c1fff3a5e55a0c58ce4178963046bc6`, its own release asset, installed as
 `armada-vela-npu.raw`) is **not** in the release zip. It contains:
 
 - `fsr4npud` (the NPU daemon) and `fsr4npu-check`: ours, GPL-3.0-or-later with a GPL-3.0 section 7 additional permission
@@ -50,7 +50,7 @@ reads them from the device's own dsp partition.
 
 ## Qualcomm AI Engine Direct (QNN) runtime
 
-- **Included** (only inside `vela-npu-sysext-15.raw`, never as a separate download): `libQnnHtp.so`,
+- **Included** (only inside `vela-npu-sysext-17.raw`, never as a separate download): `libQnnHtp.so`,
   `libQnnHtpV73Stub.so`, `libQnnSystem.so`, `libQnnHtpV73Skel.so`, `libQairtHtpV73Skel.so`, `libQnnHtpV73.so`,
   `libQnnHtpV79Stub.so`, `libQnnHtpV79Skel.so`, `libQairtHtpV79Skel.so`, `libQnnHtpV79.so`, `libQnnHtpV75Stub.so`,
   `libQnnHtpV75Skel.so`, `libQairtHtpV75Skel.so`, `libQnnHtpV75.so` from the

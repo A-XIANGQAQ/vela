@@ -39,6 +39,18 @@
 //                 [--backend stub|qnn] [--alloc auto|rpcmem|vk|memfd] [--exec-timeout-ms 2000]
 //                 [--exec-hard-timeout-ms 10000] [--power-grace-ms 2000] [--power-corner turbo] [--stub-bytes 8294400] [--stub-nout 1]
 //                 [--stub-delay-us 0] [--stub-load-ms 0] [--max-clients 4] [--allow-uid U]... [--exit-after-clients K] [--max-seconds S] [--qnn-log L]
+//                 [--power-live PATH|off] [--power-stats-jobs N] [--graph-set auto|released|low]
+// Governor: the daemon steps the core corner by the measured slack between the start corner (--power-corner, default turbo) and
+// svs_plus (see "R4 governor" below). FSR4NPUD_POWER_GOV=0 or the control-file key gov=0: the fixed vote of package 15.
+// Control-file keys: gov=0|1 govmin=<corner >= svs_plus> govdown=<us> govup=<us> govq=<1..50> govrails=core|both govfloor=<us, 0 = auto>.
+// PACKAGE 16: the core power corner follows the frame chain's slack (governor, on by default; FSR4NPUD_POWER_GOV=0 turns it off).
+// For tests the power vote can be changed while a client runs, through a control file (env FSR4NPUD_POWER_LIVE or
+// --power-live <absolute path>; off by default). Keys: core= bus= coremin= busmin= (voltage corners, the
+// --power-corner names), sleep=0|1, sleeplat=<us>, dcvs=0|1, mode=perf|duty|updown|uponly|saver|saver_aggr, hmx=<corner>|default|off,
+// hmxperf=high|low. Missing keys = the start values (--power-corner, sleep disabled, latency 40, no HMX vote = package 15).
+// The file is stat()ed at most every 200 ms; a change re-sends the vote while voted ON and logs "power_vote LIVE ...". A bad
+// file is ignored (one "power_live BAD" line) and the settings stay. Every --power-stats-jobs executes (and at each change) a
+// "power_win" line gives the execute times of that window next to the settings it ran with. See NPUPWR/NOTES.md.
 #define _GNU_SOURCE 1
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -56,6 +68,7 @@ extern "C" {
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstdarg>
@@ -130,6 +143,161 @@ static bool powerCornerParse(const string& n) {
     {"turbo", DCVS_VOLTAGE_VCORNER_TURBO}, {"nom_plus", DCVS_VOLTAGE_VCORNER_NOM_PLUS}, {"nom", DCVS_VOLTAGE_VCORNER_NOM}, {"svs_plus", DCVS_VOLTAGE_VCORNER_SVS_PLUS},
     {"svs", DCVS_VOLTAGE_VCORNER_SVS}, {"svs2", DCVS_VOLTAGE_VCORNER_SVS2}, {"dcvs", DCVS_VOLTAGE_CORNER_DISABLE}};
   for (auto& t : T) if (n == t.n) { optPowerCorner = n; gCornerVal = t.v; gCornerDcvs = n == "dcvs"; return true; } return false; }
+
+// ---------------- NPUPWR: live power settings (main thread only: the control file is read, and the vote sent, between two executes)
+static const struct { const char* n; uint32_t v; } kCorner[] = {{"max", DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER}, {"turbo_plus", DCVS_VOLTAGE_VCORNER_TURBO_PLUS},
+  {"turbo", DCVS_VOLTAGE_VCORNER_TURBO}, {"nom_plus", DCVS_VOLTAGE_VCORNER_NOM_PLUS}, {"nom", DCVS_VOLTAGE_VCORNER_NOM}, {"svs_plus", DCVS_VOLTAGE_VCORNER_SVS_PLUS},
+  {"svs", DCVS_VOLTAGE_VCORNER_SVS}, {"svs2", DCVS_VOLTAGE_VCORNER_SVS2}, {"dcvs", DCVS_VOLTAGE_CORNER_DISABLE}};
+// HMX_V2 takes the "expanded" corners (QnnHtpPerfInfrastructure_ExpVoltageCorner_t). The --power-corner names map to them as HAP does
+// (svs2 = LOW_SVS, svs_plus = SVS_L1, nom_plus = NOM_L1, turbo_plus = TUR_L1); the expanded names themselves are accepted too.
+static const struct { const char* n; uint32_t v; } kExpCorner[] = {{"max", DCVS_EXP_VCORNER_MAX}, {"turbo_plus", DCVS_EXP_VCORNER_TUR_L1}, {"turbo", DCVS_EXP_VCORNER_TUR},
+  {"nom_plus", DCVS_EXP_VCORNER_NOM_L1}, {"nom", DCVS_EXP_VCORNER_NOM}, {"svs_plus", DCVS_EXP_VCORNER_SVS_L1}, {"svs", DCVS_EXP_VCORNER_SVS}, {"svs2", DCVS_EXP_VCORNER_LOW_SVS},
+  {"min", DCVS_EXP_VCORNER_MIN}, {"low_svs_d2", DCVS_EXP_VCORNER_LOW_SVS_D2}, {"low_svs_d1", DCVS_EXP_VCORNER_LOW_SVS_D1}, {"low_svs", DCVS_EXP_VCORNER_LOW_SVS},
+  {"low_svs_l0", DCVS_EXP_VCORNER_LOW_SVS_L0}, {"svs_l0", DCVS_EXP_VCORNER_SVS_L0}, {"svs_l1", DCVS_EXP_VCORNER_SVS_L1}, {"svs_l2", DCVS_EXP_VCORNER_SVS_L2},
+  {"nom_l1", DCVS_EXP_VCORNER_NOM_L1}, {"nom_l2", DCVS_EXP_VCORNER_NOM_L2}, {"tur", DCVS_EXP_VCORNER_TUR}, {"tur_l1", DCVS_EXP_VCORNER_TUR_L1},
+  {"tur_l2", DCVS_EXP_VCORNER_TUR_L2}, {"tur_l3", DCVS_EXP_VCORNER_TUR_L3}};
+static const struct { const char* n; uint32_t v; } kMode[] = {{"perf", QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE}, {"duty", QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_DUTY_CYCLE_MODE},
+  {"updown", QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_ADJUST_UP_DOWN}, {"uponly", QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_ADJUST_ONLY_UP},
+  {"saver", QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_MODE}, {"saver_aggr", QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_AGGRESSIVE_MODE}};
+enum { HMX_OFF = -1, HMX_DEFAULT = -2 };   // off: no HMX_V2 config at all (package 15); default: hmxPickDefault 1 (HMX scales with the DCVS corner)
+struct PowerSet { uint32_t core, bus, coreMin, busMin; int sleep; uint32_t sleepLat; int dcvs; uint32_t mode; int hmx; int hmxLow;
+  int gov; uint32_t govMin; int govDown, govUp, govQ, govRails, govFloor; };   // R4 governor: on, lowest corner, margins (us), gap percentile, 0 core / 1 core+bus, floor us (0 = auto)
+static PowerSet gPS, gPS0; static bool gPSFile = false;   // gPS0 = the start values; gPSFile: gPS came from the control file
+static unsigned gPSGen = 0; static unsigned long gPSRc = 0; static bool gPSRcKnown = false; static bool gHmxVoted = false;
+static string optPowerLive = ""; static int optPowerStatsJobs = -1;   // package 16: no control file by default; statistics: -1 = 600 with a control file, else off
+static const char* cName(uint32_t v) { for (auto& t : kCorner) if (t.v == v) return t.n; return "?"; }
+static const char* eName(int v) { if (v == HMX_OFF) return "off"; if (v == HMX_DEFAULT) return "default"; for (auto& t : kExpCorner) if ((int)t.v == v) return t.n; return "?"; }
+static const char* mName(uint32_t v) { for (auto& t : kMode) if (t.v == v) return t.n; return "?"; }
+// R4 governor start values (env FSR4NPUD_POWER_GOV, _GOV_DOWN_US, _GOV_UP_US, _GOV_Q, _GOV_RAILS, _GOV_FLOOR_US, _GOV_MIN); the rules: "R4 governor" below
+static int optGov = 1, optGovDownUs = 500, optGovUpUs = 150, optGovQ = 25, optGovRails = 0, optGovFloorUs = 0; static uint32_t optGovMin = DCVS_VOLTAGE_VCORNER_SVS_PLUS;
+static PowerSet powerDefaults() {   // exactly the package-15 ON vote for the --power-corner value
+  PowerSet s; s.core = s.bus = s.coreMin = s.busMin = gCornerVal; s.sleep = 0; s.sleepLat = 40; s.dcvs = gCornerDcvs ? 1 : 0;
+  s.mode = gCornerDcvs ? QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_ADJUST_UP_DOWN : QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE; s.hmx = HMX_OFF; s.hmxLow = 0;
+  s.gov = (optGov && !gCornerDcvs) ? 1 : 0; s.govMin = optGovMin; s.govDown = optGovDownUs; s.govUp = optGovUpUs; s.govQ = optGovQ; s.govRails = optGovRails; s.govFloor = optGovFloorUs; return s; }
+static bool psEq(const PowerSet& a, const PowerSet& b) { return a.core == b.core && a.bus == b.bus && a.coreMin == b.coreMin && a.busMin == b.busMin && a.sleep == b.sleep
+  && a.sleepLat == b.sleepLat && a.dcvs == b.dcvs && a.mode == b.mode && a.hmx == b.hmx && a.hmxLow == b.hmxLow
+  && a.gov == b.gov && (!a.gov || (a.govMin == b.govMin && a.govDown == b.govDown && a.govUp == b.govUp && a.govQ == b.govQ && a.govRails == b.govRails && a.govFloor == b.govFloor)); }
+static string psDesc(const PowerSet& s) {
+  char b[480]; char cm[40] = "", bm[40] = "";
+  if (s.coreMin != s.core) snprintf(cm, sizeof cm, " (min %s 0x%X)", cName(s.coreMin), s.coreMin);
+  if (s.busMin != s.bus) snprintf(bm, sizeof bm, " (min %s 0x%X)", cName(s.busMin), s.busMin);
+  snprintf(b, sizeof b, "core %s 0x%X%s bus %s 0x%X%s sleep %d sleeplat %u dcvs %d mode %s hmx %s%s", cName(s.core), s.core, cm, cName(s.bus), s.bus, bm, s.sleep, s.sleepLat, s.dcvs,
+           mName(s.mode), eName(s.hmx), s.hmx >= 0 ? (s.hmxLow ? " hmxperf low" : " hmxperf high") : "");
+  if (s.gov) { size_t L = strlen(b); snprintf(b + L, sizeof b - L, " gov 1 (min %s down %d up %d q %d rails %s floor %d)", cName(s.govMin), s.govDown, s.govUp, s.govQ, s.govRails ? "both" : "core", s.govFloor); }
+  return b; }
+// Parses the control file text into o (missing keys = start values). Returns "" when valid, else the reason.
+static string psParse(const string& txt, PowerSet& o) {
+  PowerSet s = gPS0; bool seen[17] = {}; static const char* K[] = {"core", "bus", "coremin", "busmin", "sleep", "sleeplat", "dcvs", "mode", "hmx", "hmxperf",
+    "gov", "govmin", "govdown", "govup", "govq", "govrails", "govfloor"};
+  size_t i = 0, n = txt.size();
+  while (i < n) {
+    if (txt[i] == '#') { while (i < n && txt[i] != '\n') i++; continue; }
+    if (isspace((unsigned char)txt[i])) { i++; continue; }
+    size_t j = i; while (j < n && !isspace((unsigned char)txt[j]) && txt[j] != '#') j++;
+    string tok = txt.substr(i, j - i); i = j; size_t eq = tok.find('=');
+    if (eq == string::npos || eq == 0) return "token '" + tok.substr(0, 40) + "' is not key=value";
+    string k = tok.substr(0, eq), v = tok.substr(eq + 1); int ki = -1; for (int q = 0; q < 17; q++) if (k == K[q]) ki = q;
+    if (ki < 0) return "unknown key '" + k.substr(0, 40) + "'";
+    if (seen[ki]) return "key '" + k + "' given twice"; seen[ki] = true;
+    if (ki <= 3) { bool ok = false; uint32_t cv = 0; for (auto& t : kCorner) if (v == t.n) { ok = true; cv = t.v; } if (!ok) return k + "=" + v.substr(0, 40) + ": not a corner (max turbo_plus turbo nom_plus nom svs_plus svs svs2 dcvs)";
+      if (ki == 0) s.core = cv; else if (ki == 1) s.bus = cv; else if (ki == 2) s.coreMin = cv; else s.busMin = cv; }
+    else if (ki == 4 || ki == 6) { if (v != "0" && v != "1") return k + "=" + v.substr(0, 40) + ": must be 0 or 1"; (ki == 4 ? s.sleep : s.dcvs) = v[0] - '0'; }
+    else if (ki == 5) { if (v.empty() || v.size() > 5 || v.find_first_not_of("0123456789") != string::npos) return "sleeplat=" + v.substr(0, 40) + ": must be 1..65535 (us)";
+      unsigned long u = strtoul(v.c_str(), nullptr, 10); if (u < 1 || u > 65535) return "sleeplat=" + v + ": must be 1..65535 (us)"; s.sleepLat = (uint32_t)u; }
+    else if (ki == 7) { bool ok = false; for (auto& t : kMode) if (v == t.n) { ok = true; s.mode = t.v; } if (!ok) return "mode=" + v.substr(0, 40) + ": must be perf, duty, updown, uponly, saver or saver_aggr"; }
+    else if (ki == 8) { if (v == "off") s.hmx = HMX_OFF; else if (v == "default") s.hmx = HMX_DEFAULT;
+      else { bool ok = false; for (auto& t : kExpCorner) if (v == t.n) { ok = true; s.hmx = (int)t.v; } if (!ok) return "hmx=" + v.substr(0, 40) + ": not a corner name, default or off"; } }
+    else if (ki == 9) { if (v != "high" && v != "low") return "hmxperf=" + v.substr(0, 40) + ": must be high or low"; s.hmxLow = v == "low"; }
+    else if (ki == 10) { if (v != "0" && v != "1") return "gov=" + v.substr(0, 40) + ": must be 0 or 1"; s.gov = v[0] - '0'; }
+    else if (ki == 11) { bool ok = false; for (auto& t : kCorner) if (v == t.n && t.v >= DCVS_VOLTAGE_VCORNER_SVS_PLUS && t.v != DCVS_VOLTAGE_CORNER_DISABLE) { ok = true; s.govMin = t.v; }
+      if (!ok) return "govmin=" + v.substr(0, 40) + ": must be svs_plus, nom, nom_plus, turbo, turbo_plus or max (never below svs_plus)"; }
+    else if (ki == 15) { if (v != "core" && v != "both") return "govrails=" + v.substr(0, 40) + ": must be core or both"; s.govRails = v == "both"; }
+    else { if (v.empty() || v.size() > 5 || v.find_first_not_of("0123456789") != string::npos) return k + "=" + v.substr(0, 40) + ": must be a number";
+      const int u = atoi(v.c_str()); if (ki == 14) { if (u < 1 || u > 50) return "govq=" + v + ": must be 1..50"; s.govQ = u; }
+      else if (u > 50000) return k + "=" + v + ": must be 0..50000 (us)"; else if (ki == 12) s.govDown = u; else if (ki == 13) s.govUp = u; else s.govFloor = u; }
+  }
+  // follow-ups of the given keys: a min not given = its target; DCVS on when a rail has no corner vote (dcvs), unless dcvs= says so
+  const uint32_t DIS = DCVS_VOLTAGE_CORNER_DISABLE;
+  if (!seen[2]) s.coreMin = s.core; if (!seen[3]) s.busMin = s.bus;
+  if ((s.core == DIS) != (s.coreMin == DIS)) return "core and coremin: dcvs (no corner vote) must be on both or neither";
+  if ((s.bus == DIS) != (s.busMin == DIS)) return "bus and busmin: dcvs (no corner vote) must be on both or neither";
+  if (s.core != DIS && s.coreMin > s.core) return string("coremin ") + cName(s.coreMin) + " is above core " + cName(s.core);
+  if (s.bus != DIS && s.busMin > s.bus) return string("busmin ") + cName(s.busMin) + " is above bus " + cName(s.bus);
+  const bool anyDis = s.core == DIS || s.bus == DIS;
+  if (!seen[6]) s.dcvs = (anyDis || gPS0.dcvs) ? 1 : 0; else if (anyDis && !s.dcvs) return "dcvs=0 with a rail at dcvs (no corner vote): nothing would set its clock";
+  if (!seen[7]) s.mode = s.dcvs ? QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_ADJUST_UP_DOWN : QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+  if (seen[9] && s.hmx < 0) return "hmxperf needs hmx=<corner>";
+  if (s.gov && (s.core == DIS || s.dcvs)) { if (seen[10]) return "gov=1 needs a core corner and dcvs=0 (the governor pins the corner itself)"; s.gov = 0; }   // gov from the start values: off for such a file
+  o = s; return ""; }
+// ---------------- R4 governor (AUDIT/REPORT3 A1, AUDIT/REPORT4 part 2): the core corner follows the slack. Main thread only.
+// On by default (package 16); off with env FSR4NPUD_POWER_GOV=0 or the control-file key gov=0.
+// Signal: the idle gap of each job, gap(N) = kick(N+1) read - done(N) written, both on this daemon's clock (onKick / onRun).
+// In the layer's exact mode the GPU runs WAIT HTP(N) -> K2(N) -> pre(N+1) -> E1 -> kick(N+1), so
+//   gap = (GPU chain K2 + pre, the "floor") + (how long the result lay unused before the GPU asked for it, the "slack").
+// A gap at the floor = the GPU waited for the NPU (a lower corner makes the frame longer); a gap above it = free time.
+// The daemon cannot see the floor (it is GPU time), so it learns it:
+//   - any gap ever seen is an upper bound (ring of the last 20 windows' p10: "low gap");
+//   - a step whose exec change shows up in the kick period (down: period grows, up: period shrinks) proves a stall; the gap of
+//     the stalled window IS the floor ("learned", kept 120 s);
+//   - until then a prior: FSR4NPUD_POWER_GOV_FLOOR_PCT (40) % of the exec time at the top corner, or govfloor=<us>.
+// Rules per window (>= 20 jobs and >= 500 ms): slack = gap p<govq> - floor.
+//   down one corner: slack - predicted exec growth >= govdown us in 4 windows in a row; the window after the step is checked:
+//                    kick period grew by more than max(0.3 ms, half the exec growth) -> back up at once, floor learned, hold-off doubles (2..60 s);
+//   up one corner:   floor learned and slack < govup us; or floor not learned and the gap sits at its recent minimum below the
+//                    level last seen without a stall -> an "up probe" (period shrinks = it was a stall; else come back down later).
+// Limits: never below svs_plus (govmin=), never above the start corner (--power-corner, the package default) or the file's core=.
+// One client only (two clients, a pause > 2 s or a new client: top corner, start again). One "power_gov STEP" line per step.
+static int optGovLog = 0, optGovFloorPct = 40, optGovWinJobs = 20, optGovWinMs = 500, optGovDownWins = 4;   // the other governor options are defined above powerDefaults()
+static const uint32_t kGovLadder[] = {DCVS_VOLTAGE_VCORNER_SVS_PLUS, DCVS_VOLTAGE_VCORNER_NOM, DCVS_VOLTAGE_VCORNER_NOM_PLUS, DCVS_VOLTAGE_VCORNER_TURBO,
+  DCVS_VOLTAGE_VCORNER_TURBO_PLUS, DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER};
+enum { GOV_NL = 6, GOV_RING = 20 };
+// exec time at ladder[i-1] / exec time at ladder[i]: a guess used only until corner i-1 was visited (then the measured time).
+// Measured on RP6 with core = bus: max -> turbo 1.08, turbo -> nom 1.11..1.19 (TRIED 2026-11-23); nom -> svs_plus is not measured.
+static const double kGovRatio[GOV_NL] = {0, 1.20, 1.06, 1.06, 1.04, 1.04};
+static int govIdx(uint32_t corner) { for (int i = 0; i < GOV_NL; i++) if (kGovLadder[i] == corner) return i; return -1; }
+struct Gov {
+  bool active = false; int lo = 0, hi = 0, k = 0, client = -1, skip = 0, okWins = 0, lowN = 0, lowI = 0; double lastKick = 0, lastDone = 0, winT0 = 0;
+  vector<double> vG, vP, vH; double H[GOV_NL] = {}, Ht[GOV_NL] = {}, low[GOV_RING] = {};
+  double floorEx = 0, floorExT = -1e18;                       // the floor learned at a proven stall
+  double verG[GOV_NL] = {}, verT[GOV_NL] = {};                 // per corner: a gap level (window p10) seen without a stall (and when)
+  double holdUntil = 0, backoffMs = 2000, lastUpT = -1e18;    // after a failed step down
+  double upProbeAt = 0, upBackoffMs = 4000;                   // after an up probe that found no stall
+  int probe = 0; double pP = 0, pPm = 0, pH = 0, pG = 0, pGlo = 0;               // -1 / +1: the last step is checked in the next window against these
+  unsigned nStep = 0, nWin = 0; };
+static Gov gGov;
+static void govReset() {   // new settings, a new ON vote, a new client: top corner, nothing learned
+  Gov n; n.nStep = gGov.nStep; n.nWin = gGov.nWin; gGov = n;
+  if (!gPS.gov || gPS.core == DCVS_VOLTAGE_CORNER_DISABLE) return;
+  const uint32_t top = (gPS0.core != DCVS_VOLTAGE_CORNER_DISABLE && gPS0.core < gPS.core) ? gPS0.core : gPS.core;   // never above the start corner
+  gGov.hi = govIdx(top); if (gGov.hi < 0) return;   // the top is below svs_plus: nothing to steer
+  gGov.lo = govIdx(gPS.govMin); if (gGov.lo < 0) gGov.lo = 0; if (gGov.lo > gGov.hi) gGov.lo = gGov.hi;
+  gGov.active = true; gGov.k = gGov.hi; }
+// The vote actually sent: the control-file settings, with the core corner (rails both: and a higher bus corner) replaced by the governor's.
+static PowerSet psEff() {
+  PowerSet e = gPS; if (!gGov.active) return e;
+  e.core = e.coreMin = kGovLadder[gGov.k];
+  if (gPS.govRails && e.bus != DCVS_VOLTAGE_CORNER_DISABLE && e.bus > e.core) { e.bus = e.core; if (e.busMin > e.bus) e.busMin = e.bus; }
+  return e; }
+static void govLogCfg(const char* src);
+// stub backend only: the stub's execute delay scales with the effective core corner, so the governor can be tested off-device.
+// FSR4NPUD_STUB_CORNER_PCT="turbo=100,nom_plus=106,..." replaces entries of the table (percent of --stub-delay-us).
+static int gStubPct[GOV_NL + 2] = {135, 112, 106, 100, 96, 92, 160, 200};   // ladder order, then svs, svs2
+static int stubCornerPct() { const uint32_t c = psEff().core; const int i = govIdx(c); if (i >= 0) return gStubPct[i];
+  return c == DCVS_VOLTAGE_VCORNER_SVS ? gStubPct[GOV_NL] : c == DCVS_VOLTAGE_VCORNER_SVS2 ? gStubPct[GOV_NL + 1] : 100; }
+// ---------------- NPUPWR: per-window execute statistics with the settings they ran under
+static vector<double> gWinEx, gWinSvc; static double gWinT0 = 0; static unsigned gWinN = 0;
+static double wall_s() { timespec t; clock_gettime(CLOCK_REALTIME, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+static void winFlush(const char* why) {
+  if (gWinEx.empty()) { gWinT0 = now_ms(); return; }
+  vector<double> e = gWinEx, v = gWinSvc; sort(e.begin(), e.end()); sort(v.begin(), v.end()); double sum = 0; for (double x : e) sum += x; const double dur = (now_ms() - gWinT0) / 1e3;
+  char rc[32]; if (gPSRcKnown) snprintf(rc, sizeof rc, "0x%lx", gPSRc); else snprintf(rc, sizeof rc, "n/a");
+  logf("power_win %u gen %u jobs %zu over %.2f s (%.1f /s) exec mean %.3f p50 %.3f p90 %.3f max %.3f ms service p50 %.3f p90 %.3f ms | %s | %s rc %s | end %s | wall %.3f",
+       ++gWinN, gPSGen, e.size(), dur, dur > 0 ? e.size() / dur : 0.0, sum / e.size(), e[e.size() / 2], e[e.size() * 9 / 10], e.back(), v.empty() ? 0.0 : v[v.size() / 2], v.empty() ? 0.0 : v[v.size() * 9 / 10],
+       psDesc(psEff()).c_str(), gPSFile ? "file" : "start values", rc, why, wall_s());
+  gWinEx.clear(); gWinSvc.clear(); gWinT0 = now_ms(); }
+static void winAdd(double ex, double svc) {
+  if (optPowerStatsJobs <= 0) return; if (gWinEx.empty() && gWinT0 == 0) gWinT0 = now_ms();
+  gWinEx.push_back(ex); gWinSvc.push_back(svc); if ((int)gWinEx.size() >= optPowerStatsJobs) winFlush("window full"); }
 static std::atomic<double> gExecStart{0}; static std::atomic<int> gExecSock{-1}, gExecDone{-1}; static std::atomic<uint64_t> gExecSeq{0};
 
 // ---------------- graphs (both backends)
@@ -202,27 +370,196 @@ static bool parseGraph(const Graph* g, Parsed& o) {
 }
 static void parsedFree(Parsed& o) { if (o.sc) S.systemContextFree(o.sc); o.sc = nullptr; vector<uint8_t>().swap(o.bin); }
 
+// The ON vote from gPS (NPUPWR). With the start values (no control file) the DCVS_V3 struct is field for field the package-15 one.
+// Caller holds gQnnMu.
+static Qnn_ErrorHandle_t powerSendOn() {
+  QnnHtpPerfInfrastructure_PowerConfig_t d; memset(&d, 0, sizeof d); d.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3; auto& v = d.dcvsV3Config;
+  const PowerSet E = psEff();   // R4 governor: gPS with the governor's core corner; governor off: E = gPS
+  v.contextId = gPcid; v.setDcvsEnable = 1; v.setSleepLatency = 1; v.setSleepDisable = 1; v.setBusParams = 1; v.setCoreParams = 1;
+  v.dcvsEnable = E.dcvs ? 1 : 0; v.powerMode = (QnnHtpPerfInfrastructure_PowerMode_t)E.mode;
+  v.sleepLatency = E.sleepLat; v.sleepDisable = E.sleep ? 0 : 1;   // start values: latency 40, sleep disabled (packages <= 15)
+  v.busVoltageCornerMin = (QnnHtpPerfInfrastructure_VoltageCorner_t)E.busMin; v.busVoltageCornerTarget = v.busVoltageCornerMax = (QnnHtpPerfInfrastructure_VoltageCorner_t)E.bus;
+  v.coreVoltageCornerMin = (QnnHtpPerfInfrastructure_VoltageCorner_t)E.coreMin; v.coreVoltageCornerTarget = v.coreVoltageCornerMax = (QnnHtpPerfInfrastructure_VoltageCorner_t)E.core;
+  const QnnHtpPerfInfrastructure_PowerConfig_t* c1[] = {&d, nullptr}; return gPerf->setPowerConfig(gPcid, c1); }
+// HMX_V2 in its own call after the DCVS_V3 one, so a refusal (the docs: v75 and later only; SM8550 is v73) never touches the main vote.
+// hmx=off after an explicit vote sends hmxPickDefault 1 (the docs: the client must revert it itself). Caller holds gQnnMu. Returns rc, or 0 if nothing sent.
+static Qnn_ErrorHandle_t powerSendHmx(bool forceDefault, bool* sent) {
+  *sent = false; const bool pickDefault = forceDefault || gPS.hmx == HMX_DEFAULT || gPS.hmx == HMX_OFF;
+  if (pickDefault && !gHmxVoted && (forceDefault || gPS.hmx == HMX_OFF)) return QNN_SUCCESS;   // nothing explicit to undo
+  QnnHtpPerfInfrastructure_PowerConfig_t h; memset(&h, 0, sizeof h); h.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_HMX_V2; auto& x = h.hmxV2Config;
+  x.hmxPickDefault = pickDefault ? 1 : 0; x.hmxPerfMode = gPS.hmxLow && !pickDefault ? QNN_HTP_PERF_INFRASTRUCTURE_CLK_PERF_LOW : QNN_HTP_PERF_INFRASTRUCTURE_CLK_PERF_HIGH;
+  const QnnHtpPerfInfrastructure_ExpVoltageCorner_t ec = pickDefault ? DCVS_EXP_VCORNER_DISABLE : (QnnHtpPerfInfrastructure_ExpVoltageCorner_t)gPS.hmx;
+  x.hmxVoltageCornerMin = x.hmxVoltageCornerTarget = x.hmxVoltageCornerMax = ec;
+  const QnnHtpPerfInfrastructure_PowerConfig_t* c1[] = {&h, nullptr}; Qnn_ErrorHandle_t e = gPerf->setPowerConfig(gPcid, c1); *sent = true;
+  if (e == QNN_SUCCESS) gHmxVoted = !pickDefault; return e; }
 static void powerVote(bool on, const char* why) {
   if (!gPerf || on == gVoted) return;
   std::lock_guard<std::mutex> ql(gQnnMu);
-  QnnHtpPerfInfrastructure_PowerConfig_t d; memset(&d, 0, sizeof d); d.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3; auto& v = d.dcvsV3Config;
-  v.contextId = gPcid; v.setDcvsEnable = 1; v.setSleepLatency = 1; v.setSleepDisable = 1; v.setBusParams = 1; v.setCoreParams = 1;
-  if (on) { v.dcvsEnable = gCornerDcvs ? 1 : 0; v.powerMode = gCornerDcvs ? QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_ADJUST_UP_DOWN : QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
-    v.sleepLatency = 40; v.sleepDisable = 1;   // performance settings of packages <= 14 (max); the other corners change only the corner
-    const QnnHtpPerfInfrastructure_VoltageCorner_t vc = (QnnHtpPerfInfrastructure_VoltageCorner_t)gCornerVal;
-    v.busVoltageCornerMin = v.busVoltageCornerTarget = v.busVoltageCornerMax = vc;
-    v.coreVoltageCornerMin = v.coreVoltageCornerTarget = v.coreVoltageCornerMax = vc; }
-  else { v.dcvsEnable = 1; v.powerMode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_MODE; v.sleepLatency = 1000; v.sleepDisable = 0;   // no corner vote: DSP DCVS decides
+  Qnn_ErrorHandle_t e, eh = QNN_SUCCESS; bool hs = false;
+  if (on) { govReset(); e = powerSendOn(); if (e == QNN_SUCCESS) eh = powerSendHmx(false, &hs); gPSRc = (unsigned long)(e != QNN_SUCCESS ? e : eh); gPSRcKnown = true; }
+  else {
+    if (gHmxVoted) eh = powerSendHmx(true, &hs);   // back to the default HMX vote while the HVX vote still stands
+    QnnHtpPerfInfrastructure_PowerConfig_t d; memset(&d, 0, sizeof d); d.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3; auto& v = d.dcvsV3Config;
+    v.contextId = gPcid; v.setDcvsEnable = 1; v.setSleepLatency = 1; v.setSleepDisable = 1; v.setBusParams = 1; v.setCoreParams = 1;
+    v.dcvsEnable = 1; v.powerMode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_POWER_SAVER_MODE; v.sleepLatency = 1000; v.sleepDisable = 0;   // no corner vote: DSP DCVS decides
     v.busVoltageCornerMin = v.busVoltageCornerTarget = v.busVoltageCornerMax = DCVS_VOLTAGE_CORNER_DISABLE;
-    v.coreVoltageCornerMin = v.coreVoltageCornerTarget = v.coreVoltageCornerMax = DCVS_VOLTAGE_CORNER_DISABLE; }
-  const QnnHtpPerfInfrastructure_PowerConfig_t* c1[] = {&d, nullptr}; Qnn_ErrorHandle_t e = gPerf->setPowerConfig(gPcid, c1);
-  if (e != QNN_SUCCESS && !on) {   // release refused: drop the whole vote client instead
-    Qnn_ErrorHandle_t e2 = gPerf->destroyPowerConfigId(gPcid); uint32_t np = 0; Qnn_ErrorHandle_t e3 = gPerf->createPowerConfigId(0, 0, &np); if (e3 == QNN_SUCCESS) gPcid = np;
-    logf("power_vote release rc 0x%lx -> destroyPowerConfigId rc 0x%lx, new id rc 0x%lx", (unsigned long)e, (unsigned long)e2, (unsigned long)e3); e = e2; }
+    v.coreVoltageCornerMin = v.coreVoltageCornerTarget = v.coreVoltageCornerMax = DCVS_VOLTAGE_CORNER_DISABLE;
+    const QnnHtpPerfInfrastructure_PowerConfig_t* c1[] = {&d, nullptr}; e = gPerf->setPowerConfig(gPcid, c1);
+    if (e != QNN_SUCCESS) {   // release refused: drop the whole vote client instead
+      Qnn_ErrorHandle_t e2 = gPerf->destroyPowerConfigId(gPcid); uint32_t np = 0; Qnn_ErrorHandle_t e3 = gPerf->createPowerConfigId(0, 0, &np); if (e3 == QNN_SUCCESS) gPcid = np;
+      logf("power_vote release rc 0x%lx -> destroyPowerConfigId rc 0x%lx, new id rc 0x%lx", (unsigned long)e, (unsigned long)e2, (unsigned long)e3); e = e2; gHmxVoted = false; } }
   if (e == QNN_SUCCESS) gVoted = on;
-  char onTxt[128]; if (gCornerDcvs) snprintf(onTxt, sizeof onTxt, "ON corner dcvs (no corner vote 0x%x), DCVS on, adjust up-down, sleep disabled", gCornerVal);
-  else snprintf(onTxt, sizeof onTxt, "ON corner %s 0x%X, DCVS off, sleep disabled", optPowerCorner.c_str(), gCornerVal);
-  logf("power_vote %s (%s) rc 0x%lx", on ? onTxt : "OFF released (DCVS on, power saver, sleep allowed)", why, (unsigned long)e); }
+  char hx[48] = ""; if (hs) snprintf(hx, sizeof hx, ", hmx %s rc 0x%lx", on ? eName(gPS.hmx) : "default", (unsigned long)eh);
+  if (on && !gPSFile && psEq(gPS, gPS0)) {   // start values: the package-15 line, word for word
+    char onTxt[128]; if (gCornerDcvs) snprintf(onTxt, sizeof onTxt, "ON corner dcvs (no corner vote 0x%x), DCVS on, adjust up-down, sleep disabled", gCornerVal);
+    else snprintf(onTxt, sizeof onTxt, "ON corner %s 0x%X, DCVS off, sleep disabled", optPowerCorner.c_str(), gCornerVal);
+    logf("power_vote %s (%s) rc 0x%lx", onTxt, why, (unsigned long)e); }
+  else if (on) logf("power_vote ON %s (control file, gen %u) (%s) rc 0x%lx%s", psDesc(gPS).c_str(), gPSGen, why, (unsigned long)e, hx);
+  else logf("power_vote %s (%s) rc 0x%lx%s", "OFF released (DCVS on, power saver, sleep allowed)", why, (unsigned long)e, hx); }
+// NPUPWR: new settings from the control file (or the start values when it went away): re-sent at once while voted ON.
+static void powerLiveApply(const PowerSet& n, bool fromFile, const char* src) {
+  winFlush("settings change");   // the window so far ran with the old settings
+  gPS = n; gPSFile = fromFile; gPSGen++; govReset();
+  if (isQnn && gPerf && gVoted) {
+    Qnn_ErrorHandle_t e, eh = QNN_SUCCESS; bool hs = false; double t0 = now_ms();
+    { std::lock_guard<std::mutex> ql(gQnnMu); e = powerSendOn(); if (e == QNN_SUCCESS) eh = powerSendHmx(false, &hs); }
+    gPSRc = (unsigned long)(e != QNN_SUCCESS ? e : eh); gPSRcKnown = true;
+    char hx[48] = ""; if (hs) snprintf(hx, sizeof hx, " hmx rc 0x%lx", (unsigned long)eh);
+    logf("power_vote LIVE %s gen %u (%s) rc 0x%lx%s, %.2f ms | wall %.3f", psDesc(gPS).c_str(), gPSGen, src, (unsigned long)e, hx, now_ms() - t0, wall_s()); }
+  else { gPSRcKnown = false;
+    logf("power_vote LIVE %s gen %u (%s) rc n/a: %s | wall %.3f", psDesc(gPS).c_str(), gPSGen, src,
+         !isQnn ? "stub backend, no QNN power infrastructure: not sent" : !gPerf ? "no HTP perf infrastructure: not sent" : "no client (not voted): sent with the next ON vote", wall_s()); }
+  govLogCfg(src); }
+// NPUPWR: the control file. A cheap lstat() at most every 200 ms; it is read only when inode, size, mtime or ctime changed.
+static double gLiveNext = 0; static bool gLiveHad = false; static struct { ino_t ino; off_t size; long ms, mns, cs, cns; bool any; } gLiveSig{};
+static void powerLiveCheck(bool force) {
+  if (optPowerLive.empty()) return; const double tn = now_ms(); if (!force && tn < gLiveNext) return; gLiveNext = tn + 200;
+  struct stat st; if (lstat(optPowerLive.c_str(), &st) != 0) {
+    if (gLiveSig.any || force) { gLiveSig = {}; if (gLiveHad) { gLiveHad = false; if (gPSFile || !psEq(gPS, gPS0)) powerLiveApply(gPS0, false, "control file gone: start values"); }
+      else if (force) logf("power_live: control file %s absent: start values (%s)", optPowerLive.c_str(), psDesc(gPS0).c_str()); }
+    return; }
+  if (gLiveSig.any && gLiveSig.ino == st.st_ino && gLiveSig.size == st.st_size && gLiveSig.ms == st.st_mtim.tv_sec && gLiveSig.mns == st.st_mtim.tv_nsec
+      && gLiveSig.cs == st.st_ctim.tv_sec && gLiveSig.cns == st.st_ctim.tv_nsec) return;
+  gLiveSig.ino = st.st_ino; gLiveSig.size = st.st_size; gLiveSig.ms = st.st_mtim.tv_sec; gLiveSig.mns = st.st_mtim.tv_nsec; gLiveSig.cs = st.st_ctim.tv_sec; gLiveSig.cns = st.st_ctim.tv_nsec; gLiveSig.any = true;
+  string why;
+  if (!S_ISREG(st.st_mode)) why = "not a regular file (a symlink or other is refused)";
+  else if (st.st_uid != getuid() && st.st_uid != 0) why = "owner uid " + to_string((unsigned)st.st_uid) + " is neither the daemon's uid " + to_string((unsigned)getuid()) + " nor root";
+  else if (st.st_size > 4096) why = "larger than 4096 bytes";
+  string txt;
+  if (why.empty()) { int fd = open(optPowerLive.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW); if (fd < 0) why = string("open: ") + strerror(errno);
+    else { char b[4097]; ssize_t r = read(fd, b, 4096); close(fd); if (r < 0) why = string("read: ") + strerror(errno); else txt.assign(b, (size_t)r); } }
+  PowerSet n; if (why.empty()) { why = psParse(txt, n); for (char& ch : why) if (ch == '\n' || ch == '\r') ch = ' '; }
+  if (!why.empty()) { logf("power_live BAD %s: %s; ignored, settings kept: %s gen %u", optPowerLive.c_str(), why.c_str(), psDesc(gPS).c_str(), gPSGen); return; }
+  gLiveHad = true;
+  if (psEq(n, gPS) && gPSFile) { logf("power_live: %s re-read, same settings (gen %u)", optPowerLive.c_str(), gPSGen); return; }
+  if (psEq(n, gPS)) { gPSFile = true; logf("power_live: %s read, same as the current settings (%s), nothing sent (gen %u)", optPowerLive.c_str(), psDesc(gPS).c_str(), gPSGen); return; }
+  powerLiveApply(n, true, "control file"); }
+// ---------------- R4 governor: the rules (see the comment at struct Gov)
+static double govPct(vector<double> v, int q) { sort(v.begin(), v.end()); size_t i = v.size() * (size_t)q / 100; if (i >= v.size()) i = v.size() - 1; return v[i]; }
+static void govLogCfg(const char* src) {
+  static int was = -1;
+  if (gPS.gov && !gGov.active) { logf("power_gov OFF (%s): gov=1 but the core corner %s has no corner vote or is below svs_plus: nothing to steer", src, cName(gPS.core)); was = 0; return; }
+  if (!gGov.active) { if (was == 1) logf("power_gov OFF (%s): core back to %s 0x%X", src, cName(gPS.core), gPS.core); was = 0; return; }
+  char fl[64]; if (gPS.govFloor > 0) snprintf(fl, sizeof fl, "%d us (govfloor)", gPS.govFloor); else snprintf(fl, sizeof fl, "%d %% of the exec time at the top", optGovFloorPct);
+  logf("power_gov ON (%s): core between %s 0x%X and %s 0x%X, start at the top, rails %s | window >= %d jobs and >= %d ms | down: slack - predicted step >= %d us in %d windows, "
+       "checked by the kick period | up: slack < %d us or an up probe | slack = gap p%d - floor; gap = kick(N+1) - done(N); floor: learned at a stall, else min(low gap, prior %s)",
+       src, cName(kGovLadder[gGov.lo]), kGovLadder[gGov.lo], cName(kGovLadder[gGov.hi]), kGovLadder[gGov.hi], gPS.govRails ? "core+bus" : "core",
+       optGovWinJobs, optGovWinMs, gPS.govDown, optGovDownWins, gPS.govUp, gPS.govQ, fl);
+  was = 1; }
+static void govClearWin() { gGov.vG.clear(); gGov.vP.clear(); gGov.vH.clear(); gGov.okWins = 0; }
+// One step. Sends the vote (qnn, voted), one log line. A refused vote keeps the old corner and stops down steps for 60 s.
+static bool govApply(int nk, const char* why) {
+  Gov& g = gGov; const int ok_ = g.k; const uint32_t from = kGovLadder[g.k], to = kGovLadder[nk]; const char* dir = nk > g.k ? "up" : "down";
+  winFlush("governor step");   // the power_win so far ran at the old corner
+  g.k = nk; char rc[96]; bool ok = true;
+  if (isQnn && gPerf && gVoted) { double t0 = now_ms(); Qnn_ErrorHandle_t e; { std::lock_guard<std::mutex> ql(gQnnMu); e = powerSendOn(); }
+    gPSRc = (unsigned long)e; gPSRcKnown = true; ok = e == QNN_SUCCESS; snprintf(rc, sizeof rc, "rc 0x%lx, %.2f ms%s", (unsigned long)e, now_ms() - t0, ok ? "" : " REFUSED: corner kept, no down steps for 60 s"); }
+  else snprintf(rc, sizeof rc, "rc n/a: %s", !isQnn ? "stub backend, not sent" : !gPerf ? "no HTP perf infrastructure" : "not voted, sent with the next ON vote");
+  logf("power_gov STEP %u %s core %s 0x%X -> %s 0x%X%s | %s | %s | wall %.3f", ++g.nStep, dir, cName(from), from, cName(to), to, gPS.govRails ? " (bus follows)" : "", why, rc, wall_s());
+  if (!ok) { g.k = ok_; g.holdUntil = now_ms() + 60000; g.probe = 0; }
+  govClearWin(); g.skip = 2;   // the two jobs around the vote change are not measured
+  return ok; }
+static void govWindow(double now) {
+  Gov& g = gGov; g.nWin++;
+  double Pm = 0; for (double x : g.vP) Pm += x; Pm /= g.vP.size();
+  const double P50 = govPct(g.vP, 50), H50 = govPct(g.vH, 50), G50 = govPct(g.vG, 50), Gq = govPct(g.vG, gPS.govQ), G10 = govPct(g.vG, 10); const size_t n = g.vG.size();
+  g.vG.clear(); g.vP.clear(); g.vH.clear();
+  g.H[g.k] = g.H[g.k] > 0 ? 0.5 * g.H[g.k] + 0.5 * H50 : H50; g.Ht[g.k] = now;
+  g.low[g.lowI] = G10; g.lowI = (g.lowI + 1) % GOV_RING; if (g.lowN < GOV_RING) g.lowN++;
+  double lowG = 1e18; for (int i = 0; i < g.lowN; i++) lowG = min(lowG, g.low[i]);
+  const double up = gPS.govUp / 1000.0, down = gPS.govDown / 1000.0; char why[400];
+  // 1. the check of the last step: did the kick period follow the exec time?
+  if (g.probe) { const int dir = g.probe; g.probe = 0; const double dH = (H50 - g.pH) * -dir, dP = (P50 - g.pP) * -dir, dPm = (Pm - g.pPm) * -dir;   // all > 0 when the period followed
+    // median: an uncapped game; mean: a capped game shows a stall as dropped frames, the median stays
+    const double spread = dir < 0 ? G50 - G10 : g.pG - g.pGlo;   // of the window that would be the stalled one
+    const bool tight = spread <= max(0.25, 0.5 * max(dP, 0.0));
+    const bool stall = dH > 0.05 && tight && (dP > max(0.3, 0.5 * dH) || dPm > max(0.6, dH));
+    if (dir < 0 && stall) {   // the step down made the frame longer: this window sits at the floor
+      // uncapped game: the period grew by no more than the exec time and this window's gap is the floor. A frame limiter turns the
+      // stall into dropped frames (the period jumps by a whole frame): then the floor lies within one step below the gap before the step.
+      g.floorEx = dP <= 1.2 * dH ? min(G50, g.pG) : g.pG - 0.5 * dH; g.floorExT = now; g.backoffMs = now - g.lastUpT < 60000 ? min(g.backoffMs * 2, 60000.0) : 2000; g.lastUpT = now; g.holdUntil = now + g.backoffMs;
+      snprintf(why, sizeof why, "step down undone: kick period p50 %.2f -> %.2f (mean %.2f -> %.2f) ms with exec %.2f -> %.2f ms; floor learned %.2f ms; next try in %.0f s", g.pP, P50, g.pPm, Pm, g.pH, H50, g.floorEx, g.backoffMs / 1e3);
+      govApply(g.k + 1, why); return; }
+    if (dir < 0) { g.verG[g.k] = G10; g.verT[g.k] = now; }   // accepted: this gap level is free of a stall
+    if (dir > 0 && stall) { g.floorEx = g.pG; g.floorExT = now; g.upBackoffMs = 4000; }   // the lower corner was a stall: its gap was the floor
+    if (dir > 0 && !stall) { if (g.k > 0) { g.verG[g.k - 1] = g.pGlo; g.verT[g.k - 1] = now; } g.upProbeAt = now + g.upBackoffMs; g.upBackoffMs = min(g.upBackoffMs * 2, 64000.0); } }
+  // 2. the floor and the slack
+  const bool learned = now - g.floorExT < 120000; const double Htop = g.H[g.hi] > 0 ? g.H[g.hi] : H50;
+  double fl = learned ? g.floorEx : gPS.govFloor > 0 ? gPS.govFloor / 1000.0 : optGovFloorPct / 100.0 * Htop; const char* src = learned ? "learned" : gPS.govFloor > 0 ? "govfloor" : "prior";
+  if (lowG < fl) { fl = lowG; src = "low gap"; if (learned) g.floorEx = lowG; }
+  const double S = Gq - fl;
+  double dHp = 0; if (g.k > g.lo) dHp = (g.H[g.k - 1] > 0 && now - g.Ht[g.k - 1] < 120000) ? max(0.0, g.H[g.k - 1] - H50) : H50 * (kGovRatio[g.k] - 1);
+  if (optGovLog) logf("power_gov win %u core %s jobs %zu | period p50 %.2f mean %.2f exec p50 %.2f gap p50 %.2f p%d %.2f p10 %.2f low %.2f ms | floor %.2f (%s) slack %.2f next step +%.2f ms | ok %d",
+                      g.nWin, cName(kGovLadder[g.k]), n, P50, Pm, H50, G50, gPS.govQ, Gq, G10, lowG, fl, src, S, dHp, g.okWins);
+  // 3. up
+  if (g.k < g.hi) {
+    if (learned && S < up) { snprintf(why, sizeof why, "slack %.2f ms < %.2f (gap p%d %.2f - floor %.2f %s); period p50 %.2f exec p50 %.2f ms", S, up, gPS.govQ, Gq, fl, src, P50, H50);
+      govApply(g.k + 1, why); return; }
+    const bool seenFree = g.verT[g.k] > 0 && now - g.verT[g.k] < 30000 && Gq >= g.verG[g.k] - 0.2;   // this gap level was free of a stall not long ago
+    if (!learned && Gq - lowG < up && !seenFree && now >= g.upProbeAt) {
+      snprintf(why, sizeof why, "up probe: gap p%d %.2f ms at its low %.2f, floor not known; period p50 %.2f exec p50 %.2f ms", gPS.govQ, Gq, lowG, P50, H50);
+      g.pP = P50; g.pPm = Pm; g.pH = H50; g.pG = G50; g.pGlo = G10; if (govApply(g.k + 1, why)) g.probe = 1; return; } }
+  // 4. down
+  if (g.k > g.lo && now >= g.holdUntil && S - dHp >= down) {
+    if (++g.okWins >= optGovDownWins) {
+      snprintf(why, sizeof why, "slack %.2f ms (gap p%d %.2f - floor %.2f %s) - step %.2f >= %.2f in %d windows; period p50 %.2f exec p50 %.2f ms", S, gPS.govQ, Gq, fl, src, dHp, down, optGovDownWins, P50, H50);
+      g.pP = P50; g.pPm = Pm; g.pH = H50; g.pG = G50; g.pGlo = G10; if (govApply(g.k - 1, why)) g.probe = -1; } }
+  else g.okWins = 0; }
+// A job that is not part of a frame chain (RUN message): the governor goes back to the top and forgets its window.
+static void govNotChain() {
+  Gov& g = gGov; if (!g.active) return; g.client = -1; govClearWin(); g.probe = 0; g.lowN = g.lowI = 0; g.floorExT = -1e18;
+  if (g.k != g.hi) govApply(g.hi, "a RUN message (not a frame chain): top corner"); }
+// Called after every good execute of the eventfd path: tKick = when the daemon read the kick, tDone = after the done was written.
+static void govJob(int clientId, int nClients, double tKick, double tDone, double exMs) {
+  Gov& g = gGov; if (!g.active) return;
+  if (nClients != 1 || clientId != g.client) {   // not one game's frame chain: top corner, start again
+    const bool had = g.client >= 0; g.client = clientId; g.lastKick = tKick; g.lastDone = tDone; govClearWin(); g.probe = 0; g.lowN = g.lowI = 0; g.floorExT = -1e18;
+    if (g.k != g.hi) govApply(g.hi, had ? "another client or two clients at once: top corner" : "first client: top corner"); return; }
+  const double P = tKick - g.lastKick, G = tKick - g.lastDone; g.lastKick = tKick; g.lastDone = tDone;
+  if (P > 2000) { govClearWin(); g.probe = 0; g.lowN = g.lowI = 0; g.floorExT = -1e18; if (g.k != g.hi) govApply(g.hi, "first job after a pause > 2 s: top corner"); return; }
+  if (P > 100) { govClearWin(); g.probe = 0; return; }   // a menu or a hitch: not a frame cadence
+  if (g.skip > 0) { g.skip--; return; }
+  if (g.vG.empty()) g.winT0 = tKick;
+  g.vG.push_back(G); g.vP.push_back(P); g.vH.push_back(exMs);
+  if ((int)g.vG.size() < optGovWinJobs || tDone - g.winT0 < optGovWinMs) return;
+  govWindow(tDone); }
+// env start values of the governor; returns "" or the reason
+static string govEnv() {
+  auto num = [](const char* k, int lo, int hi, int* o) -> string { const char* v = getenv(k); if (!v || !*v) return ""; char* e = nullptr; long x = strtol(v, &e, 10);
+    if (*e || x < lo || x > hi) return string(k) + " must be " + to_string(lo) + ".." + to_string(hi); *o = (int)x; return ""; };
+  string r;
+  if (!(r = num("FSR4NPUD_POWER_GOV", 0, 1, &optGov)).empty()) return r; if (!(r = num("FSR4NPUD_POWER_GOV_DOWN_US", 0, 20000, &optGovDownUs)).empty()) return r;
+  if (!(r = num("FSR4NPUD_POWER_GOV_UP_US", 0, 20000, &optGovUpUs)).empty()) return r; if (!(r = num("FSR4NPUD_POWER_GOV_Q", 1, 50, &optGovQ)).empty()) return r;
+  if (!(r = num("FSR4NPUD_POWER_GOV_FLOOR_US", 0, 50000, &optGovFloorUs)).empty()) return r; if (!(r = num("FSR4NPUD_POWER_GOV_FLOOR_PCT", 1, 200, &optGovFloorPct)).empty()) return r;
+  if (!(r = num("FSR4NPUD_POWER_GOV_LOG", 0, 1, &optGovLog)).empty()) return r; if (!(r = num("FSR4NPUD_POWER_GOV_WIN_JOBS", 5, 1000, &optGovWinJobs)).empty()) return r;
+  if (!(r = num("FSR4NPUD_POWER_GOV_WIN_MS", 50, 10000, &optGovWinMs)).empty()) return r; if (!(r = num("FSR4NPUD_POWER_GOV_DOWN_WINS", 1, 100, &optGovDownWins)).empty()) return r;
+  if (const char* v = getenv("FSR4NPUD_POWER_GOV_RAILS")) { if (!strcmp(v, "core")) optGovRails = 0; else if (!strcmp(v, "both")) optGovRails = 1; else return "FSR4NPUD_POWER_GOV_RAILS must be core or both"; }
+  if (const char* v = getenv("FSR4NPUD_POWER_GOV_MIN")) { bool ok = false; for (auto& t : kCorner) if (!strcmp(v, t.n) && govIdx(t.v) >= 0) { ok = true; optGovMin = t.v; } if (!ok) return "FSR4NPUD_POWER_GOV_MIN must be svs_plus, nom, nom_plus, turbo, turbo_plus or max"; }
+  if (const char* v = getenv("FSR4NPUD_STUB_CORNER_PCT")) { string s = v; size_t a = 0; while (a < s.size()) { size_t b = s.find(',', a); if (b == string::npos) b = s.size(); string t = s.substr(a, b - a); a = b + 1; size_t q = t.find('=');
+      if (q == string::npos) return "FSR4NPUD_STUB_CORNER_PCT: name=percent,..."; int p = atoi(t.c_str() + q + 1); string nm = t.substr(0, q); int ix = -1;
+      for (auto& c : kCorner) if (nm == c.n) ix = govIdx(c.v) >= 0 ? govIdx(c.v) : c.v == DCVS_VOLTAGE_VCORNER_SVS ? GOV_NL : c.v == DCVS_VOLTAGE_VCORNER_SVS2 ? GOV_NL + 1 : -1;
+      if (ix < 0 || p < 1 || p > 1000) return "FSR4NPUD_STUB_CORNER_PCT: bad entry " + t; gStubPct[ix] = p; } }
+  return ""; }
 static string dmabufExporter(int fd) {   // /proc/self/fdinfo exp_name of a dma-buf: system = kernel dma-heap, else the fastrpc exporter
   char p[64]; snprintf(p, sizeof p, "/proc/self/fdinfo/%d", fd); FILE* f = fopen(p, "r"); if (!f) return ""; char l[256]; string r;
   while (fgets(l, sizeof l, f)) if (!strncmp(l, "exp_name:", 9)) { char* q = l + 9; while (*q == ' ' || *q == '\t') q++; r = q; while (!r.empty() && (r.back() == '\n' || r.back() == ' ')) r.pop_back(); break; }
@@ -453,7 +790,7 @@ static int execute(Client* c, double* exMs, int slot = 0) {
     const uint8_t* in = (const uint8_t*)c->map[c->t[0].fd_idx] + (((slot & 1) && c->alt) ? c->tAlt.off : c->t[0].off);
     for (uint32_t k = 1; k < c->nt; k++) memcpy((uint8_t*)c->map[c->t[k].fd_idx] + (o1 ? c->offOut1 + (c->t[k].off - c->t[1].off) : c->t[k].off), in, min(c->g->bytes[0], c->g->bytes[k]));
     for (int i = 0; i < c->nfd; i++) { dma_buf_sync s{DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW}; ioctl(c->fds[i], DMA_BUF_IOCTL_SYNC, &s); }
-    { const int dl = c->g->stubDelayUs >= 0 ? c->g->stubDelayUs : optStubDelayUs; if (dl > 0) { double e = now_ms() + dl / 1000.0; while (now_ms() < e) {} } }
+    { const int dl = c->g->stubDelayUs >= 0 ? c->g->stubDelayUs : optStubDelayUs; if (dl > 0) { double e = now_ms() + dl / 1000.0 * stubCornerPct() / 100.0; while (now_ms() < e) {} } }   // R4: stub time by corner
   }
   gExecStart = 0; *exMs = now_ms() - t0; if (ql.owns_lock()) ql.unlock();
   if (inP && gStDiag) {   // diagnostics: memory (after civac) vs the view before execute, per 64-byte line
@@ -482,8 +819,9 @@ static void onRun(Client* c, const fsr4npu_msg& m, int* fds, int nfd, double tRe
   r.status = st; r.v[0] = (uint64_t)(ex * 1e6); r.v[1] = (uint64_t)(fenceMs * 1e6);
   if (!isQnn && st == S_OK && (m.flags & F_VERIFY)) { r.v[2] = fnv64((const uint8_t*)c->map[c->t[0].fd_idx] + c->t[0].off, c->g->bytes[0]); r.v[3] = fnv64((const uint8_t*)c->map[c->t[1].fd_idx] + c->t[1].off, c->g->bytes[1]); }
   if (st) c->errors++; else { c->frames++; c->vExec.push_back(ex); c->vFence.push_back(fenceMs); }
-  c->vSvc.push_back(now_ms() - tRecv);
+  c->vSvc.push_back(now_ms() - tRecv); if (!st) winAdd(ex, c->vSvc.back());
   if (!sendMsg(c, r)) logf("client %d DONE send failed (client gone?)", c->id);
+  govNotChain();   // a RUN message is not the layer's frame chain: top corner (fsr4npu-check times stay those of the start corner)
 }
 
 static void handleMsg(Client* c) {
@@ -552,8 +890,9 @@ static void onKick(Client* c) {
   uint64_t out; if (!c->ready) out = 2 + (uint64_t)(-E_STATE);
   else { double ex = 0; int st = execute(c, &ex, int((v >> 32) & 3)); if (c->timedOut) { dropClient(c, "execute exceeded the soft timeout (client was told E_TIMEOUT)"); return; }
     out = st ? 2 + (uint64_t)(-st) : 1; if (st) c->errors++; else { c->frames++; c->vExec.push_back(ex); } }
-  c->vSvc.push_back(now_ms() - tRecv);
+  c->vSvc.push_back(now_ms() - tRecv); if (c->ready && out == 1) winAdd(c->vExec.back(), c->vSvc.back());
   if (write(c->done, &out, 8) != 8) logf("client %d done eventfd write failed", c->id);
+  if (c->ready && out == 1) govJob(c->id, (int)clients.size(), tRecv, now_ms(), c->vExec.back());
 }
 
 // ---------------- loader thread: file reads and context create/free, never on the frame path. The main thread owns the graph states; a job and its result pass through a locked queue.
@@ -582,7 +921,8 @@ static void loaderMain() {
     r->ms = now_ms() - t0; { std::lock_guard<std::mutex> l(gJobMu); gResults.push_back(r); } uint64_t v = 1; if (write(gWakeFd, &v, 8) != 8) {} } }
 
 static string loadedList() { string s; for (Graph* g : graphs) if (g->st == Graph::LOADED) s += (s.empty() ? "" : " ") + g->sock; return s.empty() ? "none" : s; }
-static void statusLine() { string st = "STATUS=serving " + to_string(graphs.size()) + " socket(s), alloc " + (isQnn ? gAllocName : string(gMemfd ? "memfd" : "vk")) + ", loaded: " + loadedList(); sdNotify(st.c_str()); }
+static string optGraphSet = "auto", gSetTxt = "released (no self-check)";
+static void statusLine() { string st = "STATUS=serving " + to_string(graphs.size()) + " socket(s), alloc " + (isQnn ? gAllocName : string(gMemfd ? "memfd" : "vk")) + ", graphs: " + gSetTxt + ", loaded: " + loadedList(); sdNotify(st.c_str()); }
 static int loadedCount() { int n = 0; for (Graph* g : graphs) if (g->st == Graph::LOADED || g->st == Graph::LOADING) n++; return n; }
 static Graph* lruIdle() { Graph* b = nullptr; for (Graph* g : graphs) if (g->st == Graph::LOADED && g->pins == 0 && !g->keep && (!b || g->lastUse < b->lastUse)) b = g; return b; }
 static void startUnload(Graph* g, const char* why) { logf("graph %s: unloading (%s)", g->sock.c_str(), why); g->st = Graph::UNLOADING; post(J_UNLOAD, g); }
@@ -617,8 +957,79 @@ static void resultsApply() {
       const bool again = g->reload || g->pins > 0; g->reload = false; if (again && !gExiting) startLoad(g); }
     delete r; } }
 
+// ---------------- package 16: graph set (released, or the 4 MB-plan "low" set for units with a faulty upper VTCM window)
+// Some SM8550 units give wrong NPU results with the released graphs: fixed bits in the upper part of the 8 MB VTCM window read
+// wrong (GitHub issue 2; test 7 on an Odin 2 Portal: released and 5-7 MB plans wrong, 4 MB plans with the file's window size set
+// to 8 MB correct in 20 of 20 runs). <graph-dir>/low4/ holds every graph planned for a 4 MB window (stored size patched to 8 MB,
+// so the runtime puts the window at the bottom) and the file SELFCHECK: "<graph> <16 hex digits>" = the expected output hash of
+// that graph for the fixed input of fsr4npu-check.
+// --graph-set auto (default; env FSR4NPUD_GRAPH_SET): at start, before any socket is bound, the released <graph> runs 3 times
+//   on the fixed input. Hash right: the released set (good units keep the faster graphs). Hash wrong: the same check on
+//   low4/<graph>; right -> every graph is loaded from low4/; wrong or missing -> exit 4 (the unit does not restart; Vela then
+//   runs FSR 4 on the GPU instead of showing a broken picture). No low4/SELFCHECK (the v79 folder, old images) or the check
+//   cannot run (file, load or execute error): the released set, as before.
+// --graph-set released: no check (package 15 behaviour).  --graph-set low: low4/ without a check (tests).
+// Only with --graphs (the service); not in the one-graph --name mode.
+static const char* kLowDir = "low4";
+// 1 = right, 0 = wrong, -1 = could not run (why). Raw client buffers: no shared buffer, nothing registered, context freed again.
+static int selfCheckRun(const string& path, uint64_t want, uint64_t* got, double* exMs, string* why) {
+  *got = 0; *exMs = 0;
+  if (!isQnn) {   // stub backend: FSR4NPUD_SELFCHECK_STUB="<released>,<low>" each ok | wrong | missing (tests of the choice only)
+    static int nth = 0; const char* e = getenv("FSR4NPUD_SELFCHECK_STUB"); string s = e ? e : "ok,ok"; size_t c = s.find(',');
+    const string v = nth++ == 0 ? s.substr(0, c) : (c == string::npos ? string("ok") : s.substr(c + 1));
+    if (v == "missing") { *why = "file missing (stub)"; return -1; } *got = v == "ok" ? want : want ^ 0x5a5a; *exMs = 0.01; return v == "ok" ? 1 : 0; }
+  if (access(path.c_str(), R_OK) != 0) { *why = "file missing"; return -1; }
+  Graph g; g.path = path; g.sock = "selfcheck"; Parsed o; if (!parseGraph(&g, o)) { *why = "the graph file cannot be read"; return -1; }
+  Qnn_ContextHandle_t ctx = nullptr; Qnn_GraphHandle_t G = nullptr; int res = -1; char b[96];
+  { std::lock_guard<std::mutex> ql(gQnnMu); gLoadStart = now_ms();   // the hung-load watchdog covers the load
+    Qnn_ErrorHandle_t e = Q.contextCreateFromBinary(BE, DV, nullptr, o.bin.data(), o.bin.size(), &ctx, nullptr); gLoadStart = 0;
+    if (e != QNN_SUCCESS) { snprintf(b, sizeof b, "contextCreateFromBinary rc 0x%lx", (unsigned long)e); *why = b; ctx = nullptr; }
+    else if ((e = Q.graphRetrieve(ctx, o.name.c_str(), &G)) != QNN_SUCCESS) { snprintf(b, sizeof b, "graphRetrieve rc 0x%lx", (unsigned long)e); *why = b; }
+    else {
+      vector<vector<uint8_t>> buf(o.nt); Qnn_Tensor_t T[FSR4NPU_MAXT];
+      for (uint32_t k = 0; k < o.nt; k++) { buf[k].assign(o.bytes[k], 0); T[k] = o.T[k]; T[k].v1.memType = QNN_TENSORMEMTYPE_RAW;
+        T[k].v1.clientBuf.data = buf[k].data(); T[k].v1.clientBuf.dataSize = (uint32_t)o.bytes[k]; }
+      for (uint64_t i = 0; i < o.bytes[0]; i++) buf[0][i] = (uint8_t)((i * 7u + (i >> 12)) % 59u);   // the input of fsr4npu-check
+      vector<double> ex; res = 1;
+      for (int r = 0; r < 3 && res == 1; r++) {
+        for (uint32_t k = 1; k < o.nt; k++) memset(buf[k].data(), 0xA5 ^ r, buf[k].size());   // a run that writes nothing cannot pass
+        const double t0 = now_ms(); e = Q.graphExecute(G, &T[0], 1, &T[1], o.nt - 1, nullptr, nullptr); ex.push_back(now_ms() - t0);
+        if (e != QNN_SUCCESS) { snprintf(b, sizeof b, "graphExecute rc 0x%lx", (unsigned long)e); *why = b; res = -1; break; }
+        uint64_t hh = 1469598103934665603ULL; for (uint32_t k = 1; k < o.nt; k++) hh ^= fnv64(buf[k].data(), buf[k].size()) + k;   // as fsr4npu-check
+        *got = hh; if (hh != want) res = 0; }
+      sort(ex.begin(), ex.end()); *exMs = ex[ex.size() / 2]; }
+    if (ctx) Q.contextFree(ctx, nullptr); }
+  parsedFree(o); return res; }
+// Returns 0 to go on, or the exit code. Sets the graphs' paths and gSetTxt.
+static int graphSetChoose() {
+  const string low = optGraphDir + "/" + kLowDir; auto useLow = [&]() { for (Graph* g : graphs) g->path = low + "/" + g->name + ".bin"; };
+  if (optGraphSet == "released") { gSetTxt = "released (no self-check)"; logf("graph set: released, no self-check (--graph-set released)"); return 0; }
+  if (optGraphSet == "low") { useLow(); gSetTxt = "low4 (forced)"; logf("graph set: LOW, the 4 MB-plan graphs of %s for every graph, no self-check (--graph-set low)", low.c_str()); return 0; }
+  string gname; uint64_t want = 0;
+  { FILE* f = fopen((low + "/SELFCHECK").c_str(), "r"); char n[64], h[32];
+    if (f) { if (fscanf(f, "%63s %31s", n, h) == 2 && strlen(h) == 16 && strspn(h, "0123456789abcdef") == 16) { gname = n; want = strtoull(h, nullptr, 16); } fclose(f); } }
+  if (gname.empty()) { logf("graph set: released, no self-check (no %s/SELFCHECK)", low.c_str()); return 0; }
+  uint64_t got = 0, gotL = 0; double ex = 0, exL = 0; string why, whyL; const double t0 = now_ms();
+  const int r = selfCheckRun(optGraphDir + "/" + gname + ".bin", want, &got, &ex, &why);
+  if (r == 1) { gSetTxt = "released (self-check ok)";
+    logf("graph set: released. Self-check ok: %s hash %016llx in 3 of 3 runs, execute %.2f ms without a power vote, %.0f ms in all", gname.c_str(), (unsigned long long)got, ex, now_ms() - t0); return 0; }
+  if (r < 0) { logf("graph set: released. The self-check could not run (%s %s): nothing is known about this unit's NPU memory", gname.c_str(), why.c_str()); return 0; }
+  const int rl = selfCheckRun(low + "/" + gname + ".bin", want, &gotL, &exL, &whyL);
+  if (rl == 1) { useLow(); gSetTxt = "low4 (self-check: released wrong, low4 ok)";
+    logf("graph set: LOW. SELF-CHECK FAILED for the released %s: hash %016llx, expected %016llx (this unit's NPU memory gives wrong results in the upper VTCM window). "
+         "Every graph is loaded from %s (planned for a 4 MB window): its %s is right, execute %.2f ms (released %.2f ms), %.0f ms in all",
+         gname.c_str(), (unsigned long long)got, (unsigned long long)want, low.c_str(), gname.c_str(), exL, ex, now_ms() - t0); return 0; }
+  char lw[160]; if (rl < 0) snprintf(lw, sizeof lw, "the 4 MB-plan graph could not run (%s)", whyL.c_str()); else snprintf(lw, sizeof lw, "the 4 MB-plan graph is wrong too (hash %016llx)", (unsigned long long)gotL);
+  logf("FAIL graph set: NONE. SELF-CHECK FAILED for the released %s (hash %016llx, expected %016llx) and %s. The NPU of this unit cannot give right results: "
+       "exit 4, no restart; Vela runs FSR 4 on the GPU", gname.c_str(), (unsigned long long)got, (unsigned long long)want, lw);
+  sdNotify("STATUS=FAIL NPU self-check: released and low4 graphs wrong, NPU off"); return 4; }
+
 int main(int argc, char** argv) {
   T0 = now_ms(); setvbuf(stderr, nullptr, _IOLBF, 0);
+  if (const char* pl = getenv("FSR4NPUD_POWER_LIVE")) optPowerLive = pl;   // NPUPWR: the control file ("" or off: none)
+  if (const char* ps = getenv("FSR4NPUD_POWER_STATS_JOBS")) optPowerStatsJobs = atoi(ps);
+  if (const char* gs = getenv("FSR4NPUD_GRAPH_SET")) optGraphSet = gs;
+  { const string ge = govEnv(); if (!ge.empty()) { fprintf(stderr, "%s\n", ge.c_str()); return 2; } }   // R4 governor
   if (const char* pc = getenv("FSR4NPUD_POWER_CORNER")) if (*pc && !powerCornerParse(pc)) { fprintf(stderr, "FSR4NPUD_POWER_CORNER must be max, turbo_plus, turbo, nom_plus, nom, svs_plus, svs, svs2 or dcvs\n"); return 2; }
   for (int i = 1; i < argc; i++) { string a = argv[i]; auto nx = [&]() -> const char* { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", a.c_str()); exit(2); } return argv[++i]; };
     if (a == "--name") optName = nx(); else if (a == "--backend") optBackend = nx(); else if (a == "--ctx") optCtx = nx();
@@ -628,11 +1039,18 @@ int main(int argc, char** argv) {
     else if (a == "--max-clients") optMaxClients = atoi(nx()); else if (a == "--allow-uid") allowUid.push_back((uid_t)atoi(nx())); else if (a == "--allow-gid") allowGid.push_back((gid_t)atoi(nx())); else if (a == "--exec-timeout-ms") optExecTimeoutMs = atoi(nx());
     else if (a == "--exit-after-clients") optExitAfter = atoi(nx()); else if (a == "--max-seconds") optMaxSec = atoi(nx()); else if (a == "--qnn-log") optQnnLog = atoi(nx()); else if (a == "--alloc") optAlloc = nx();
     else if (a == "--exec-hard-timeout-ms") optExecHardMs = atoi(nx()); else if (a == "--power-grace-ms") optPowerGraceMs = atoi(nx());
+    else if (a == "--graph-set") optGraphSet = nx(); else if (a == "--power-live") optPowerLive = nx(); else if (a == "--power-stats-jobs") optPowerStatsJobs = atoi(nx());
     else if (a == "--power-corner") { if (!powerCornerParse(nx())) { fprintf(stderr, "--power-corner must be max, turbo_plus, turbo, nom_plus, nom, svs_plus, svs, svs2 or dcvs\n"); return 2; } }
     else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; } }
   if (optAlloc != "auto" && optAlloc != "rpcmem" && optAlloc != "vk" && optAlloc != "memfd") { fprintf(stderr, "--alloc must be auto, rpcmem, vk or memfd\n"); return 2; }
   if (!optGraphs.empty() && (optGraphDir.empty() || !optCtx.empty())) { fprintf(stderr, "--graphs needs --graph-dir and excludes --ctx\n"); return 2; }
   if (optMaxLoaded < 1) { fprintf(stderr, "--max-loaded must be at least 1\n"); return 2; }
+  if (optGraphSet != "auto" && optGraphSet != "released" && optGraphSet != "low") { fprintf(stderr, "--graph-set / FSR4NPUD_GRAPH_SET must be auto, released or low\n"); return 2; }
+  if (optPowerLive == "off" || optPowerLive == "0") optPowerLive.clear();
+  if (!optPowerLive.empty() && optPowerLive[0] != '/') { fprintf(stderr, "--power-live / FSR4NPUD_POWER_LIVE must be an absolute path or off\n"); return 2; }
+  if (optPowerStatsJobs < 0) optPowerStatsJobs = optPowerLive.empty() ? 0 : 600;
+  gPS0 = gPS = powerDefaults();   // NPUPWR: the start values = the package-15 vote of --power-corner
+  govReset();
   gMemfd = optAlloc == "memfd";
   if (optExecHardMs < optExecTimeoutMs) optExecHardMs = optExecTimeoutMs;
   allowUid.push_back(getuid()); if (getenv("SUDO_UID")) allowUid.push_back((uid_t)atoi(getenv("SUDO_UID")));
@@ -666,6 +1084,7 @@ int main(int argc, char** argv) {
   const bool oneGraph = graphs[0]->keep;
   if (getenv("NOTIFY_SOCKET")) sdNotify(isQnn ? "STATUS=opening the QNN backend" : "STATUS=stub backend");
   if (isQnn) { if (qnnOpen()) allocDecide(); else { logf("FAIL qnn init (is vela-npu-listener.service running? journalctl -u vela-npu-listener)"); sdNotify("STATUS=FAIL qnn init"); return 3; } }
+  if (!oneGraph) { const int gr = graphSetChoose(); if (gr) { logf("fsr4npud exit %d", gr); return gr; } }   // package 16: before any socket is bound
   gWakeFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); if (gWakeFd < 0) { logf("FAIL eventfd: %s", strerror(errno)); return 1; }
   if (oneGraph) {   // one graph: loaded before READY, a failure ends the process, as always
     Graph* g = graphs[0]; Result r; r.g = g; double t0 = now_ms(); if (!contextLoad(&r)) { logf("FAIL qnn init (is vela-npu-listener.service running? journalctl -u vela-npu-listener)"); sdNotify("STATUS=FAIL qnn init"); return 3; }
@@ -679,6 +1098,11 @@ int main(int argc, char** argv) {
   { string bs; if (oneGraph) for (uint32_t k = 0; k < graphs[0]->nt; k++) bs += (k ? "," : "") + to_string(graphs[0]->bytes[k]);
     logf("fsr4npud READY name=@%s sockets=%d backend=%s graph=%s tensors=%u bytes=%s max-loaded=%d alloc=%s pid=%d uid=%u", graphs[0]->sock.c_str(), bound, optBackend.c_str(), oneGraph ? graphs[0]->name.c_str() : "on demand", graphs[0]->nt, bs.c_str(), optMaxLoaded, isQnn ? gAllocName.c_str() : gMemfd ? "memfd" : "vk", (int)getpid(), (unsigned)getuid()); }
   sdNotify("READY=1"); statusLine();
+  logf("power_live: control file %s, checked every 200 ms; window stats every %d executes; start values %s", optPowerLive.empty() ? "off" : optPowerLive.c_str(), optPowerStatsJobs, psDesc(gPS0).c_str());
+  if (optGov && !gPS0.gov) logf("power_gov OFF: --power-corner dcvs has no corner to steer");
+  if (!optGov) logf("power_gov OFF: FSR4NPUD_POWER_GOV=0, the core corner stays at %s 0x%X (the vote of package 15)", cName(gPS0.core), gPS0.core);
+  govLogCfg("start values");
+  powerLiveCheck(true);
   std::thread loader(loaderMain);
   if (!oneGraph) for (Graph* g : graphs) if (g->ls >= 0) post(J_INFO, g);   // the sizes for HELLO and ALLOC, before the first client asks; a missing file shows in the log now
   while (!gStop) {
@@ -689,7 +1113,9 @@ int main(int argc, char** argv) {
       const bool wait = g->st != Graph::FAILED && (!g->infoReady || (isQnn && !gAllocReady) || (c->ready && !c->registered));
       p.push_back({c->sock, short(wait ? 0 : POLLIN), 0}); who.push_back({c, 0}); if (c->ready && c->registered && c->kick >= 0) { p.push_back({c->kick, POLLIN, 0}); who.push_back({c, 1}); } }
     int to = 1000; if (gVoted && clients.empty()) to = max(0, min(1000, (int)(gIdleSince + optPowerGraceMs - now_ms()) + 1));
+    if (!optPowerLive.empty()) to = min(to, 200);   // NPUPWR: a control-file change lands within ~200 ms even between jobs
     int pr = poll(p.data(), p.size(), to); if (pr < 0) { if (errno == EINTR) continue; logf("poll: %s", strerror(errno)); gExitCode = 1; break; }
+    powerLiveCheck(false);   // NPUPWR: before this round's executes (rate-limited to one lstat per 200 ms)
     if (gVoted && clients.empty() && now_ms() - gIdleSince >= optPowerGraceMs) powerVote(false, "no client");
     for (size_t li = 0; li < nl; li++) if (p[li].revents & POLLIN) { Graph* g = lg[li];
       int s = accept4(g->ls, nullptr, nullptr, SOCK_CLOEXEC);
@@ -710,7 +1136,7 @@ int main(int argc, char** argv) {
     { double tn = now_ms(); for (Graph* g : graphs) if (g->st == Graph::LOADED && g->pins == 0 && !g->keep && tn - g->lastUse >= optGraphIdleMs) startUnload(g, "idle"); }
     if (optExitAfter > 0 && clientsDone >= optExitAfter) { logf("served %d clients, exiting", clientsDone); break; }
   }
-  if (gStop) logf("stop signal"); sdNotify("STOPPING=1");
+  if (gStop) logf("stop signal"); sdNotify("STOPPING=1"); winFlush("daemon exit");
   gExiting = true;
   { std::lock_guard<std::mutex> l(gJobMu); gJobQuit = true; gJobCv.notify_all(); } loader.join(); resultsApply();   // the job in hand ends first; queued jobs are dropped
   while (!clients.empty()) dropClient(clients.front(), "daemon exit");

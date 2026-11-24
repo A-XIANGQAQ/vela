@@ -1,6 +1,6 @@
 # How the Vela NPU graphs are built
 
-This page describes how the 34 graph files in `vela-npu-sysext-14.raw` (the same files are in `vela-npu-sysext-15.raw`) were made: 17 for HTP v73 (Snapdragon 8 Gen 2,
+This page describes how the 34 graph files in `vela-npu-sysext-14.raw` (the same files are in `vela-npu-sysext-15.raw`; package 17 has new v73 files, see [`npu/graphs/pkg17/README.md`](../npu/graphs/pkg17/README.md)) were made: 17 for HTP v73 (Snapdragon 8 Gen 2,
 SM8550) and the same 17 for HTP v79 (Snapdragon 8 Elite, SM8750). It lists the inputs, the tool versions, the commands,
 and the hashes a correct build gives.
 
@@ -326,7 +326,8 @@ a tool version is different.
 Hashes of the files inside `vela-npu-sysext-14.raw` (image sha256
 `10acba9196a7a55f712d14451ed64a20385cc5eab045744be6a63dd264392ac1`).
 The graph files are the same in package 15 (`vela-npu-sysext-15.raw`, sha256
-`5cdfc9c15180eb5c14ee4810f89d221a8d390d9459560c08346af6358c91ae73`). The image's own
+`5cdfc9c15180eb5c14ee4810f89d221a8d390d9459560c08346af6358c91ae73`). Package 17 (`vela-npu-sysext-17.raw`) ships new files for the same
+graphs (a faster, bit-exact build form) and a second set `low4/`: see [`npu/graphs/pkg17/README.md`](../npu/graphs/pkg17/README.md). The hashes in this section are those of package 14/15. The image's own
 `usr/lib64/vela-npu/MANIFEST.md5` has the same md5s.
 
 ### 5.1 HTP v73 (`usr/lib64/vela-npu/`)

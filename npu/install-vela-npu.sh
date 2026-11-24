@@ -1,23 +1,24 @@
 #!/bin/sh
-# Vela NPU system part, package 15: lets Vela run FSR 4 / FSR 4 Fast on the Hexagon NPU (Snapdragon 8 Gen 2, SM8550;
+# Vela NPU system part, package 17: lets Vela run FSR 4 / FSR 4 Fast on the Hexagon NPU (Snapdragon 8 Gen 2, SM8550;
 # Snapdragon 8 Gen 3, SM8650; Snapdragon 8 Elite, SM8750, experimental).
 # Needs sudo ONCE (it adds a system extension, a udev rule and system services). Run in Desktop mode -> Konsole, game closed:
-#   curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.24/install-vela-npu.sh | sudo sh
+#   curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.21/install-vela-npu.sh | sudo sh
 # What it does:
-#   1. downloads vela-npu-sysext-15.raw (NPU daemon, 17 FSR 4 graphs for HTP v73 and for HTP v79, quic/fastrpc, and the
+#   1. downloads vela-npu-sysext-17.raw (NPU daemon, 17 FSR 4 graphs for HTP v73 and for HTP v79, quic/fastrpc, and the
 #      Qualcomm AI Engine Direct (QNN) runtime 2.47.0.260601, unmodified) and checks its sha256;
 #   2. reads the DSP shell and C++ runtime (3 files) read-only from your device's own dsp partition;
 #   3. installs both as systemd system extensions in /var/lib/extensions (nothing in armadaOS is overwritten), enables the
 #      NPU daemon, and checks each graph with a fixed input. Prints "Vela NPU: OK" or "Vela NPU: FAILED" + the reason.
-# Remove: uninstall-vela-npu.sh (same release). Options: --image <local vela-npu-sysext-15.raw>, --force.
+# Remove: uninstall-vela-npu.sh (same release). Options: --image <local vela-npu-sysext-17.raw>, --force.
 # The image carries the QNN runtime (no SDK download); library search paths: /usr/lib64/vela-npu only; root:root, umask 022.
 set -u
 umask 022
-VER=15
-TAG=v0.8.24
+VER=17
+# PKG17: set TAG to the release that carries vela-npu-sysext-17.raw (until then the download fails, nothing is installed)
+TAG=v0.8.25
 BASE_URL="https://github.com/zrprod9-cmyk/vela/releases/download/$TAG"
 IMAGE=vela-npu-sysext-$VER.raw
-IMAGE_SHA256=5cdfc9c15180eb5c14ee4810f89d221a8d390d9459560c08346af6358c91ae73
+IMAGE_SHA256=8795c509be690e643f6739112aa4033d4c1fff3a5e55a0c58ce4178963046bc6
 EXT=/var/lib/extensions
 QDIR=/var/lib/extensions/armada-vela-npu-qnn
 # One daemon serves all graphs (one cDSP session). The graphs are loaded on first use, so the check below loads each one in turn.

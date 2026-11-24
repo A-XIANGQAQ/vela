@@ -17,7 +17,7 @@ kept in `assets/licenses/decky-plugin-template-BSD-3-Clause.txt`.
 
 ## Vela NPU system part (`npu/`)
 
-- `vela-npu-sysext-15.raw` (sha256 `5cdfc9c15180eb5c14ee4810f89d221a8d390d9459560c08346af6358c91ae73`) contains Vela's
+- `vela-npu-sysext-17.raw` (sha256 `8795c509be690e643f6739112aa4033d4c1fff3a5e55a0c58ce4178963046bc6`) contains Vela's
   files (the daemon `fsr4npud`, the checker `fsr4npu-check`, systemd units and drop-ins, a udev rule and 17 compiled FSR 4
   graphs, each for HTP v73 and HTP v79),
   quic/fastrpc (BSD-3-Clause, its text is inside the image) and the **Qualcomm AI Engine Direct SDK runtime
