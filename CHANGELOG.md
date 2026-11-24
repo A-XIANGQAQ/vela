@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.8.25 — 2026-11-24
+
+Faster NPU graphs, a fix for units whose NPU gives wrong FSR 4 output, and a fix for SGSR 2 colours.
+
+New
+- **NPU package 17.** Faster FSR 4 on the NPU with the same picture bit for bit. NPU time per frame on our Retroid Pocket 6: 1280x720 output -5 %, 1280x800 -5 %, 1920x1080 Ultra Performance -10 %, 1152x648 -31 %, 960x540 -16 %.
+- **Units whose NPU gives wrong FSR 4 output (#2).** When the NPU service starts it checks one graph with a known input. If the result is wrong, it switches to graphs planned for a smaller memory window, which give correct results on the units tested in #2. If those are wrong too, the NPU stays off and Vela runs FSR 4 on the GPU instead of showing a broken picture.
+- The NPU power governor is on by default: it lowers the NPU clock when the game has time to spare. FSR4NPUD_POWER_GOV=0 turns it off.
+- FSR 4: the GPU part does a little less work per frame (about 0.1 ms), same picture bit for bit.
+
+Our Retroid Pocket 6 (Snapdragon 8 Gen 2), average fps, each version run twice in the order old, new, new, old:
+
+| game | model | 0.8.24 + NPU package 15 | 0.8.25 + NPU package 17 |
+|---|---|---|---|
+| Deep Rock Galactic 1920x1080 | FSR 4 | 65.8 | 66.9 |
+| Deep Rock Galactic 1920x1080 | SGSR 2 | 98.9 | 99.5 |
+| Manor Lords 1280x720 | FSR 4 | 59.5 | 59.6 |
+| Manor Lords 1280x720 | SGSR 2 | 59.7 | 59.8 |
+
+Manor Lords runs at its frame cap here, so it shows that nothing got slower rather than how much faster.
+
+Fixed
+- SGSR 2: wrong brightness and tint in games that report their own exposure (Haste, Ghostrunner, Into the Dead, Manor Lords, Deep Rock Galactic). SGSR 2 got the game's exposure value where it expects the change of exposure between frames.
+- Vulkan: when an upscaler can't start, Vela no longer retries it every frame; it falls back to SGSR 2 once.
+- Vulkan: SGSR 2 reads depth buffers that also carry stencil correctly.
+
+Known issues
+- Native Vulkan games on Unity: Vela can now draw through their DLSS path (the 3D scene used to stay empty), but Unity only offers DLSS on NVIDIA GPUs, so players can't reach it yet.
+- FSR 3 and DittoSR in native Vulkan games don't start on our device: AMD's Vulkan module finds no memory type it accepts on the console's GPU driver. Vela uses SGSR 2 there.
+- FSR 4 is not offered in native Vulkan games yet.
+- Unity Vulkan games: menu backgrounds with many small bright points look a little darker with SGSR 2 than without upscaling.
+- On some Retroid Pocket 6 units the NPU gives wrong results even with the smaller graphs (#2); there the NPU stays off and FSR 4 runs on the GPU. We are testing those units.
+- Scenes without a depth buffer still use FSR 1.
+- FSR 4 Fast: black rectangles in some games on 8 Elite. We don't see them on 8 Gen 2.
+
 ## 0.8.24 — 2026-11-23
 
 New
