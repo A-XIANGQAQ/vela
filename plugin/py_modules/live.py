@@ -13,6 +13,7 @@ the /tmp files again when it loads. A key that is not set leaves the launch sett
 """
 import json
 import os
+import re
 
 import presets
 import profiles
@@ -79,6 +80,86 @@ class Live:
     def __init__(self, settings, log=print):
         self.dir = os.path.join(settings, "live")
         self.log = log
+        self.mirrors = {}  # the id a running game reads its file by -> the appid whose settings it must get
+        self.mirror_state = os.path.join(self.dir, "mirrors.state")  # the copies written, so a crash leaves none behind
+
+    # 0.8.26 (GitHub #4): a launcher's runtime may hide the shortcut's appid from the game (Heroic sets SteamAppId=0): Vela's
+    # library in the game then reads /tmp/vela-live/0.ini, not <appid>.ini (fork patch 0010, VelaLive.h: the first of
+    # SteamAppId, SteamGameId, STEAM_COMPAT_APP_ID that starts with a digit), and the panel's model never reached it. While such
+    # a game runs, its live file is kept under that id as well. From indiesaudi's PR #4 (the mirror), with a record of the
+    # copies written (taken away at the next plugin start after a crash) and ensure() writing a copy again after /tmp was emptied.
+
+    def mirror(self, appid, run_id):
+        """The running game `appid` reads its live file as <run_id>.ini: write it there too, and keep it in step."""
+        appid, run_id = str(appid), str(run_id)
+        if not re.fullmatch(r"[0-9][0-9A-Za-z_-]*", run_id) or run_id == appid or self.mirrors.get(run_id) == appid:
+            return False
+        if os.path.exists(self._json(run_id)):
+            return False  # the id of a game of its own: never write over its file
+        self.mirrors[run_id] = appid
+        self._write_mirror(run_id, self.get(appid))
+        self._save_mirrors()
+        self.log(f"live {appid}: the game reads its settings as {run_id}.ini, kept there while it runs")
+        return True
+
+    def unmirror(self, keep=()):
+        """Drops the copies of games that no longer run (keep: the appids that still do)."""
+        gone = False
+        for run_id, appid in list(self.mirrors.items()):
+            if appid not in keep:
+                del self.mirrors[run_id]
+                self._write_mirror(run_id, None)
+                gone = True
+        if gone:
+            self._save_mirrors()
+
+    def _write_mirror(self, run_id, values):
+        path = os.path.join(TMP_DIR, f"{run_id}.ini")
+        try:
+            if not values:
+                if os.path.exists(path):
+                    os.remove(path)
+                return
+            os.makedirs(TMP_DIR, exist_ok=True)
+            tmp = path + ".new"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("".join(f"{k}={v}\n" for k, v in sorted(values.items())))
+            os.replace(tmp, path)
+        except OSError as e:
+            self.log(f"live mirror {run_id}: {e}")
+
+    def _sync_mirrors(self, appid, values):
+        for run_id, owner in self.mirrors.items():
+            if owner == str(appid):
+                self._write_mirror(run_id, values)
+
+    def _save_mirrors(self):
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            with open(self.mirror_state + ".new", "w", encoding="utf-8") as f:
+                json.dump(sorted(self.mirrors), f)
+            os.replace(self.mirror_state + ".new", self.mirror_state)
+        except OSError as e:
+            self.log(f"live mirror record: {e}")
+
+    def drop_stale_mirrors(self):
+        """Plugin start: a copy a crashed plugin left in /tmp is not kept by a running game any more: taken away, unless the
+        id has a file of its own."""
+        try:
+            with open(self.mirror_state, encoding="utf-8") as f:
+                ids = json.load(f)
+        except (OSError, ValueError):
+            return []
+        gone = []
+        for run_id in ids if isinstance(ids, list) else []:
+            if re.fullmatch(r"[0-9][0-9A-Za-z_-]*", str(run_id)) and not os.path.exists(self._json(str(run_id))):
+                self._write_mirror(str(run_id), None)
+                gone.append(str(run_id))
+        self.mirrors = {}
+        self._save_mirrors()
+        if gone:
+            self.log(f"live: copies left by an earlier run taken away: {gone}")
+        return gone
 
     def _json(self, appid):
         return os.path.join(self.dir, f"{appid}.json")
@@ -149,6 +230,11 @@ class Live:
                 self.log(f"live {appid}: the /tmp file was gone, written again: {values}")
             except OSError as e:
                 self.log(f"live {appid}: {e}")
+        for run_id, owner in list(self.mirrors.items()):  # a copy under a hidden id, after /tmp was emptied
+            if not os.path.exists(os.path.join(TMP_DIR, f"{run_id}.ini")) and self.get(owner):
+                self._write_mirror(run_id, self.get(owner))
+                back.append(run_id)
+                self.log(f"live {owner}: the copy {run_id}.ini was gone, written again")
         return back
 
     def _write_tmp(self, appid, values):
@@ -181,11 +267,13 @@ class Live:
         elif os.path.exists(self._json(appid)):
             os.remove(self._json(appid))
         self._write_tmp(appid, values)
+        self._sync_mirrors(appid, values)
         self.log(f"live {appid}: {values or 'launch settings'}")
         return values
 
     def restore_all(self):
         """The /tmp files again after a reboot or a plugin update."""
+        self.drop_stale_mirrors()
         try:
             names = os.listdir(self.dir)
         except OSError:

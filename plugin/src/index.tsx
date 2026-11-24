@@ -22,6 +22,8 @@ type Hint = { id: string; code?: string; got?: string; res?: string; soc?: strin
 type GameState = {
   appid: string; running: boolean; sgsr3: S3State; check: Check; scan?: { inputs?: string[] | null };
   models: { id: ModelId; ok: boolean; why?: string | null }[]; model: ModelId | "off"; hint: Hint | null;
+  // a launcher's shortcut (Xodus Nexus ...): the game folder the backend learned while the game ran
+  learned?: { folder: string; confirmed: boolean } | null; handoff?: boolean;
   llfg_on?: boolean; layer_on?: boolean; launch_fix?: boolean; window_fix?: boolean;
   not_in_launch?: "wrapped" | "left_out" | null;  // V03c: set up, but Vela is not in the game's launch
   report?: ReportPanel | null;
@@ -504,6 +506,9 @@ function GameContent({ visible }: { visible: boolean }) {
           <div style={{ fontSize: 13 }}><span style={{ color: status.dot }}>●</span> {status.text}</div>
           {status.sub && <div style={LINE}>{status.sub}</div>}
           {status.why && <div style={LINE}>{status.why}</div>}
+          {gs.learned && <div style={LINE}>{t("learned.folder", { folder: gs.learned.folder })}</div>}
+          {gs.learned && !gs.learned.confirmed && !on && supported && <div style={{ ...LINE, opacity: 1, color: YELLOW }}>{t("learned.confirm")}</div>}
+          {on && gs.handoff && <div style={{ ...LINE, opacity: 1, color: YELLOW, marginTop: 6 }}>→ {t("learned.launcherOpen")}</div>}
           {on && gs.hint && <div style={{ ...LINE, opacity: 1, color: YELLOW, marginTop: 6 }}>→ {hintText(gs.hint)}</div>}
           {fsr1 && <div style={{ ...LINE, marginTop: 6 }}>{t("steam_fsr1")}</div>}
         </div>

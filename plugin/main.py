@@ -17,6 +17,7 @@ import profiles  # noqa: E402
 import gameutil
 import launchopts  # noqa: E402
 import latency  # noqa: E402
+import learn  # noqa: E402
 import live  # noqa: E402
 import nofg  # noqa: E402
 import npu  # noqa: E402
@@ -160,6 +161,9 @@ class Plugin:
                     self.rep.observe(running)  # 0.8.16: how long each run lasted (the bad-run question)
                 if getattr(self, "nofg", None) is not None:  # NOFG: a run that had the older build's layer has ended: its live file back
                     await self._step(self.nofg.reconcile, running)
+                # 0.8.26 (GitHub #3): the game of a launcher's shortcut is learned from the running game, also with the panel closed
+                await self._step(self._learn_all, running)
+                await self._step(self._mirror_live, running)  # 0.8.26 (GitHub #4): live settings under a hidden id
                 # V04 (audit 2026-11-09): the live files in /tmp again when something removed them while the plugin runs
                 await self._step(self.live.ensure)
                 if self.up.reset_pending:  # Gamescope was not up at plugin start
@@ -311,12 +315,90 @@ class Plugin:
         # the game's frame arrives at the panel resolution already: Gamescope must not upscale it again
         self.up.set_sgsr3(appid, s3_on or ag_on)
 
+    LEARN_EVERY = 5  # seconds between two looks at a running shortcut's processes (one look is ~10 ms)
+
+    def _learn_all(self, running):
+        for appid in running:
+            if sgsr3.is_shortcut(appid):
+                self._learn(appid, running)
+
+    def _learn(self, appid, running, now=None):
+        """0.8.26 (GitHub #3, from indiesaudi's PR): a non-Steam shortcut that runs now, whose game its launcher's config does
+        not give (Xodus Nexus, a store client in a Proton prefix, a launcher Vela cannot read): where its game is, read from the
+        game's own process (learn.py). Kept per shortcut; the scan uses it from then on. A game the shortcut or a readable
+        launcher config already names is never touched."""
+        appid = str(appid)
+        self._handoff = getattr(self, "_handoff", {})
+        self._run_ids = getattr(self, "_run_ids", {})  # appid -> the id the running game reads its live file by (memory only)
+        if not sgsr3.is_shortcut(appid) or appid not in running:
+            self._handoff.pop(appid, None)
+            self._run_ids.pop(appid, None)
+            return None
+        now = time.time() if now is None else now
+        seen = getattr(self, "_learn_seen", {})
+        if now - seen.get(appid, 0) < self.LEARN_EVERY:
+            return None
+        self._learn_seen = {**seen, appid: now}
+        try:
+            game = sgsr3.shortcut_game(self.s3.home, appid)
+            sc = sgsr3.shortcut_entry(self.s3.home, appid)
+            sig = sgsr3.shortcut_sig(sc)
+            own = [os.path.dirname(sc["exe"]), sc["start_dir"]] if sc else []
+            if not sgsr3.learn_kind(game):
+                if game and game["launcher"] and game["dir"]:
+                    # 0.8.26 (GitHub #4): a game its launcher's config names (Heroic): nothing is learned, but the id its runtime
+                    # gives the game (SteamAppId=0) is kept while it runs, when the running game is inside the config's folder
+                    obs = learn.observe(appid, own_dirs=own)
+                    if obs["status"] == "found" and obs.get("run_id") and sgsr3._inside(obs["install_dir"], game["dir"]):
+                        self._run_ids[appid] = obs["run_id"]
+                return None
+            obs = learn.observe(appid, own_dirs=own)
+            store = self.s3.learned
+            before = dict(store.entry(appid) or {})
+            if obs["status"] == "found":
+                self._handoff[appid] = bool(obs.get("handoff"))
+                if obs.get("run_id"):
+                    self._run_ids[appid] = obs["run_id"]
+                markers = None
+                on_disk = os.path.join(obs["install_dir"], obs["exe"])
+                if obs.get("running_exe") and learn.pe_machine(on_disk) is None and not before.get("markers"):
+                    # the launcher keeps the exe encrypted on disk: the graphics API is read from the copy that runs
+                    markers = self.check.reader(obs["running_exe"])
+                store.record(appid, obs, sig=sig, markers=markers)
+            elif obs["status"] == "other":
+                store.record(appid, obs, sig=sig)
+            if dict(store.entry(appid) or {}) != before:
+                self.s3.cache.pop(appid, None)  # the next scan sees the game
+            return obs
+        except Exception as e:  # never in the way of the panel
+            decky.logger.error(f"learn {appid}: {e}")
+            return None
+
+    def _game_cfg(self, appid):
+        """The settings-file entries of a game Vela is on in: its profile's, and DirectX 12 for a launcher's Unreal game."""
+        out = gamecfg.entries(profiles.game_cfg(appid)) + gamecfg.entries(self.s3.dx12_cfg(appid))
+        return out or None
+
+    def _mirror_live(self, running):
+        """0.8.26 (GitHub #4, mirror from indiesaudi's PR): a running launcher game whose runtime hides the shortcut's appid
+        (Heroic: SteamAppId=0) reads /tmp/vela-live/<that id>.ini. While it runs, its live file is kept under that id too, with
+        the panel closed as well; the copy goes when the game stops."""
+        on = set()
+        for appid in running:
+            rid = getattr(self, "_run_ids", {}).get(str(appid))
+            if sgsr3.is_shortcut(appid) and rid and rid != str(appid) and self.live.get(appid):
+                self.live.mirror(appid, rid)
+                on.add(str(appid))
+        self.live.unmirror(keep=on)
+
     def _game_state(self, appid, window=None, launch=None):
         """window: Steam's resolution override for the game as the panel read it (GetResolutionOverrideForApp; None = not
         read): the steps say when it is not the window the mode needs (0.8.11)."""
         if getattr(self, "chip", None) is not None:
             device.refresh(self, self.v79_dirs, log=decky.logger.info)  # 0.8.21: NPU part installed while the plugin runs
         running = gameutil.running_appids()
+        self._learn(appid, running)  # 0.8.26: a launcher's shortcut that runs: where its game is (the scan below uses it)
+        self._mirror_live(running)
         if getattr(self, "rep", None):
             self.rep.observe(running)
         self.lat.reconcile(running)
@@ -353,7 +435,7 @@ class Plugin:
                     decky.logger.exception("report: run end")
             # 0.8.16: the profile's game settings (its upscaler on, the output at the full screen) in a game that is
             # on, also one set up before its profile had them; a file the game has not written yet waits for its first run
-            cfg = profiles.game_cfg(appid)
+            cfg = self._game_cfg(appid)
             if cfg:
                 self.cfg.ensure(appid, scan.get("install_dir"), cfg, appid in running)
                 s3["game_cfg"] = self.cfg.status(appid)
@@ -476,6 +558,11 @@ class Plugin:
                # 0.8.16: what apply_model "auto" would set up (None: Vela cannot set this game up)
                "auto_model": self._default_model(v["kind"], s3, npu_st, bool(v.get("vulkan"))),
                "window": win, "window_fix": False,
+               # a launcher's shortcut (Xodus Nexus ...): the game folder Vela saw it run (the panel names it; picking a model
+               # confirms a folder that carried no id of its own), and whether an already open launcher started this run
+               "learned": ({"folder": gs["scan"]["learned"]["folder"], "confirmed": gs["scan"]["learned"]["confirmed"]}
+                           if gs["scan"].get("learned") else None),
+               "handoff": bool(getattr(self, "_handoff", {}).get(str(appid))),
                "layer_on": bool(ag.get("installed")),  # 0.8.12's any-game layer: the panel turns it off
                "launch_fix": self._launch_pending(appid, s3),
                "not_in_launch": self._not_in_launch(appid, s3, bool(gs.get("running")))}
@@ -845,7 +932,11 @@ class Plugin:
         return {"launch_options": launch, "resolution": override, "model": model}
 
     async def apply_model(self, appid, model, launch_options, resolution):
-        return await self._run(self._apply_model, str(appid), str(model), launch_options, resolution)
+        res = await self._run(self._apply_model, str(appid), str(model), launch_options, resolution)
+        if str(model) != "off" and sgsr3.is_shortcut(appid):
+            self.s3.learned.confirm(appid)  # the player set Vela up for the game the panel named
+            self.s3.cache.pop(str(appid), None)
+        return res
 
     def _window_fix(self, appid):
         """0.8.15: the panel puts Steam's window of a set-up game back to the full screen (an old window pick of 720p / 900p
@@ -875,7 +966,7 @@ class Plugin:
         if npu_on:
             res["launch_options"] = self.npu.enable(appid, res["launch_options"])
         self._sync_gamescope(appid, True, False)
-        cfg = profiles.game_cfg(appid)
+        cfg = self._game_cfg(appid)
         if cfg:
             self.cfg.enable(appid, res["status"]["scan"].get("install_dir"), cfg, appid in gameutil.running_appids())
         self.floor.enable(appid)

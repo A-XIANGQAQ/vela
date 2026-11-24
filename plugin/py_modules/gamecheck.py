@@ -147,6 +147,10 @@ class GameCheck:
                 cache[path] = hit
                 dirty = True
             found |= set(hit["found"])
+        seen = (scan.get("learned") or {}).get("markers")
+        if seen and not _is_pe(os.path.join(scan.get("exe_dir") or "", scan.get("exe") or "")):
+            # a launcher keeps the exe encrypted on disk (Xodus Nexus): what was read from the copy that ran
+            found |= set(seen)
         d = scan.get("exe_dir")
         if d:
             try:
@@ -164,6 +168,14 @@ class GameCheck:
 
     def check(self, scan, static=False, s3_assets=True, ag_assets=True, appid=None):
         return verdict(scan, self.markers(scan) if scan.get("exe_dir") else set(), static, s3_assets, ag_assets, appid)
+
+
+def _is_pe(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except OSError:
+        return False
 
 
 API_ORDER = ("dx12", "dx11", "vulkan", "opengl")
@@ -191,8 +203,14 @@ def verdict(scan, markers, static=False, s3_assets=True, ag_assets=True, appid=N
     out = {"api": api, "inputs": inputs, "inputs_from": inputs_from, "reason": None}
     if scan.get("anticheat"):
         return {**out, "kind": "none", "reason": "anticheat"}
+    if scan.get("pending") in ("start_once", "launcher"):
+        # 0.8.26 (GitHub #3): a shortcut that starts a launcher: its game is learned while it runs ("start_once"), or it was
+        # seen to start other games ("launcher"). The reason stays non_steam, the panel words the pending state
+        return {**out, "kind": "none", "reason": "non_steam", "pending": scan["pending"]}
     if not scan.get("install_dir"):
         return {**out, "kind": "none", "reason": "non_steam" if is_shortcut(appid) else "not_installed"}
+    if scan.get("machine") == "x86":
+        return {**out, "kind": "none", "reason": "x86"}  # Vela's libraries are 64-bit: a 32-bit game cannot load them
     if static and s3_assets:
         return {**out, "kind": "static"}
     if api == ["opengl"]:

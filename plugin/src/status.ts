@@ -16,7 +16,7 @@ export type S3Log = {
 };
 export type Live = { model?: string; npu?: number; npuexact?: number };
 export type S3State = { installed: boolean; intact: boolean | null; log: S3Log | null; menu_hint: string; static_fsr2?: object | null; live?: Live };
-export type Check = { kind: string; reason: string | null; dx11_only?: boolean };
+export type Check = { kind: string; reason: string | null; pending?: string | null; dx11_only?: boolean };
 // the part of the game state the card reads
 export type StatusIn = {
   running: boolean; sgsr3: S3State; check: Check; scan?: { inputs?: string[] | null }; model: string;
@@ -41,7 +41,7 @@ export const fellBackWhy = (why: string | null | undefined, want: string) =>
 export function statusOf(gs: StatusIn): Status {
   const s3 = gs.sgsr3, c = gs.check;
   if (gs.layer_on) return { dot: YELLOW, text: t("st.layer"), sub: gs.running ? t("st.layerRunning") : t("st.layerOff") };
-  if (c.kind === "none") return { dot: GREY, text: t("not_supported"), sub: reasonText(c.reason) };
+  if (c.kind === "none") return { dot: GREY, text: t("not_supported"), sub: reasonText(c.pending ?? c.reason) };
   if (!s3.installed) return { dot: GREY, text: t("st.off") };  // NOFG (2026-11-15): no frame-generation / any-game status any more
   if (s3.intact === false) return { dot: RED, text: t("st.filesChanged"), sub: t("st.filesChangedSub") };
   // V03c: set up, but Vela is not in this game's launch (options that wrap %command% in a shell command, or the launcher left the
