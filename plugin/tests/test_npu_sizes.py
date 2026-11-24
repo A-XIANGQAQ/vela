@@ -92,5 +92,5 @@ for s in ("1920x1080", "1600x900", "1280x720"):
 # the texts
 with open(os.path.join(ROOT, "src", "i18n", "en.json"), encoding="utf-8") as fh:
     en = json.load(fh)
-assert "(package 15)" in en["hint.npu_update_up"] and "(package 15)" in en["hint.npu_update_sizes"] and "{cmd}" in en["hint.npu_update_sizes"]
+assert "(package 17)" in en["hint.npu_update_up"] and "(package 17)" in en["hint.npu_update_sizes"] and "{cmd}" in en["hint.npu_update_sizes"]
 print("test_npu_sizes OK")

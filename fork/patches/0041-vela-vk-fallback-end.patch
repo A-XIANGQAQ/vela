@@ -1,0 +1,45 @@
+From be10247168c69f62901a0cba4355a2878b7a8c70 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 23 Nov 2026 21:21:23 +0100
+Subject: [PATCH] 0041-vela-vk-fallback-end: the Vulkan fallback chain ends:
+ FSR 2.1.2 failing -> SGSR 2, SGSR 2 failing -> no more changes for the handle
+ (upstream retried FSR 2.1.2 every frame: Haste Demo 1287 failed inits in 5
+ min after a live switch to FSR 3)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/upscalers/FeatureProvider_Vk.cpp | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/OptiScaler/upscalers/FeatureProvider_Vk.cpp b/OptiScaler/upscalers/FeatureProvider_Vk.cpp
+index aeb9952..18c9574 100644
+--- a/OptiScaler/upscalers/FeatureProvider_Vk.cpp
++++ b/OptiScaler/upscalers/FeatureProvider_Vk.cpp
+@@ -207,7 +207,23 @@ bool FeatureProvider_Vk::ChangeFeature(Upscaler upscaler, VkInstance instance, V
+         {
+             LOG_ERROR("init failed with {0} feature", UpscalerDisplayName(state.newBackend));
+ 
+-            if (state.newBackend != Upscaler::DLSSD)
++            // Vela 0041: the fallback chain ends. Upstream fell back to FSR 2.1.2 after every failure, its own failure
++            // included, so a game where FSR 2.1.2 cannot start retried it every frame for good (Haste Demo, Vulkan:
++            // 1287 "init failed with FSR 2.1.2" in 5 min after a live switch to FSR 3, the picture never came back).
++            // Now: FSR 2.1.2 failing -> SGSR 2 (Vela's Vulkan default), SGSR 2 failing -> stop changing (logged).
++            if (state.newBackend == Upscaler::SGSR2)
++            {
++                LOG_ERROR("Vela: SGSR 2 cannot start either; no more fallbacks for this handle");
++                state.newBackend = Upscaler::Reset;
++                state.changeBackend[handleId] = false;
++                return false;
++            }
++            else if (state.newBackend == Upscaler::FSR21)
++            {
++                LOG_WARN("Vela: FSR 2.1.2 cannot start; falling back to SGSR 2");
++                state.newBackend = Upscaler::SGSR2;
++            }
++            else if (state.newBackend != Upscaler::DLSSD)
+             {
+                 if (cfg.VulkanUpscaler == Upscaler::DLSS)
+                 {
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,748 @@
+From 174cea12fb4f6388f0bf288bba1aec8f313450b2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 00:32:01 +0100
+Subject: [PATCH] 0043-vela-vk-defer core: bookkeeping of the deferred Vulkan
+ upscale, free of Vulkan headers (hooks/VelaVkDeferCore.h): Tracker = what the
+ hooks saw of the game's command buffers (begun, secondary, inside a render
+ pass, queue family of the pool) and which recorded jobs wait for a command
+ buffer to reach vkQueueSubmit (a job on a secondary follows
+ vkCmdExecuteCommands to the primary; a re-begun / reset / freed buffer loses
+ its jobs); Ring = 4 own command buffers, strict round robin, Free ->
+ Recording -> Ready -> InFlight, stale rule for the next-Evaluate path (a job
+ no hook submits is due one Evaluate later, a hook job two later), drop by
+ handle. Host-side test arm64ec/tests/vk_defer_core_test.cpp (not in the DLL):
+ 6058 checks
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ OptiScaler/hooks/VelaVkDeferCore.h   | 334 ++++++++++++++++++++++++
+ arm64ec/tests/vk_defer_core_test.cpp | 376 +++++++++++++++++++++++++++
+ 2 files changed, 710 insertions(+)
+ create mode 100644 OptiScaler/hooks/VelaVkDeferCore.h
+ create mode 100644 arm64ec/tests/vk_defer_core_test.cpp
+
+diff --git a/OptiScaler/hooks/VelaVkDeferCore.h b/OptiScaler/hooks/VelaVkDeferCore.h
+new file mode 100644
+index 0000000..cdd556d
+--- /dev/null
++++ b/OptiScaler/hooks/VelaVkDeferCore.h
+@@ -0,0 +1,334 @@
++#pragma once
++
++// Vela 0043 (vk-defer): the bookkeeping of the deferred Vulkan upscale, free of Vulkan and OptiScaler headers so the
++// same code runs in the host-side test (arm64ec/tests/vk_defer_core_test.cpp). Handles are opaque pointers.
++//
++//   Tracker  what the hooks saw of the game's command buffers: begun (known), secondary, inside a render pass, and
++//            which deferred jobs wait for a command buffer to reach vkQueueSubmit (a job recorded while the game was in
++//            a secondary follows vkCmdExecuteCommands to the primary).
++//   Ring     the states of our own command buffers: Free -> Recording -> Ready (recorded, not submitted) -> InFlight
++//            (submitted, fence pending) -> Free. Strict round robin, so a slot is reused only after the job that used it
++//            RingSize jobs ago has completed.
++//
++// Neither class locks: the caller holds one mutex per object (VelaVkDefer.cpp).
++
++#include <cstdint>
++#include <iterator>
++#include <unordered_map>
++#include <vector>
++
++namespace vela_vk_defer
++{
++using Handle = void*;
++
++struct Job
++{
++    int slot = -1;
++    uint64_t seq = 0;
++};
++
++struct CbQuery
++{
++    bool known = false;     // the hooks saw vkBeginCommandBuffer for this handle
++    bool secondary = false; // allocated as secondary, or begun with RENDER_PASS_CONTINUE
++    bool inPass = false;    // primary: between begin/end render pass (or rendering); secondary: RENDER_PASS_CONTINUE
++    bool familyKnown = false;
++    uint32_t family = 0; // queue family of its pool (when the pool's creation was seen)
++};
++
++class Tracker
++{
++  public:
++    void OnCreatePool(Handle pool, uint32_t family) { _poolFamily[pool] = family; }
++
++    void OnDestroyPool(Handle pool)
++    {
++        _poolFamily.erase(pool);
++        for (auto it = _cbs.begin(); it != _cbs.end();)
++            it = it->second.pool == pool ? _cbs.erase(it) : std::next(it);
++    }
++
++    // vkResetCommandPool: every command buffer of the pool is back in the initial state
++    void OnResetPool(Handle pool)
++    {
++        for (auto& [cb, s] : _cbs)
++            if (s.pool == pool)
++                ResetState(s);
++    }
++
++    void OnAllocate(Handle pool, Handle cb, bool secondary)
++    {
++        auto& s = _cbs[cb];
++        s = {};
++        s.pool = pool;
++        s.levelKnown = true;
++        s.secondaryLevel = secondary;
++    }
++
++    void OnFree(Handle cb) { _cbs.erase(cb); }
++
++    // renderPassContinue = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT in the begin flags. The spec ignores the bit
++    // for a primary; when the allocation was not seen (level unknown) the bit alone marks a secondary inside a pass.
++    void OnBegin(Handle cb, bool renderPassContinue)
++    {
++        auto& s = _cbs[cb];
++        ResetState(s);
++        s.known = true;
++        const bool secondary = s.levelKnown ? s.secondaryLevel : renderPassContinue;
++        s.secondary = secondary;
++        s.inPass = secondary && renderPassContinue;
++    }
++
++    void OnReset(Handle cb)
++    {
++        auto it = _cbs.find(cb);
++        if (it != _cbs.end())
++            ResetState(it->second);
++    }
++
++    // begin/end of a render pass instance (vkCmdBeginRenderPass*, vkCmdBeginRendering*) on a primary
++    void OnPass(Handle cb, bool begin)
++    {
++        auto it = _cbs.find(cb);
++        if (it == _cbs.end() || !it->second.known || it->second.secondary)
++            return;
++        it->second.inPass = begin;
++    }
++
++    // vkCmdExecuteCommands: jobs waiting on a secondary now wait on the command buffer that executes it
++    void OnExecute(Handle primary, uint32_t count, const Handle* secondaries)
++    {
++        if (_watchCount == 0 || secondaries == nullptr)
++            return;
++        for (uint32_t i = 0; i < count; i++)
++        {
++            auto it = _cbs.find(secondaries[i]);
++            if (it == _cbs.end() || it->second.jobs.empty() || secondaries[i] == primary)
++                continue;
++            auto moved = std::move(it->second.jobs);
++            it->second.jobs.clear();
++            auto& dst = _cbs[primary].jobs;
++            dst.insert(dst.end(), moved.begin(), moved.end());
++        }
++    }
++
++    CbQuery Query(Handle cb) const
++    {
++        CbQuery q {};
++        auto it = _cbs.find(cb);
++        if (it == _cbs.end())
++            return q;
++        q.known = it->second.known;
++        q.secondary = it->second.secondary;
++        q.inPass = it->second.inPass;
++        auto pf = _poolFamily.find(it->second.pool);
++        if (pf != _poolFamily.end())
++        {
++            q.familyKnown = true;
++            q.family = pf->second;
++        }
++        return q;
++    }
++
++    // a job recorded during Evaluate on `cb` waits for the submit that carries cb (or the primary executing it)
++    void Watch(Handle cb, Job job)
++    {
++        _cbs[cb].jobs.push_back(job);
++        _watchCount++;
++    }
++
++    // vkQueueSubmit*: the jobs whose command buffer is in this submit, oldest first; they stop waiting
++    void TakeForSubmit(Handle cb, std::vector<Job>& out)
++    {
++        if (_watchCount == 0)
++            return;
++        auto it = _cbs.find(cb);
++        if (it == _cbs.end() || it->second.jobs.empty())
++            return;
++        for (const Job& j : it->second.jobs)
++            out.push_back(j);
++        _watchCount -= it->second.jobs.size();
++        it->second.jobs.clear();
++    }
++
++    size_t WatchCount() const { return _watchCount; }
++    size_t Size() const { return _cbs.size(); }
++
++  private:
++    struct CbState
++    {
++        Handle pool = nullptr;
++        bool levelKnown = false;
++        bool secondaryLevel = false;
++        bool known = false;
++        bool secondary = false;
++        bool inPass = false;
++        std::vector<Job> jobs;
++    };
++
++    // a re-begun / reset command buffer lost its recording: jobs still waiting on it can never be submitted by the hook
++    // (the ring's stale rule sends them through the next-Evaluate path)
++    void ResetState(CbState& s)
++    {
++        _watchCount -= s.jobs.size();
++        s.jobs.clear();
++        s.known = false;
++        s.secondary = false;
++        s.inPass = false;
++    }
++
++    std::unordered_map<Handle, CbState> _cbs;
++    std::unordered_map<Handle, uint32_t> _poolFamily;
++    size_t _watchCount = 0;
++};
++
++enum class SlotState : uint8_t
++{
++    Free,
++    Recording,
++    Ready,
++    InFlight
++};
++
++class Ring
++{
++  public:
++    // 4 = SGSR2FeatureVk::FrameRingDepth: the feature rewrites descriptor set / constants slot k every 4th Evaluate, and
++    // strict round robin frees our slot k only when the job that used that set has completed.
++    static constexpr int Size = 4;
++
++    struct Slot
++    {
++        SlotState state = SlotState::Free;
++        uint64_t seq = 0;
++        uint32_t handleId = 0;
++        bool viaHook = false; // a hook will submit it (else: the next Evaluate)
++        bool clearFirst = false;
++    };
++
++    int NextIndex() const { return _next; }
++    const Slot& At(int i) const { return _slots[i]; }
++    uint64_t Seq() const { return _seq; }
++
++    // Returns the slot, or -1 when the next slot is still InFlight (the caller checks its fence, calls Complete and
++    // retries, or gives the frame up). A Ready job still sitting in the next slot was never submitted: it is dropped.
++    int Acquire(uint32_t handleId, bool viaHook, bool* droppedReady = nullptr)
++    {
++        Slot& s = _slots[_next];
++        if (s.state == SlotState::InFlight || s.state == SlotState::Recording)
++            return -1;
++        if (droppedReady != nullptr)
++            *droppedReady = s.state == SlotState::Ready;
++        s = {};
++        s.state = SlotState::Recording;
++        s.seq = ++_seq;
++        s.handleId = handleId;
++        s.viaHook = viaHook;
++        const int i = _next;
++        _next = (_next + 1) % Size;
++        return i;
++    }
++
++    void Commit(int i, bool clearFirst)
++    {
++        if (_slots[i].state != SlotState::Recording)
++            return;
++        _slots[i].state = SlotState::Ready;
++        _slots[i].clearFirst = clearFirst;
++    }
++
++    // the recording is thrown away; the slot is the next one again, so the round robin keeps its order
++    void Cancel(int i)
++    {
++        if (_slots[i].state != SlotState::Recording)
++            return;
++        const bool latest = _slots[i].seq == _seq && (_next + Size - 1) % Size == i;
++        _slots[i] = {};
++        if (latest)
++        {
++            _next = i;
++            _seq--;
++        }
++    }
++
++    bool IsReady(Job j) const
++    {
++        return j.slot >= 0 && j.slot < Size && _slots[j.slot].state == SlotState::Ready && _slots[j.slot].seq == j.seq;
++    }
++
++    void Submitted(int i)
++    {
++        if (_slots[i].state == SlotState::Ready)
++            _slots[i].state = SlotState::InFlight;
++    }
++
++    void Complete(int i)
++    {
++        if (_slots[i].state == SlotState::InFlight)
++            _slots[i] = {};
++    }
++
++    // a job that could not be submitted (queue error): never reaches the GPU
++    void Fail(int i)
++    {
++        if (_slots[i].state == SlotState::Ready)
++            _slots[i] = {};
++    }
++
++    // the feature of this handle is about to be destroyed or re-created: recorded but unsubmitted jobs reference its
++    // pipelines and images and must never be submitted (handleId 0xFFFFFFFF = every handle)
++    int DropHandle(uint32_t handleId)
++    {
++        int n = 0;
++        for (auto& s : _slots)
++        {
++            if (s.state == SlotState::Ready && (handleId == 0xFFFFFFFFu || s.handleId == handleId))
++            {
++                s = {};
++                n++;
++            }
++        }
++        return n;
++    }
++
++    // Called at the start of an Evaluate, before Acquire: the Ready jobs the next-Evaluate path must submit now, oldest
++    // first. A job no hook will submit is due one Evaluate later; a job a hook should have submitted is due two
++    // Evaluates later (the game's submit of its frame may still be on its way while the next frame records).
++    int Stale(Job out[Size]) const
++    {
++        int n = 0;
++        for (int k = 0; k < Size; k++)
++        {
++            const int i = (_next + k) % Size; // oldest first
++            const Slot& s = _slots[i];
++            if (s.state != SlotState::Ready)
++                continue;
++            const uint64_t age = _seq - s.seq + 1;
++            if (age >= (s.viaHook ? 2u : 1u))
++                out[n++] = Job { i, s.seq };
++        }
++        return n;
++    }
++
++    // every slot free again, the sequence numbers go on (a job of the old ring can never match a new one)
++    void Reset()
++    {
++        for (auto& s : _slots)
++            s = {};
++        _next = 0;
++    }
++
++    int Count(SlotState st) const
++    {
++        int n = 0;
++        for (const auto& s : _slots)
++            n += s.state == st ? 1 : 0;
++        return n;
++    }
++
++  private:
++    Slot _slots[Size] {};
++    int _next = 0;
++    uint64_t _seq = 0;
++};
++} // namespace vela_vk_defer
+diff --git a/arm64ec/tests/vk_defer_core_test.cpp b/arm64ec/tests/vk_defer_core_test.cpp
+new file mode 100644
+index 0000000..2a00478
+--- /dev/null
++++ b/arm64ec/tests/vk_defer_core_test.cpp
+@@ -0,0 +1,376 @@
++// Host-side test of the Vela 0043 bookkeeping (OptiScaler/hooks/VelaVkDeferCore.h): no Vulkan, no OptiScaler headers.
++//   x86_64-w64-mingw32-clang++ -std=c++20 -O1 -I OptiScaler/hooks arm64ec/tests/vk_defer_core_test.cpp -o t.exe && ./t.exe
++// Not part of the DLL (arm64ec/build.sh compiles OptiScaler/ and compat/arm64ec/ only).
++
++#include "VelaVkDeferCore.h"
++
++#include <cstdio>
++#include <cstdlib>
++
++using namespace vela_vk_defer;
++
++static int g_checks = 0, g_failed = 0;
++#define CHECK(x)                                                                                                       \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        g_checks++;                                                                                                    \
++        if (!(x))                                                                                                      \
++        {                                                                                                              \
++            g_failed++;                                                                                                \
++            std::printf("FAIL line %d: %s\n", __LINE__, #x);                                                           \
++        }                                                                                                              \
++    } while (0)
++
++static Handle H(uintptr_t v) { return (Handle) v; }
++
++static void TestTrackerStates()
++{
++    Tracker t;
++    const Handle pool = H(0x10), P = H(0x100), X = H(0x200), Y = H(0x300), U = H(0x400);
++    t.OnCreatePool(pool, 3);
++    t.OnAllocate(pool, P, false);
++    t.OnAllocate(pool, X, true);
++    t.OnAllocate(pool, Y, true);
++
++    CHECK(!t.Query(P).known); // allocated, never begun
++    CHECK(!t.Query(H(0x999)).known);
++
++    // Unity: a secondary begun with RENDER_PASS_CONTINUE
++    t.OnBegin(X, true);
++    CbQuery q = t.Query(X);
++    CHECK(q.known && q.secondary && q.inPass && q.familyKnown && q.family == 3);
++
++    // a secondary outside a render pass: compute work is valid there
++    t.OnBegin(Y, false);
++    q = t.Query(Y);
++    CHECK(q.known && q.secondary && !q.inPass);
++
++    // a primary: inside a pass only between begin and end
++    t.OnBegin(P, false);
++    CHECK(t.Query(P).known && !t.Query(P).secondary && !t.Query(P).inPass);
++    t.OnPass(P, true);
++    CHECK(t.Query(P).inPass);
++    t.OnPass(P, false);
++    CHECK(!t.Query(P).inPass);
++
++    // the spec ignores RENDER_PASS_CONTINUE on a primary
++    t.OnBegin(P, true);
++    CHECK(!t.Query(P).secondary && !t.Query(P).inPass);
++
++    // allocation not seen (made before the hooks tracked): the flag alone decides
++    t.OnBegin(U, true);
++    q = t.Query(U);
++    CHECK(q.known && q.secondary && q.inPass && !q.familyKnown);
++    t.OnBegin(U, false);
++    CHECK(t.Query(U).known && !t.Query(U).secondary && !t.Query(U).inPass);
++
++    // a render pass event on a command buffer never seen begun changes nothing
++    t.OnPass(H(0x777), true);
++    CHECK(!t.Query(H(0x777)).known);
++
++    // reset: unknown again until the next begin
++    t.OnReset(X);
++    CHECK(!t.Query(X).known);
++    t.OnBegin(X, true);
++    t.OnResetPool(pool);
++    CHECK(!t.Query(X).known && !t.Query(P).known);
++    t.OnBegin(X, true);
++    t.OnFree(X);
++    CHECK(!t.Query(X).known);
++    t.OnDestroyPool(pool);
++    CHECK(!t.Query(P).familyKnown && t.Size() == 1); // only U (no pool) is left
++}
++
++static void TestTrackerWatch()
++{
++    Tracker t;
++    const Handle pool = H(0x10), P = H(0x100), P2 = H(0x110), X = H(0x200), X2 = H(0x210);
++    t.OnAllocate(pool, P, false);
++    t.OnAllocate(pool, P2, false);
++    t.OnAllocate(pool, X, true);
++    t.OnAllocate(pool, X2, true);
++    std::vector<Job> out;
++
++    // secondary -> primary -> submit
++    t.OnBegin(P, false);
++    t.OnBegin(X, true);
++    t.Watch(X, Job { 0, 1 });
++    CHECK(t.WatchCount() == 1);
++    t.TakeForSubmit(P, out);
++    CHECK(out.empty()); // not executed yet
++    t.OnExecute(P, 1, &X);
++    t.TakeForSubmit(X, out);
++    CHECK(out.empty()); // moved away from the secondary
++    t.TakeForSubmit(P2, out);
++    CHECK(out.empty());
++    t.TakeForSubmit(P, out);
++    CHECK(out.size() == 1 && out[0].slot == 0 && out[0].seq == 1 && t.WatchCount() == 0);
++    out.clear();
++    t.TakeForSubmit(P, out);
++    CHECK(out.empty()); // taken once
++
++    // two secondaries with jobs executed by one primary, in order
++    t.OnBegin(P, false);
++    t.OnBegin(X, true);
++    t.OnBegin(X2, true);
++    t.Watch(X, Job { 1, 2 });
++    t.Watch(X2, Job { 2, 3 });
++    const Handle both[2] = { X, X2 };
++    t.OnExecute(P, 2, both);
++    t.TakeForSubmit(P, out);
++    CHECK(out.size() == 2 && out[0].seq == 2 && out[1].seq == 3 && t.WatchCount() == 0);
++    out.clear();
++
++    // Evaluate on a primary that is inside a pass: the primary itself is watched
++    t.OnBegin(P2, false);
++    t.OnPass(P2, true);
++    t.Watch(P2, Job { 3, 4 });
++    t.OnPass(P2, false);
++    t.TakeForSubmit(P2, out);
++    CHECK(out.size() == 1 && out[0].seq == 4);
++    out.clear();
++
++    // the recording is abandoned (begun again before it was executed): the hook never gets the job
++    t.OnBegin(X, true);
++    t.Watch(X, Job { 0, 5 });
++    t.OnBegin(X, true);
++    CHECK(t.WatchCount() == 0);
++    t.OnExecute(P, 1, &X);
++    t.TakeForSubmit(P, out);
++    CHECK(out.empty());
++
++    // a job on a primary that is reset / freed / whose pool goes away
++    t.OnBegin(P, false);
++    t.Watch(P, Job { 1, 6 });
++    t.OnReset(P);
++    CHECK(t.WatchCount() == 0);
++    t.OnBegin(P, false);
++    t.Watch(P, Job { 1, 7 });
++    t.OnResetPool(pool);
++    CHECK(t.WatchCount() == 0);
++
++    // executing a secondary the tracker never saw, or a null list, is harmless
++    const Handle stranger = H(0xABC);
++    t.OnBegin(P, false);
++    t.Watch(P, Job { 2, 8 });
++    t.OnExecute(P, 1, &stranger);
++    t.OnExecute(P, 1, nullptr);
++    t.OnExecute(P, 1, &P); // self: ignored
++    t.TakeForSubmit(P, out);
++    CHECK(out.size() == 1 && out[0].seq == 8);
++}
++
++static void TestRing()
++{
++    Ring r;
++    bool dropped = false;
++
++    // round robin, sequence numbers
++    int a = r.Acquire(7, true, &dropped);
++    CHECK(a == 0 && !dropped && r.At(0).state == SlotState::Recording && r.At(0).seq == 1);
++    CHECK(r.Acquire(7, true) == 1);
++    r.Reset();
++    CHECK(r.Count(SlotState::Free) == Ring::Size && r.Seq() == 2);
++
++    // cancel puts the slot and the sequence back
++    a = r.Acquire(7, true);
++    const uint64_t seqA = r.At(a).seq;
++    r.Cancel(a);
++    CHECK(r.NextIndex() == a && r.Seq() == seqA - 1);
++    a = r.Acquire(7, true);
++    CHECK(r.At(a).seq == seqA);
++    r.Commit(a, true);
++    CHECK(r.IsReady(Job { a, seqA }) && r.At(a).clearFirst);
++    CHECK(!r.IsReady(Job { a, seqA + 1 }) && !r.IsReady(Job { -1, seqA }) && !r.IsReady(Job { 9, seqA }));
++
++    // stale rule: a hook job is not due at the next Evaluate, it is due at the one after
++    Job st[Ring::Size];
++    CHECK(r.Stale(st) == 0);
++    int b = r.Acquire(7, true);
++    r.Commit(b, false);
++    CHECK(r.Stale(st) == 1 && st[0].slot == a);
++    r.Submitted(a);
++    CHECK(!r.IsReady(Job { a, seqA }) && r.At(a).state == SlotState::InFlight);
++    r.Complete(a);
++    CHECK(r.At(a).state == SlotState::Free);
++
++    // a job no hook submits is due at the next Evaluate
++    r.Reset();
++    int c = r.Acquire(7, false);
++    r.Commit(c, false);
++    CHECK(r.Stale(st) == 1 && st[0].slot == c);
++
++    // ring full: the 5th acquire fails until the oldest completes
++    r.Reset();
++    int s[Ring::Size];
++    for (int i = 0; i < Ring::Size; i++)
++    {
++        s[i] = r.Acquire(1, true);
++        CHECK(s[i] == i);
++        r.Commit(s[i], false);
++        r.Submitted(s[i]);
++    }
++    CHECK(r.Acquire(1, true) == -1 && r.Count(SlotState::InFlight) == Ring::Size);
++    r.Complete(r.NextIndex());
++    CHECK(r.Acquire(1, true) == 0);
++
++    // a Ready job still in the next slot was never submitted: dropped and reported
++    r.Reset();
++    for (int i = 0; i < Ring::Size; i++)
++        r.Commit(r.Acquire(1, true), false);
++    dropped = false;
++    const uint64_t oldSeq = r.At(0).seq;
++    CHECK(r.Acquire(1, true, &dropped) == 0 && dropped);
++    CHECK(!r.IsReady(Job { 0, oldSeq })); // the old job can no longer be submitted
++
++    // a feature goes away: only its unsubmitted jobs are dropped
++    r.Reset();
++    int h1 = r.Acquire(1, true);
++    r.Commit(h1, false);
++    int h2 = r.Acquire(2, true);
++    r.Commit(h2, false);
++    int h3 = r.Acquire(1, true);
++    r.Commit(h3, false);
++    r.Submitted(h3);
++    CHECK(r.DropHandle(1) == 1);
++    CHECK(r.At(h1).state == SlotState::Free && r.At(h2).state == SlotState::Ready &&
++          r.At(h3).state == SlotState::InFlight);
++    CHECK(r.DropHandle(0xFFFFFFFFu) == 1 && r.At(h3).state == SlotState::InFlight);
++
++    // a failed submit frees the slot; state changes on the wrong state do nothing
++    r.Reset();
++    int f = r.Acquire(1, true);
++    r.Submitted(f); // not Ready
++    CHECK(r.At(f).state == SlotState::Recording);
++    r.Commit(f, false);
++    r.Complete(f); // not InFlight
++    CHECK(r.At(f).state == SlotState::Ready);
++    r.Fail(f);
++    CHECK(r.At(f).state == SlotState::Free);
++}
++
++// 2000 frames as the Unity case runs them: Evaluate on a secondary inside a pass, executed by a primary, submitted;
++// the GPU finishes a job two frames later. Every job must be submitted by the hook, none by the stale rule, none lost.
++static void TestFrameLoopHook()
++{
++    Tracker t;
++    Ring r;
++    const Handle pool = H(1), P = H(0x100), X = H(0x200);
++    t.OnAllocate(pool, P, false);
++    t.OnAllocate(pool, X, true);
++    int hook = 0, stale = 0, noSlot = 0;
++    int inFlightAge[Ring::Size] {};
++    for (int frame = 0; frame < 2000; frame++)
++    {
++        t.OnBegin(P, false);
++        t.OnPass(P, true);
++        t.OnBegin(X, true);
++
++        // Evaluate
++        Job st[Ring::Size];
++        stale += r.Stale(st);
++        const CbQuery q = t.Query(X);
++        CHECK(q.known && q.inPass);
++        const int next = r.NextIndex();
++        if (r.At(next).state == SlotState::InFlight && inFlightAge[next] >= 2)
++            r.Complete(next);
++        const int slot = r.Acquire(1, true);
++        if (slot < 0)
++        {
++            noSlot++;
++        }
++        else
++        {
++            r.Commit(slot, frame == 0);
++            t.Watch(X, Job { slot, r.At(slot).seq });
++        }
++
++        t.OnExecute(P, 1, &X);
++        t.OnPass(P, false);
++
++        // vkQueueSubmit hook
++        std::vector<Job> jobs;
++        t.TakeForSubmit(P, jobs);
++        for (const Job& j : jobs)
++        {
++            if (r.IsReady(j))
++            {
++                r.Submitted(j.slot);
++                inFlightAge[j.slot] = 0;
++                hook++;
++            }
++        }
++        for (int i = 0; i < Ring::Size; i++)
++            if (r.At(i).state == SlotState::InFlight)
++                inFlightAge[i]++;
++    }
++    CHECK(hook == 2000 && stale == 0 && noSlot == 0 && t.WatchCount() == 0);
++}
++
++// The hooks are blind: every job is submitted at the start of the next Evaluate, in order.
++static void TestFrameLoopFallback()
++{
++    Ring r;
++    int fallback = 0, noSlot = 0;
++    uint64_t lastSeq = 0;
++    for (int frame = 0; frame < 2000; frame++)
++    {
++        Job st[Ring::Size];
++        const int n = r.Stale(st);
++        CHECK(n == (frame == 0 ? 0 : 1));
++        for (int k = 0; k < n; k++)
++        {
++            CHECK(r.IsReady(st[k]) && st[k].seq == lastSeq + 1);
++            lastSeq = st[k].seq;
++            r.Submitted(st[k].slot);
++            fallback++;
++        }
++        const int next = r.NextIndex();
++        if (r.At(next).state == SlotState::InFlight)
++            r.Complete(next); // the fence of the job 4 frames back has signalled
++        const int slot = r.Acquire(1, false);
++        if (slot < 0)
++            noSlot++;
++        else
++            r.Commit(slot, false);
++    }
++    CHECK(fallback == 1999 && noSlot == 0);
++}
++
++// A hook job whose submit never comes (the game threw the recording away) goes out through the stale rule two Evaluates
++// later and the hook, arriving late for it, does not submit it a second time.
++static void TestOrphan()
++{
++    Tracker t;
++    Ring r;
++    const Handle X = H(0x200), P = H(0x100);
++    t.OnBegin(X, true);
++    const int s0 = r.Acquire(1, true);
++    r.Commit(s0, false);
++    const Job j0 { s0, r.At(s0).seq };
++    t.Watch(X, j0);
++
++    Job st[Ring::Size];
++    CHECK(r.Stale(st) == 0); // next Evaluate: not due yet
++    const int s1 = r.Acquire(1, true);
++    r.Commit(s1, false);
++    CHECK(r.Stale(st) == 1 && st[0].slot == s0); // the Evaluate after: due
++    r.Submitted(s0);
++
++    std::vector<Job> jobs;
++    t.OnExecute(P, 1, &X);
++    t.TakeForSubmit(P, jobs);
++    CHECK(jobs.size() == 1 && !r.IsReady(jobs[0])); // late hook: already in flight
++}
++
++int main()
++{
++    TestTrackerStates();
++    TestTrackerWatch();
++    TestRing();
++    TestFrameLoopHook();
++    TestFrameLoopFallback();
++    TestOrphan();
++    std::printf("vk_defer_core_test: %d checks, %d failed\n", g_checks, g_failed);
++    return g_failed == 0 ? 0 : 1;
++}
+-- 
+2.54.0.windows.1
+

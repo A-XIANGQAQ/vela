@@ -39,3 +39,13 @@ ba7450a8c640779e69f0c0b51c6c80b7 *0037-vela-input-api-log.patch
 6388498c0bbcd16ca79e8a0409d38bbc *0038-vela-ue-xess-depth.patch
 bcb1fc606cdcd25527140d1c8380e099 *0039-vela-nodepth-flat.patch
 6a3354a9989f515442a31da7dd50dd6a *0040-vela-vk-live.patch
+41e8b31f4a630f055c3537c35ab0ef9e *0041-vela-vk-fallback-end.patch
+ffb1a46e094b1a4088ada90990acc56b *0042-vela-sgsr2-vk-depth-view.patch
+d3ddfc4ab0ad45765ce110810b78444c *0043a-vela-vk-defer-core.patch
+474d9c697818ab8c2e43e5f6c825e8e7 *0043b-vela-vk-defer-hooks.patch
+d4eba79919551ea9d4c44f146c221a47 *0043c-vela-vk-defer.patch
+e00f52f0014d0aef9ce97c4f613bdf54 *0044-vela-unity-vk-outside-pass.patch
+5fe2df7f4d59ad7b4abf354f095c9b0c *0045-vela-unity-vk-interface.patch
+d601e38511aef02904d429bc1c56ad27 *0046-vela-sgsr2-preexposure.patch
+c2f1f2e6ac4bf9de859b0dc49de8fc62 *0047-vela-ffx-vk-debug.patch
+a895f1471224a86968014265a1b22de5 *0048-vela-vk-shaders.patch

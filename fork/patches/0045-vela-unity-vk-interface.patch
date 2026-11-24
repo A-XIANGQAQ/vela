@@ -1,0 +1,629 @@
+From 9228d0bcfefcc2dfdd0e92b269591a0cb40ecc82 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 01:45:22 +0100
+Subject: [PATCH] 0045-vela-unity-vk-interface: the 0044 code patch lands too
+ late when OptiScaler is loaded after the plugin device init (device job R8D),
+ so Unity is asked through its own public interface instead. IUnityInterfaces*
+ is read from the global NVUnityPlugin.dll keeps it in: the export
+ UnityPluginLoad, its E9 jump thunks, the first RIP-relative 64-bit store in
+ the first 0x80 bytes (decoded, no fixed RVA; this build: RVA 154268); every
+ pointer is checked (readable, function pointers inside UnityPlayer.dll)
+ before a call. IUnityGraphicsVulkan = GetInterfaceSplit(V1 GUID
+ 95355348d4ef4e11-9789313dfcffcc87); V1 and V2 share the slots used (2
+ ConfigureEvent, 4 CommandRecordingState, 9 EnsureOutsideRenderPass).
+ VELA_UNITY_VK_OUTSIDE is now bit flags, unset = 7: 1 = the 0044 patch; 2 =
+ ConfigureEvent(NVUP_GetBaseEventId()+1 and +2, {EnsureOutside, DontCare, 9})
+ at NVSDK_NGX_VULKAN_Init and once more before the first recording call; 4 =
+ before CreateFeature and Evaluate record: CommandRecordingState, inside a
+ render pass -> EnsureOutsideRenderPass, state again, and recording goes into
+ the command buffer Unity then names. 0043 interplay: in auto mode the answer
+ of Unity wins (outside -> not deferred, still inside -> deferred, call failed
+ or no interface -> the rules as before). Log prefix Vela Unity VK: (interface
+ found, ConfigureEvent events, first CreateFeature / Evaluate state, counters
+ every 600 Evaluate calls, one line per failure). VelaVkDefer::DropHandle also
+ waits up to 200 ms each for jobs of the handle already on the GPU before the
+ feature is destroyed (VUID-vkDestroyImage-image-01000 in run R8C). Host test:
+ the decode on the real plugin gives function RVA 35DD0 and global RVA 154268
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ OptiScaler/hooks/VelaUnityVk.cpp      | 256 +++++++++++++++++++++++++-
+ OptiScaler/hooks/VelaUnityVk.h        |  36 +++-
+ OptiScaler/hooks/VelaUnityVkCore.h    |  47 +++++
+ OptiScaler/hooks/VelaVkDefer.cpp      |  35 +++-
+ OptiScaler/hooks/VelaVkDefer.h        |   3 +-
+ OptiScaler/inputs/NVNGX_DLSS_Vk.cpp   |   9 +-
+ arm64ec/tests/unity_vk_patch_test.cpp |  34 ++++
+ 7 files changed, 399 insertions(+), 21 deletions(-)
+
+diff --git a/OptiScaler/hooks/VelaUnityVk.cpp b/OptiScaler/hooks/VelaUnityVk.cpp
+index 26e6586..f38a06e 100644
+--- a/OptiScaler/hooks/VelaUnityVk.cpp
++++ b/OptiScaler/hooks/VelaUnityVk.cpp
+@@ -20,14 +20,16 @@ std::mutex g_mx;
+ std::vector<HMODULE> g_done; // module handles already looked at (a handful at most)
+ std::atomic<bool> g_outside { false };
+ 
+-bool Enabled()
++int Flags()
+ {
+-    static const bool on = []
++    static const int f = []
+     {
+         const char* e = std::getenv("VELA_UNITY_VK_OUTSIDE");
+-        return !(e != nullptr && e[0] == '0' && e[1] == 0);
++        if (e != nullptr && e[0] >= '0' && e[0] <= '7' && e[1] == 0)
++            return e[0] - '0';
++        return 7;
+     }();
+-    return on;
++    return f;
+ }
+ 
+ bool EndsWithNoCase(std::wstring_view text, std::wstring_view lowerSuffix)
+@@ -62,10 +64,11 @@ void Handle(HMODULE module, const char* where, bool inTime)
+             return;
+     g_done.push_back(module);
+ 
+-    if (!Enabled())
++    if ((Flags() & 1) == 0)
+     {
+-        LOG_INFO("Vela Unity VK: off (VELA_UNITY_VK_OUTSIDE=0): NVUnityPlugin.dll {:X} left as it is ({})",
+-                 (size_t) module, where);
++        LOG_INFO("Vela Unity VK: off (VELA_UNITY_VK_OUTSIDE={}, bit 1 not set): NVUnityPlugin.dll {:X} code left as it "
++                 "is ({})",
++                 Flags(), (size_t) module, where);
+         return;
+     }
+     if (!inTime)
+@@ -105,6 +108,158 @@ void Handle(HMODULE module, const char* where, bool inTime)
+         break;
+     }
+ }
++
++// ------------------------------------------------------------------------------------------ 0045: Unity's interface
++// Own declarations of the public Unity native plugin API (IUnityInterface.h, IUnityGraphicsVulkan.h), only what is used.
++// IUnityInterfaces = { GetInterface, RegisterInterface, GetInterfaceSplit, RegisterInterfaceSplit }.
++// IUnityGraphicsVulkan (V1 GUID 95355348d4ef4e11-9789313dfcffcc87; V2 has the same first 13 members): slot 2
++// ConfigureEvent (the plugin's own CALL [RAX+10h]), slot 4 CommandRecordingState, slot 9 EnsureOutsideRenderPass.
++constexpr unsigned long long kVulkanGuidHigh = 0x95355348d4ef4e11ULL;
++constexpr unsigned long long kVulkanGuidLow = 0x9789313dfcffcc87ULL;
++constexpr int kSlotGetInterfaceSplit = 2;
++constexpr int kSlotConfigureEvent = 2;
++constexpr int kSlotCommandRecordingState = 4;
++constexpr int kSlotEnsureOutsideRenderPass = 9;
++constexpr int kVulkanSlotsNeeded = 10;
++
++struct UnityRecordingState // UnityVulkanRecordingState
++{
++    VkCommandBuffer commandBuffer;
++    VkCommandBufferLevel commandBufferLevel;
++    VkRenderPass renderPass;
++    VkFramebuffer framebuffer;
++    int subPassIndex;
++    unsigned long long currentFrameNumber;
++    unsigned long long safeFrameNumber;
++    void* reserved[4];
++};
++
++struct UnityEventConfig // UnityVulkanPluginEventConfig
++{
++    int renderPassPrecondition; // 2 = kUnityVulkanRenderPass_EnsureOutside
++    int graphicsQueueAccess;    // 0 = kUnityVulkanGraphicsQueueAccess_DontCare
++    uint32_t flags;             // 9 = EnsurePreviousFrameSubmission | ModifiesCommandBuffersState (the plugin's own)
++};
++
++using PFN_GetInterfaceSplit = void* (*) (unsigned long long, unsigned long long);
++using PFN_ConfigureEvent = void (*)(int, const UnityEventConfig*);
++using PFN_CommandRecordingState = bool (*)(UnityRecordingState*, int);
++using PFN_EnsureOutsideRenderPass = void (*)();
++using PFN_GetBaseEventId = int (*)();
++
++void** g_vulkan = nullptr; // IUnityGraphicsVulkan as its table of function pointers; set once, under g_mx
++int g_ifaceTries = 0;
++bool g_configuredAtRecord = false;
++bool g_firstLogged[2] = {};
++uint64_t g_evals = 0, g_insideAtEntry = 0, g_outsideAfter = 0, g_stillInside = 0, g_stateFailed = 0, g_changed = 0;
++
++bool Readable(const void* p, size_t size)
++{
++    MEMORY_BASIC_INFORMATION mbi {};
++    if (p == nullptr || VirtualQuery(p, &mbi, sizeof(mbi)) == 0)
++        return false;
++    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
++        return false;
++    const auto* end = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
++    return static_cast<const uint8_t*>(p) + size <= end;
++}
++
++bool InModule(const void* p, HMODULE module)
++{
++    auto* base = reinterpret_cast<uint8_t*>(module);
++    const uint32_t size = ImageSize(base);
++    const auto* q = static_cast<const uint8_t*>(p);
++    return size != 0 && q >= base && q < base + size;
++}
++
++// g_mx held. One line per failure; at most three tries (NGX init, first CreateFeature, first Evaluate).
++bool FindInterface(const char* where)
++{
++    if (g_vulkan != nullptr)
++        return true;
++    if (g_ifaceTries >= 3)
++        return false;
++    g_ifaceTries++;
++
++    HMODULE plugin = GetModuleHandleW(L"NVUnityPlugin.dll");
++    HMODULE player = GetModuleHandleW(L"UnityPlayer.dll");
++    if (plugin == nullptr || player == nullptr)
++    {
++        LOG_INFO("Vela Unity VK: interface not looked for at {}: {} is not loaded (not a Unity game with the NVIDIA "
++                 "plugin)",
++                 where, plugin == nullptr ? "NVUnityPlugin.dll" : "UnityPlayer.dll");
++        g_ifaceTries = 3;
++        return false;
++    }
++
++    auto* pluginBase = reinterpret_cast<uint8_t*>(plugin);
++    auto* load = reinterpret_cast<uint8_t*>(GetProcAddress(plugin, "UnityPluginLoad"));
++    if (load == nullptr || !Readable(load, 16))
++    {
++        LOG_WARN("Vela Unity VK: interface not found at {}: NVUnityPlugin.dll exports no UnityPluginLoad", where);
++        return false;
++    }
++    uint8_t* fn = FollowJumps(load, pluginBase);
++    uint8_t* global = fn != nullptr && Readable(fn, kStoreWindow) ? FirstRipStore64(fn, kStoreWindow) : nullptr;
++    if (global == nullptr || !InModule(global, plugin) || !Readable(global, sizeof(void*)))
++    {
++        LOG_WARN("Vela Unity VK: interface not found at {}: no store of IUnityInterfaces* in the first {} bytes of "
++                 "UnityPluginLoad (another plugin build)",
++                 where, kStoreWindow);
++        return false;
++    }
++
++    void** interfaces = *reinterpret_cast<void***>(global);
++    if (interfaces == nullptr || !Readable(interfaces, 4 * sizeof(void*)) || !InModule(interfaces[0], player) ||
++        !InModule(interfaces[1], player) || !InModule(interfaces[2], player) || !InModule(interfaces[3], player))
++    {
++        LOG_WARN("Vela Unity VK: interface not found at {}: the plugin's global (RVA {:X}) holds {:X}, not an "
++                 "IUnityInterfaces of UnityPlayer.dll",
++                 where, (size_t) (global - pluginBase), (size_t) interfaces);
++        return false;
++    }
++
++    auto getSplit = reinterpret_cast<PFN_GetInterfaceSplit>(interfaces[kSlotGetInterfaceSplit]);
++    void** vulkan = static_cast<void**>(getSplit(kVulkanGuidHigh, kVulkanGuidLow));
++    if (vulkan == nullptr || !Readable(vulkan, kVulkanSlotsNeeded * sizeof(void*)) ||
++        !InModule(vulkan[kSlotConfigureEvent], player) || !InModule(vulkan[kSlotCommandRecordingState], player) ||
++        !InModule(vulkan[kSlotEnsureOutsideRenderPass], player))
++    {
++        LOG_WARN("Vela Unity VK: interface not found at {}: IUnityInterfaces {:X} gave IUnityGraphicsVulkan {:X} (null "
++                 "= Unity does not run Vulkan; else its functions are not in UnityPlayer.dll)",
++                 where, (size_t) interfaces, (size_t) vulkan);
++        return false;
++    }
++
++    g_vulkan = vulkan;
++    LOG_INFO("Vela Unity VK: interface found at {}: IUnityInterfaces {:X} (the plugin's global at RVA {:X}), "
++             "IUnityGraphicsVulkan {:X} (V1 GUID 95355348d4ef4e11-9789313dfcffcc87); VELA_UNITY_VK_OUTSIDE={}",
++             where, (size_t) interfaces, (size_t) (global - pluginBase), (size_t) vulkan, Flags());
++    return true;
++}
++
++// g_mx held, interface found. Unity's header: "should be called during initialization"; whether a later call is
++// honoured is what the device run tells.
++void ConfigureEvents(const char* where)
++{
++    HMODULE plugin = GetModuleHandleW(L"NVUnityPlugin.dll");
++    auto getBase = plugin != nullptr ? reinterpret_cast<PFN_GetBaseEventId>(GetProcAddress(plugin, "NVUP_GetBaseEventId"))
++                                     : nullptr;
++    if (getBase == nullptr)
++    {
++        LOG_WARN("Vela Unity VK: ConfigureEvent not called at {}: NVUnityPlugin.dll exports no NVUP_GetBaseEventId",
++                 where);
++        return;
++    }
++    const int base = getBase();
++    const UnityEventConfig cfg { 2, 0, 9 };
++    auto configure = reinterpret_cast<PFN_ConfigureEvent>(g_vulkan[kSlotConfigureEvent]);
++    configure(base + 1, &cfg);
++    configure(base + 2, &cfg);
++    LOG_INFO("Vela Unity VK: ConfigureEvent called for events {} and {} at {} (render pass precondition "
++             "EnsureOutside, queue access DontCare, flags 9)",
++             base + 1, base + 2, where);
++}
+ } // namespace
+ 
+ HMODULE VelaUnityVk::AfterLoad(std::wstring_view name, HMODULE module, const char* where)
+@@ -122,3 +277,90 @@ void VelaUnityVk::CheckLoaded(const char* where)
+ }
+ 
+ bool VelaUnityVk::OutsidePass() { return g_outside.load(std::memory_order_relaxed); }
++
++void VelaUnityVk::AtNgxInit()
++{
++    if ((Flags() & 6) == 0)
++    {
++        LOG_INFO("Vela Unity VK: interface not used (VELA_UNITY_VK_OUTSIDE={}, bits 2 and 4 not set)", Flags());
++        return;
++    }
++    std::scoped_lock lock(g_mx);
++    if (FindInterface("NVSDK_NGX_VULKAN_Init") && (Flags() & 2) != 0)
++        ConfigureEvents("NVSDK_NGX_VULKAN_Init");
++}
++
++VkCommandBuffer VelaUnityVk::BeforeRecord(VkCommandBuffer given, bool evaluate, PassState* state)
++{
++    if (state != nullptr)
++        *state = PassState::Unknown;
++    if ((Flags() & 6) == 0)
++        return given;
++
++    const char* what = evaluate ? "Evaluate" : "CreateFeature";
++    std::scoped_lock lock(g_mx);
++    if (!FindInterface(what))
++        return given;
++
++    // the plugin's own ConfigureEvent (EnsureInside) may have come after ours at NGX init: once more, now
++    if ((Flags() & 2) != 0 && !g_configuredAtRecord)
++    {
++        g_configuredAtRecord = true;
++        ConfigureEvents(what);
++    }
++    if ((Flags() & 4) == 0)
++        return given;
++
++    auto recordingState = reinterpret_cast<PFN_CommandRecordingState>(g_vulkan[kSlotCommandRecordingState]);
++    auto ensureOutside = reinterpret_cast<PFN_EnsureOutsideRenderPass>(g_vulkan[kSlotEnsureOutsideRenderPass]);
++
++    VkCommandBuffer cmd = given;
++    UnityRecordingState st {};
++    bool ok = recordingState(&st, 0);
++    const bool insideAtEntry = ok && st.renderPass != VK_NULL_HANDLE;
++    const int levelAtEntry = (int) st.commandBufferLevel;
++    const VkCommandBuffer unityAtEntry = st.commandBuffer;
++    bool insideAfter = insideAtEntry;
++    if (insideAtEntry)
++    {
++        ensureOutside();
++        st = {};
++        ok = recordingState(&st, 0);
++        insideAfter = ok && st.renderPass != VK_NULL_HANDLE;
++        if (ok && !insideAfter && st.commandBuffer != VK_NULL_HANDLE)
++            cmd = st.commandBuffer; // Unity ended the pass: its current command buffer is the one outside it
++    }
++
++    if (evaluate)
++    {
++        g_evals++;
++        g_insideAtEntry += insideAtEntry ? 1 : 0;
++        g_stateFailed += ok ? 0 : 1;
++        g_outsideAfter += ok && insideAtEntry && !insideAfter ? 1 : 0;
++        g_stillInside += ok && insideAfter ? 1 : 0;
++        g_changed += cmd != given ? 1 : 0;
++    }
++    if (!g_firstLogged[evaluate ? 1 : 0])
++    {
++        g_firstLogged[evaluate ? 1 : 0] = true;
++        if (!ok)
++            LOG_WARN("Vela Unity VK: first {}: CommandRecordingState failed ({}); recording into the command buffer NGX "
++                     "was given",
++                     what, insideAtEntry ? "after EnsureOutsideRenderPass" : "at entry");
++        else
++            LOG_INFO("Vela Unity VK: first {}: render pass at entry {} (level {}, Unity's command buffer {:X}, NGX was "
++                     "given {:X}), after EnsureOutsideRenderPass {}, command buffer changed {} (recording into {:X})",
++                     what, insideAtEntry ? "yes" : "no", levelAtEntry == 0 ? "primary" : "secondary",
++                     (size_t) unityAtEntry, (size_t) given,
++                     !insideAtEntry ? "not called" : insideAfter ? "still inside" : "outside", cmd != given ? "yes" : "no",
++                     (size_t) cmd);
++    }
++    if (evaluate && g_evals % 600 == 0)
++        LOG_INFO("Vela Unity VK: {} Evaluate calls: inside a render pass at entry {}, outside after "
++                 "EnsureOutsideRenderPass {}, still inside {}, state call failed {}, command buffer changed {}",
++                 g_evals, g_insideAtEntry, g_outsideAfter, g_stillInside, g_stateFailed, g_changed);
++
++    if (state != nullptr && ok)
++        *state = insideAfter ? PassState::Inside : PassState::Outside;
++    return ok ? cmd : given;
++}
+diff --git a/OptiScaler/hooks/VelaUnityVk.h b/OptiScaler/hooks/VelaUnityVk.h
+index 9eb6d12..08414ef 100644
+--- a/OptiScaler/hooks/VelaUnityVk.h
++++ b/OptiScaler/hooks/VelaUnityVk.h
+@@ -1,17 +1,27 @@
+ #pragma once
+ 
+-// Vela 0044 (unity-vk-outside-pass): Unity's NVIDIA plugin (NVUnityPlugin.dll) asks Unity to call its DLSS events
+-// INSIDE a render pass (IUnityGraphicsVulkan::ConfigureEvent, renderPassPrecondition = 1). In process, right after the
+-// module is loaded and before any of its code ran, that one immediate becomes 2 (EnsureOutside): Evaluate then gets a
+-// command buffer outside any render pass and the upscale records into it, in the same frame (no 0043 deferral).
+-// The scan and the change: hooks/VelaUnityVkCore.h.
++// Vela 0044 / 0045 (unity-vk-outside-pass): Unity's NVIDIA plugin (NVUnityPlugin.dll) asks Unity to call its DLSS
++// events INSIDE a render pass (IUnityGraphicsVulkan::ConfigureEvent, renderPassPrecondition = 1), where a compute
++// upscaler cannot record. Three ways out, one bit each:
+ //
+-//   VELA_UNITY_VK_OUTSIDE   0 = off; unset / 1 = on
++//   VELA_UNITY_VK_OUTSIDE   bit flags, a digit 0..7, unset = 7
++//     1  0044: right after NVUnityPlugin.dll is loaded, that one immediate in its code becomes 2 (EnsureOutside).
++//        Works only when OptiScaler is loaded before the plugin's device init (device job R8D: it was not).
++//     2  0045: at NVSDK_NGX_VULKAN_Init, and once more before the first recording, call Unity's own
++//        ConfigureEvent(NVUP_GetBaseEventId() + 1 and + 2, { EnsureOutside, DontCare, 9 }).
++//     4  0045: before NGX CreateFeature / Evaluate record anything, ask Unity (CommandRecordingState); inside a render
++//        pass: EnsureOutsideRenderPass(), ask again, and record into the command buffer Unity then names.
++//
++// Unity's interface is reached through the plugin itself: its export UnityPluginLoad stores the IUnityInterfaces* it
++// was given in a global; that store is decoded from the code (hooks/VelaUnityVkCore.h) and the IUnityGraphicsVulkan
++// (V1 GUID) taken from it. Every pointer is checked to lie inside UnityPlayer.dll before it is called.
+ //
+ // Log lines start with "Vela Unity VK:".
+ 
+ #include <pch.h>
+ 
++#include <vulkan/vulkan.hpp>
++
+ #include <string_view>
+ 
+ namespace VelaUnityVk
+@@ -26,4 +36,18 @@ void CheckLoaded(const char* where);
+ // hook, or found already "outside". A change made to a module that was already loaded may be too late for this run
+ // (the precondition is read once, at the plugin's device init) and does not count.
+ bool OutsidePass();
++
++// NVSDK_NGX_VULKAN_Init: finds Unity's interface and (bit 2) calls ConfigureEvent.
++void AtNgxInit();
++
++enum class PassState : int
++{
++    Unknown = 0, // no interface, bit 4 off, or Unity's state call failed
++    Outside = 1, // Unity says: no render pass is active on the command buffer returned
++    Inside = 2   // still inside a render pass after EnsureOutsideRenderPass
++};
++
++// Before NGX CreateFeature / Evaluate record into the game's command buffer, on the thread of that call. Returns the
++// command buffer to record into: `given`, or Unity's current one when EnsureOutsideRenderPass moved the recording.
++VkCommandBuffer BeforeRecord(VkCommandBuffer given, bool evaluate, PassState* state);
+ } // namespace VelaUnityVk
+diff --git a/OptiScaler/hooks/VelaUnityVkCore.h b/OptiScaler/hooks/VelaUnityVkCore.h
+index 23ea56b..b92152a 100644
+--- a/OptiScaler/hooks/VelaUnityVkCore.h
++++ b/OptiScaler/hooks/VelaUnityVkCore.h
+@@ -140,4 +140,51 @@ inline PatchResult Patch(uint8_t* base, uint32_t* rva, int* hits)
+     FlushInstructionCache(GetCurrentProcess(), s.at, kSigSize);
+     return PatchResult::Patched;
+ }
++
++// ---- Vela 0045: where the plugin keeps the IUnityInterfaces* it was given in UnityPluginLoad
++constexpr size_t kStoreWindow = 0x80;
++
++inline uint32_t ImageSize(const uint8_t* base)
++{
++    if (base == nullptr)
++        return 0;
++    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
++    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x1000)
++        return 0;
++    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
++    return nt->Signature == IMAGE_NT_SIGNATURE ? nt->OptionalHeader.SizeOfImage : 0;
++}
++
++// An export of a debug / incremental-link build is an `E9 rel32` jump thunk; follow up to four, staying in the image.
++inline uint8_t* FollowJumps(uint8_t* p, const uint8_t* imageBase)
++{
++    const uint32_t size = ImageSize(imageBase);
++    for (int i = 0; i < 4 && p != nullptr && p[0] == 0xE9; i++)
++    {
++        int32_t rel = 0;
++        std::memcpy(&rel, p + 1, 4);
++        uint8_t* next = p + 5 + rel;
++        if (size == 0 || next < imageBase || next + kStoreWindow > imageBase + size)
++            return nullptr;
++        p = next;
++    }
++    return p;
++}
++
++// The first RIP-relative 64-bit store in [fn, fn + window): REX.W (48 or 4C) 89 /r with mod = 00, rm = 101, i.e.
++// `mov [rip + disp32], r64`. Returns the address stored to.
++inline uint8_t* FirstRipStore64(uint8_t* fn, size_t window)
++{
++    if (fn == nullptr)
++        return nullptr;
++    for (size_t i = 0; i + 7 <= window; i++)
++    {
++        if ((fn[i] != 0x48 && fn[i] != 0x4C) || fn[i + 1] != 0x89 || (fn[i + 2] & 0xC7) != 0x05)
++            continue;
++        int32_t disp = 0;
++        std::memcpy(&disp, fn + i + 3, 4);
++        return fn + i + 7 + disp;
++    }
++    return nullptr;
++}
+ } // namespace vela_unity_vk
+diff --git a/OptiScaler/hooks/VelaVkDefer.cpp b/OptiScaler/hooks/VelaVkDefer.cpp
+index 2ed6df0..69cec7e 100644
+--- a/OptiScaler/hooks/VelaVkDefer.cpp
++++ b/OptiScaler/hooks/VelaVkDefer.cpp
+@@ -295,11 +295,11 @@ void FlushStale()
+ }
+ 
+ // g_ringMx held
+-void LogDecision(int mode, VkCommandBuffer cmd, const CbQuery& q, bool defer, bool viaHook)
++void LogDecision(int mode, VkCommandBuffer cmd, const CbQuery& q, bool defer, bool viaHook, int unityPass)
+ {
+     const int key =
+         (defer ? 1 : 0) | (viaHook ? 2 : 0) | (q.known ? 4 : 0) | (q.inPass ? 8 : 0) | (q.secondary ? 16 : 0) |
+-        (VelaUnityVk::OutsidePass() ? 32 : 0);
++        (VelaUnityVk::OutsidePass() ? 32 : 0) | (unityPass << 6);
+     if (key == g_lastDecision || g_decisionLogs >= 8)
+         return;
+     g_lastDecision = key;
+@@ -314,9 +314,13 @@ void LogDecision(int mode, VkCommandBuffer cmd, const CbQuery& q, bool defer, bo
+                        : viaHook ? "DEFERRED, submitted by the vkQueueSubmit hook right after the game's submit"
+                                  : "DEFERRED, submitted at the next Evaluate (fallback path, the hooks are blind)";
+     const auto& l = Layouts();
+-    LOG_INFO("Vela VK defer: mode {} ({}): Evaluate's command buffer {:X} {} -> {}; assumed layouts colour {} depth {} "
++    const char* unity = unityPass == 1   ? "; Unity CommandRecordingState: outside a render pass"
++                        : unityPass == 2 ? "; Unity CommandRecordingState: INSIDE a render pass"
++                                         : "";
++    LOG_INFO("Vela VK defer: mode {} ({}): Evaluate's command buffer {:X} {}{} -> {}; assumed layouts colour {} depth {} "
+              "motion {} output {}",
+-             mode, mode == 2 ? "always" : "auto", (size_t) cmd, seen, path, l.colour, l.depth, l.motion, l.output);
++             mode, mode == 2 ? "always" : "auto", (size_t) cmd, seen, unity, path, l.colour, l.depth, l.motion,
++             l.output);
+ }
+ 
+ // g_ringMx held
+@@ -520,7 +524,8 @@ VelaVkDefer::SubmitScope::~SubmitScope()
+ 
+ // ------------------------------------------------------------------------------------------------------------- Evaluate
+ 
+-VelaVkDefer::Scope::Scope(VkCommandBuffer gameCmd, VkDevice device, VkPhysicalDevice pd, unsigned int handleId)
++VelaVkDefer::Scope::Scope(VkCommandBuffer gameCmd, VkDevice device, VkPhysicalDevice pd, unsigned int handleId,
++                          int unityPass)
+     : _gameCmd(gameCmd), _cmd(gameCmd), _handleId(handleId)
+ {
+     const int mode = Mode();
+@@ -550,6 +555,10 @@ VelaVkDefer::Scope::Scope(VkCommandBuffer gameCmd, VkDevice device, VkPhysicalDe
+     bool defer = mode == 2;
+     if (mode == 1)
+         defer = q.known ? q.inPass : unityInside;
++    // Vela 0045: the CommandRecordingState of Unity itself, asked right before this call, is the truth for a Unity
++    // game even when the hooks are blind: outside -> record into the game's buffer, still inside -> defer.
++    if (mode == 1 && unityPass != 0)
++        defer = unityPass == 2;
+     const bool viaHook = q.known;
+ 
+     if (defer && !EnsureGpu(device, pd, q))
+@@ -565,7 +574,7 @@ VelaVkDefer::Scope::Scope(VkCommandBuffer gameCmd, VkDevice device, VkPhysicalDe
+         defer = false;
+     }
+ 
+-    LogDecision(mode, gameCmd, q, defer, viaHook);
++    LogDecision(mode, gameCmd, q, defer, viaHook, unityPass);
+     if (!defer)
+     {
+         g_direct++;
+@@ -743,6 +752,20 @@ void VelaVkDefer::DropHandle(unsigned int handleId)
+     const int n = g_ring.DropHandle(handleId);
+     g_dropped += n;
+     g_lastOutput.erase(handleId);
++    // Vela 0045: the caller destroys the feature's images next; jobs of this handle already on the GPU are waited for
++    // here (bounded, as at shutdown), not left to the caller's vkDeviceWaitIdle alone (VUID-vkDestroyImage-image-01000
++    // in run R8C)
++    if (g_gpu.ok)
++    {
++        OwnCall own;
++        for (int i = 0; i < Ring::Size; i++)
++        {
++            const auto& s = g_ring.At(i);
++            if (s.state == SlotState::InFlight && (handleId == 0xFFFFFFFFu || s.handleId == handleId) &&
++                vkWaitForFences(g_gpu.device, 1, &g_gpu.fence[i], VK_TRUE, 200000000ull) == VK_SUCCESS)
++                g_ring.Complete(i);
++        }
++    }
+     if (n > 0)
+         LOG_INFO("Vela VK defer: handle {}: {} recorded upscale(s) dropped before the feature goes away", handleId, n);
+ }
+diff --git a/OptiScaler/hooks/VelaVkDefer.h b/OptiScaler/hooks/VelaVkDefer.h
+index 257ea47..777f036 100644
+--- a/OptiScaler/hooks/VelaVkDefer.h
++++ b/OptiScaler/hooks/VelaVkDefer.h
+@@ -69,7 +69,8 @@ class SubmitScope
+ class Scope
+ {
+   public:
+-    Scope(VkCommandBuffer gameCmd, VkDevice device, VkPhysicalDevice pd, unsigned int handleId);
++    // unityPass (Vela 0045, VelaUnityVk::PassState): 0 = not known, 1 = Unity says outside a render pass, 2 = inside
++    Scope(VkCommandBuffer gameCmd, VkDevice device, VkPhysicalDevice pd, unsigned int handleId, int unityPass = 0);
+     ~Scope();
+     Scope(const Scope&) = delete;
+     Scope& operator=(const Scope&) = delete;
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+index 46cfa45..ebd4d5c 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+@@ -253,6 +253,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_Init_Ext2(
+     UpscalerTimeVk::Init(InDevice, InPD);
+ 
+     VelaUnityVk::CheckLoaded("NVSDK_NGX_VULKAN_Init"); // Vela 0044
++    VelaUnityVk::AtNgxInit(); // Vela 0045: the interface of Unity itself, ConfigureEvent
+     VelaVkDefer::Enable(); // Vela 0043: the hooks track the game's command buffers from here
+ 
+     State::Instance().nvngxVkInited = true;
+@@ -898,6 +899,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_CreateFeature1(VkDevice InDevice
+ 
+     {
+         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
++        // Vela 0045: Init records too (SGSR 2: vkCmdFillBuffer; VUID-vkCmdFillBuffer-renderpass in runs R8C / R8D)
++        InCmdList = VelaUnityVk::BeforeRecord(InCmdList, false, nullptr);
+         if (deviceContext->Init(vkInstance, vkPD, InDevice, InCmdList, vkGIPA, vkGDPA, InParameters))
+         {
+             State::Instance().currentFeature = deviceContext;
+@@ -1179,7 +1182,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer
+     // own, which is submitted right after the game's submit of this frame. recCmd is the game's buffer when not deferred.
+     if (state.changeBackend[handleId])
+         VelaVkDefer::DropHandle(handleId); // the feature goes away: its recorded, unsubmitted upscales with it
+-    VelaVkDefer::Scope velaDefer(InCmdList, vkDevice, vkPD, handleId);
++    // Vela 0045 (hooks/VelaUnityVk.h): in a Unity game, ask Unity whether this event is inside a render pass and have
++    // it end the pass; then the game's (possibly other) command buffer is valid for the upscale in the same frame.
++    VelaUnityVk::PassState velaPass = VelaUnityVk::PassState::Unknown;
++    InCmdList = VelaUnityVk::BeforeRecord(InCmdList, true, &velaPass);
++    VelaVkDefer::Scope velaDefer(InCmdList, vkDevice, vkPD, handleId, (int) velaPass);
+     if (velaDefer.Skipped())
+         return NVSDK_NGX_Result_Success;
+     const VkCommandBuffer recCmd = velaDefer.Cmd();
+diff --git a/arm64ec/tests/unity_vk_patch_test.cpp b/arm64ec/tests/unity_vk_patch_test.cpp
+index 3548460..869b312 100644
+--- a/arm64ec/tests/unity_vk_patch_test.cpp
++++ b/arm64ec/tests/unity_vk_patch_test.cpp
+@@ -70,6 +70,23 @@ static void TestCount()
+     uint32_t rva = 0;
+     int hits = 0;
+     CHECK(Patch(junk.data(), &rva, &hits) == PatchResult::NotAnImage);
++
++    // 0045: the first RIP-relative 64-bit store
++    std::vector<uint8_t> f(0x100, 0x90);
++    CHECK(FirstRipStore64(f.data(), kStoreWindow) == nullptr && FirstRipStore64(nullptr, kStoreWindow) == nullptr);
++    const uint8_t prologue[] = { 0x48, 0x89, 0x4C, 0x24, 0x08, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x44, 0x24, 0x30,
++                                 0x48, 0x89, 0x05, 0x10, 0x00, 0x00, 0x00 }; // the real function, first bytes
++    std::memcpy(f.data(), prologue, sizeof(prologue));
++    CHECK(FirstRipStore64(f.data(), kStoreWindow) == f.data() + sizeof(prologue) + 0x10); // not the [rsp+8] store
++    f[14] = 0x4C; // mov [rip+disp], r8
++    CHECK(FirstRipStore64(f.data(), kStoreWindow) == f.data() + sizeof(prologue) + 0x10);
++    f[16] = 0x45; // mod = 01: not RIP-relative
++    CHECK(FirstRipStore64(f.data(), kStoreWindow) == nullptr);
++    f[16] = 0x05;
++    CHECK(FirstRipStore64(f.data(), 20) == nullptr); // the store ends past the window
++    CHECK(ImageSize(junk.data()) == 0 && FollowJumps(f.data(), junk.data()) == f.data()); // no E9: unchanged
++    f[0] = 0xE9;
++    CHECK(FollowJumps(f.data(), junk.data()) == nullptr); // a jump out of a non-image
+ }
+ 
+ static void TestRealPlugin(const wchar_t* path)
+@@ -88,6 +105,23 @@ static void TestRealPlugin(const wchar_t* path)
+     CHECK(s.validImage && s.inside == 1 && s.outside == 0);
+     CHECK(s.rva == 0x250EC); // file offset 0x244EC in job R8B
+ 
++    // 0045: the global UnityPluginLoad stores IUnityInterfaces* in (UNITY_SIDE.md 3.1: VA 0x180154268)
++    auto* load = reinterpret_cast<uint8_t*>(GetProcAddress(m, "UnityPluginLoad"));
++    CHECK(load != nullptr);
++    uint8_t* fn = load != nullptr ? FollowJumps(load, base) : nullptr;
++    uint8_t* global = FirstRipStore64(fn, kStoreWindow);
++    CHECK(fn != nullptr && global != nullptr);
++    if (fn != nullptr && global != nullptr)
++    {
++        std::printf("UnityPluginLoad export RVA 0x%X -> function RVA 0x%X, global RVA 0x%X, image size 0x%X\n",
++                    (unsigned) (load - base), (unsigned) (fn - base), (unsigned) (global - base),
++                    (unsigned) ImageSize(base));
++        CHECK(fn - base == 0x35DD0);
++        CHECK(global - base == 0x154268);
++        CHECK(global >= base && global + 8 <= base + ImageSize(base));
++    }
++    CHECK(GetProcAddress(m, "NVUP_GetBaseEventId") != nullptr);
++
+     uint32_t rva = 0;
+     int hits = 0;
+     CHECK(Patch(base, &rva, &hits) == PatchResult::Patched && rva == 0x250EC && hits == 1);
+-- 
+2.54.0.windows.1
+

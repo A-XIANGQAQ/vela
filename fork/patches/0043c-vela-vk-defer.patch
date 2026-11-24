@@ -1,0 +1,114 @@
+From 426ca261fa82ae69ff08ea18f6f93c250813ed4f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 00:32:02 +0100
+Subject: [PATCH] 0043-vela-vk-defer: NVSDK_NGX_VULKAN_EvaluateFeature defers
+ the upscale when its command buffer is inside a render pass (Haste Demo,
+ Unity 2022.3: a secondary begun with RENDER_PASS_CONTINUE;
+ VUID-vkCmdDispatch-renderpass / -vkCmdBlitImage-renderpass /
+ -vkCmdPipelineBarrier-None-07889 in validation run k2lsp8, Turnip drops the
+ work, blank 3D scene): everything of the call (a backend change's Init, the
+ upscaler, the post-passes, the timing queries) records into our command
+ buffer, submitted right after the game's submit of that frame; the output is
+ one frame late. VELA_VK_DEFER = 0 off (as before), 1 auto (default: defer
+ when the hooks saw the buffer inside a render pass; a buffer the hooks never
+ saw begin: defer in a Unity game only, through the next-Evaluate path), 2
+ always. Log: mode at NGX init, one line per decision change (what was
+ detected, which path), hook hit counts after 120 Evaluate calls, counters
+ every 600. Recorded but unsubmitted jobs are dropped before a feature is
+ released or re-created and at NGX shutdown. A primary outside any render pass
+ records into the game's buffer exactly as before
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ OptiScaler/inputs/NVNGX_DLSS_Vk.cpp | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+index 63c9c28..8cf68d2 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+@@ -18,6 +18,7 @@
+ #include <misc/IdentifyGpu.h>
+ #include "nvsdk_ngx_vk.h"
+ #include <upscalers/sgsr3/VelaLive.h>
++#include <hooks/VelaVkDefer.h>
+ 
+ VkInstance vkInstance;
+ VkPhysicalDevice vkPD;
+@@ -250,6 +251,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_Init_Ext2(
+ 
+     UpscalerTimeVk::Init(InDevice, InPD);
+ 
++    VelaVkDefer::Enable(); // Vela 0043: the hooks track the game's command buffers from here
++
+     State::Instance().nvngxVkInited = true;
+ 
+     return NVSDK_NGX_Result_Success;
+@@ -971,6 +974,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_ReleaseFeature(NVSDK_NGX_Handle*
+         if (deviceContext == State::Instance().currentFeature)
+             State::Instance().currentFeature = nullptr;
+ 
++        VelaVkDefer::DropHandle(handleId); // Vela 0043: recorded, unsubmitted upscales name this feature's objects
+         vkDeviceWaitIdle(vkDevice);
+         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+ 
+@@ -1167,10 +1171,21 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer
+             vs.held = 0;
+     }
+ 
++    // Vela 0043 (hooks/VelaVkDefer.h): when Evaluate's command buffer is inside a render pass (Unity hands a secondary
++    // begun with RENDER_PASS_CONTINUE: dispatches, blits and barriers are invalid there and Turnip drops them), all of
++    // this call's recording (a backend change's Init, the upscaler, its post-passes) goes into a command buffer of our
++    // own, which is submitted right after the game's submit of this frame. recCmd is the game's buffer when not deferred.
++    if (state.changeBackend[handleId])
++        VelaVkDefer::DropHandle(handleId); // the feature goes away: its recorded, unsubmitted upscales with it
++    VelaVkDefer::Scope velaDefer(InCmdList, vkDevice, vkPD, handleId);
++    if (velaDefer.Skipped())
++        return NVSDK_NGX_Result_Success;
++    const VkCommandBuffer recCmd = velaDefer.Cmd();
++
+     if (state.changeBackend[handleId])
+     {
+         auto successfulPhase =
+-            FeatureProvider_Vk::ChangeFeature(state.newBackend, vkInstance, vkPD, vkDevice, InCmdList, vkGIPA, vkGDPA,
++            FeatureProvider_Vk::ChangeFeature(state.newBackend, vkInstance, vkPD, vkDevice, recCmd, vkGIPA, vkGDPA,
+                                               handleId, InParameters, contextData);
+         evalCounter = 0;
+ 
+@@ -1183,9 +1198,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer
+     deviceContext = VkContexts[handleId].feature.get();
+     state.currentFeature = deviceContext;
+ 
+-    UpscalerTimeVk::UpscaleStart(InCmdList);
++    UpscalerTimeVk::UpscaleStart(recCmd);
+ 
+-    auto upscaleResult = deviceContext->Evaluate(InCmdList, InParameters);
++    velaDefer.BeforeFeature(InParameters);
++    auto upscaleResult = deviceContext->Evaluate(recCmd, InParameters);
+ 
+     if (!upscaleResult)
+         ImGui::InsertNotification({ ImGuiToastType::Error, 10000, "Upscaler failed to run!" });
+@@ -1198,7 +1214,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer
+         return NVSDK_NGX_Result_Success;
+     }
+ 
+-    UpscalerTimeVk::UpscaleEnd(InCmdList);
++    UpscalerTimeVk::UpscaleEnd(recCmd);
++
++    if (upscaleResult)
++        velaDefer.Commit();
+ 
+     return upscaleResult ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail;
+ }
+@@ -1214,6 +1233,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_Shutdown(void)
+ 
+     // VkContexts.clear();
+ 
++    VelaVkDefer::Shutdown(); // Vela 0043
++
+     vkInstance = nullptr;
+     vkPD = nullptr;
+     vkDevice = nullptr;
+-- 
+2.54.0.windows.1
+

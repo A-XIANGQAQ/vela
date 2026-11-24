@@ -1,0 +1,106 @@
+From 9bb65408bd27d652f1d694365c48a7269eddacc6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 23 Nov 2026 21:45:46 +0100
+Subject: [PATCH] 0042-vela-sgsr2-vk-depth-view: SGSR 2 (Vulkan) samples a
+ depth-only view when the game's depth is a combined depth/stencil format
+ (Unity: D32_SFLOAT_S8_UINT with both aspects;
+ VUID-VkDescriptorImageInfo-imageView-01976 in the Haste Demo validation run
+ k2lsp8); old views kept until destruction
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../upscalers/sgsr2/SGSR2Feature_Vk.cpp       | 36 ++++++++++++++++++-
+ OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.h  |  9 +++++
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp
+index 28c507c..3f21112 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp
++++ b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp
+@@ -510,7 +510,7 @@ bool SGSR2FeatureVk::DispatchPasses(VkCommandBuffer cmd, NVSDK_NGX_Resource_VK*
+     {
+         VkDescriptorImageInfo srvs[4] = {
+             gameSampled(color->Resource.ImageViewInfo.ImageView),
+-            depth != nullptr ? gameSampled(depth->Resource.ImageViewInfo.ImageView) : ownSampled(filler),
++            depth != nullptr ? gameSampled(DepthSampleView(depth)) : ownSampled(filler),
+             gameSampled(velocity->Resource.ImageViewInfo.ImageView),
+             reactive != nullptr ? gameSampled(reactive->Resource.ImageViewInfo.ImageView) : ownSampled(filler),
+         };
+@@ -614,6 +614,36 @@ bool SGSR2FeatureVk::DispatchPasses(VkCommandBuffer cmd, NVSDK_NGX_Resource_VK*
+     return true;
+ }
+ 
++VkImageView SGSR2FeatureVk::DepthSampleView(const NVSDK_NGX_Resource_VK* depth)
++{
++    const auto& vi = depth->Resource.ImageViewInfo;
++    const bool combined = vi.Format == VK_FORMAT_D32_SFLOAT_S8_UINT || vi.Format == VK_FORMAT_D24_UNORM_S8_UINT ||
++                          vi.Format == VK_FORMAT_D16_UNORM_S8_UINT;
++    if (!combined && !(vi.SubresourceRange.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT))
++        return vi.ImageView;
++    if (vi.Image == _depthOnlyImage && _depthOnlyView != VK_NULL_HANDLE)
++        return _depthOnlyView;
++
++    VkImageViewCreateInfo ivci { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++    ivci.image = vi.Image;
++    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    ivci.format = vi.Format;
++    ivci.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, vi.SubresourceRange.baseMipLevel, 1,
++                              vi.SubresourceRange.baseArrayLayer, 1 };
++    VkImageView view = VK_NULL_HANDLE;
++    if (vkCreateImageView(Device, &ivci, nullptr, &view) != VK_SUCCESS)
++    {
++        LOG_WARN("Vela: depth-only view of the game's depth (VkFormat {}) failed; using the game's view", (int) vi.Format);
++        return vi.ImageView;
++    }
++    if (_depthOnlyView != VK_NULL_HANDLE)
++        _depthOnlyRetired.push_back(_depthOnlyView);
++    _depthOnlyImage = vi.Image;
++    _depthOnlyView = view;
++    LOG_INFO("Vela: depth VkFormat {} has depth and stencil; sampling a depth-only view of it", (int) vi.Format);
++    return view;
++}
++
+ SGSR2FeatureVk::~SGSR2FeatureVk()
+ {
+     if (Device == VK_NULL_HANDLE)
+@@ -621,6 +651,10 @@ SGSR2FeatureVk::~SGSR2FeatureVk()
+ 
+     vkDeviceWaitIdle(Device);
+ 
++    if (_depthOnlyView) vkDestroyImageView(Device, _depthOnlyView, nullptr);
++    for (VkImageView v : _depthOnlyRetired)
++        vkDestroyImageView(Device, v, nullptr);
++
+     DestroyImage(_motionDepthClipAlpha);
+     DestroyImage(_ycocg);
+     DestroyImage(_history[0]);
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.h b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.h
+index b272285..386cb42 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.h
++++ b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "nvsdk_ngx_vk.h"
++#include <vector>
+ 
+ #include "SGSR2Feature.h"
+ #include <upscalers/IFeature_Vk.h>
+@@ -98,6 +99,14 @@ class SGSR2FeatureVk : public SGSR2Feature, public IFeature_Vk
+     uint32_t _ringIndex = 0;
+     uint32_t _historyIndex = 0;
+     bool _loggedNoDepth = false;
++    // Vela 0042: a depth-only view of the game's depth image when it is a combined depth/stencil format (Unity hands
++    // D32_SFLOAT_S8_UINT with both aspects; a sampled descriptor must name one aspect: VUID-VkDescriptorImageInfo-
++    // imageView-01976, Haste Demo validation run k2lsp8). Views of an earlier depth image are kept until destruction,
++    // because a frame in flight may still use them.
++    VkImage _depthOnlyImage = VK_NULL_HANDLE;
++    VkImageView _depthOnlyView = VK_NULL_HANDLE;
++    std::vector<VkImageView> _depthOnlyRetired;
++    VkImageView DepthSampleView(const NVSDK_NGX_Resource_VK* depth);
+     bool _loggedReactive = false;
+     bool _loggedBlitAssumption = false;
+ };
+-- 
+2.54.0.windows.1
+

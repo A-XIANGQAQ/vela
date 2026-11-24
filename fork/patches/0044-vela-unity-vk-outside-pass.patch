@@ -1,0 +1,681 @@
+From 5704bf7937ad54d6683b5463dbc986ab37e2ae76 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 00:41:22 +0100
+Subject: [PATCH] 0044-vela-unity-vk-outside-pass: Unity's NVIDIA plugin
+ (NVUnityPlugin.dll) configures its DLSS plugin events with
+ renderPassPrecondition = 1 (EnsureInside;
+ IUnityGraphicsVulkan::ConfigureEvent in its Vulkan device init,
+ unconditional: AUDIT/r8/unity/UNITY_SIDE.md), which is why NGX Evaluate
+ arrives inside a render pass. Right after a module with the base name
+ NVUnityPlugin.dll is loaded (the LdrLoadDll hook and the five LoadLibrary*
+ hooks, after the original load returned; also once at OptiScaler init and at
+ NVSDK_NGX_VULKAN_Init for a module loaded before us) its executable sections
+ are scanned for C7 44 24 30 01 00 00 00 C7 44 24 34 00 00 00 00 C7 44 24 38
+ 09 00 00 00; exactly one hit: the 01 becomes 02 (EnsureOutside) in memory
+ (VirtualProtect, restore, FlushInstructionCache), once per module handle; no
+ hit, several hits, already 02: nothing changed, one line. Device job R8B with
+ that byte changed in the file: scene visible (luma 67.2 vs 12.1), no
+ render-pass VUIDs, upscale in the same frame. VELA_UNITY_VK_OUTSIDE=0 = off.
+ Log prefix 'Vela Unity VK:'. 0043 interplay: when the change was made from a
+ load hook (or the module was already 'outside'), auto mode no longer defers a
+ command buffer the hooks never saw just because the game is Unity; a buffer
+ the hooks saw inside a pass is still deferred; a change to an already loaded
+ module does not count (it may be too late for the run). Also:
+ VELA_VK_DEFER_LAYOUTS value 0 (UNDEFINED) is treated as 'no barrier' (it
+ could have made a barrier with newLayout UNDEFINED). Host test
+ arm64ec/tests/unity_vk_patch_test.cpp: the real plugin mapped without running
+ its code: one hit, RVA 250EC, changed, protection restored, second look
+ 'already outside' (23 checks)
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ OptiScaler/dllmain.cpp                |   3 +
+ OptiScaler/hooks/Kernel_Hooks.cpp     |  11 +-
+ OptiScaler/hooks/Ntdll_Hooks.h        |   7 +-
+ OptiScaler/hooks/VelaUnityVk.cpp      | 124 ++++++++++++++++++++++
+ OptiScaler/hooks/VelaUnityVk.h        |  29 ++++++
+ OptiScaler/hooks/VelaUnityVkCore.h    | 143 ++++++++++++++++++++++++++
+ OptiScaler/hooks/VelaVkDefer.cpp      |  20 ++--
+ OptiScaler/inputs/NVNGX_DLSS_Vk.cpp   |   2 +
+ arm64ec/tests/unity_vk_patch_test.cpp | 115 +++++++++++++++++++++
+ 9 files changed, 442 insertions(+), 12 deletions(-)
+ create mode 100644 OptiScaler/hooks/VelaUnityVk.cpp
+ create mode 100644 OptiScaler/hooks/VelaUnityVk.h
+ create mode 100644 OptiScaler/hooks/VelaUnityVkCore.h
+ create mode 100644 arm64ec/tests/unity_vk_patch_test.cpp
+
+diff --git a/OptiScaler/dllmain.cpp b/OptiScaler/dllmain.cpp
+index 4228009..39aaaab 100644
+--- a/OptiScaler/dllmain.cpp
++++ b/OptiScaler/dllmain.cpp
+@@ -33,6 +33,7 @@
+ #include <hooks/D3D12_Hooks.h>
+ #include <hooks/Vulkan_Hooks.h>
+ #include <hooks/Ntdll_Hooks.h>
++#include <hooks/VelaUnityVk.h>
+ #include <hooks/Kernel_Hooks.h>
+ #include <hooks/Gdi32_Hooks.h>
+ #include <hooks/Wintrust_Hooks.h>
+@@ -2070,6 +2071,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+             LoadAsiPlugins();
+         }
+ 
++        VelaUnityVk::CheckLoaded("OptiScaler init"); // Vela 0044: NVUnityPlugin.dll loaded before us
++
+         if (!Config::Instance()->DxgiSpoofing.has_value() && !State::Instance().nvngxReplacement.has_value())
+         {
+             LOG_WARN("Nvngx replacement not found!");
+diff --git a/OptiScaler/hooks/Kernel_Hooks.cpp b/OptiScaler/hooks/Kernel_Hooks.cpp
+index 7fc5845..4015cab 100644
+--- a/OptiScaler/hooks/Kernel_Hooks.cpp
++++ b/OptiScaler/hooks/Kernel_Hooks.cpp
+@@ -1,5 +1,6 @@
+ #include "pch.h"
+ #include "Kernel_Hooks.h"
++#include "VelaUnityVk.h" // Vela 0044
+ 
+ #include "Gdi32_Hooks.h"
+ #include "Streamline_Hooks.h"
+@@ -335,7 +336,7 @@ HMODULE KernelHooks::hk_K32_LoadLibraryW(LPCWSTR lpLibFileName)
+     if (result != nullptr)
+         return result;
+ 
+-    return o_K32_LoadLibraryW(lpLibFileName);
++    return VelaUnityVk::AfterLoad(name, o_K32_LoadLibraryW(lpLibFileName), "LoadLibrary"); // Vela 0044
+ }
+ 
+ VALIDATE_HOOK(hk_K32_LoadLibraryA, Kernel32Proxy::PFN_LoadLibraryA)
+@@ -356,7 +357,7 @@ HMODULE KernelHooks::hk_K32_LoadLibraryA(LPCSTR lpLibFileName)
+     if (result != nullptr)
+         return result;
+ 
+-    return o_K32_LoadLibraryA(lpLibFileName);
++    return VelaUnityVk::AfterLoad(name, o_K32_LoadLibraryA(lpLibFileName), "LoadLibrary"); // Vela 0044
+ }
+ 
+ VALIDATE_HOOK(hk_K32_LoadLibraryExW, Kernel32Proxy::PFN_LoadLibraryExW)
+@@ -376,7 +377,7 @@ HMODULE KernelHooks::hk_K32_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile,
+     if (result != nullptr)
+         return result;
+ 
+-    return o_K32_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
++    return VelaUnityVk::AfterLoad(name, o_K32_LoadLibraryExW(lpLibFileName, hFile, dwFlags), "LoadLibrary"); // Vela 0044
+ }
+ 
+ VALIDATE_HOOK(hk_K32_LoadLibraryExA, Kernel32Proxy::PFN_LoadLibraryExA)
+@@ -397,7 +398,7 @@ HMODULE KernelHooks::hk_K32_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, D
+     if (result != nullptr)
+         return result;
+ 
+-    return o_K32_LoadLibraryExA(lpLibFileName, hFile, dwFlags);
++    return VelaUnityVk::AfterLoad(name, o_K32_LoadLibraryExA(lpLibFileName, hFile, dwFlags), "LoadLibrary"); // Vela 0044
+ }
+ 
+ VALIDATE_HOOK(hk_KB_LoadLibraryExW, KernelBaseProxy::PFN_LoadLibraryExW)
+@@ -417,7 +418,7 @@ HMODULE KernelHooks::hk_KB_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
+     if (result != nullptr)
+         return result;
+ 
+-    return o_KB_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
++    return VelaUnityVk::AfterLoad(name, o_KB_LoadLibraryExW(lpLibFileName, hFile, dwFlags), "LoadLibrary"); // Vela 0044
+ }
+ 
+ VALIDATE_HOOK(hk_K32_FreeLibrary, Kernel32Proxy::PFN_FreeLibrary)
+diff --git a/OptiScaler/hooks/Ntdll_Hooks.h b/OptiScaler/hooks/Ntdll_Hooks.h
+index 2db86eb..9143c8b 100644
+--- a/OptiScaler/hooks/Ntdll_Hooks.h
++++ b/OptiScaler/hooks/Ntdll_Hooks.h
+@@ -6,6 +6,7 @@
+ #include <DllNames.h>
+ 
+ #include "LibraryLoad_Hooks.h"
++#include "VelaUnityVk.h" // Vela 0044
+ #include "Hook_Utils.h"
+ 
+ #include <cwctype>
+@@ -92,7 +93,11 @@ class NtdllHooks
+             }
+         }
+ 
+-        return o_LdrLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
++        // Vela 0044: NVUnityPlugin.dll is changed right after its load, before any of its code is called
++        const NTSTATUS status = o_LdrLoadDll(PathToFile, Flags, ModuleFileName, ModuleHandle);
++        if (status == 0)
++            VelaUnityVk::AfterLoad(name, (HMODULE) *ModuleHandle, "LdrLoadDll");
++        return status;
+     }
+ 
+     static NTSTATUS NTAPI hkNtLoadDll(PUNICODE_STRING PathToFile, PULONG Flags, PUNICODE_STRING ModuleFileName,
+diff --git a/OptiScaler/hooks/VelaUnityVk.cpp b/OptiScaler/hooks/VelaUnityVk.cpp
+new file mode 100644
+index 0000000..26e6586
+--- /dev/null
++++ b/OptiScaler/hooks/VelaUnityVk.cpp
+@@ -0,0 +1,124 @@
++#include <pch.h>
++
++#include "VelaUnityVk.h"
++#include "VelaUnityVkCore.h"
++
++#include <atomic>
++#include <cstdlib>
++#include <cwctype>
++#include <mutex>
++#include <vector>
++
++using namespace vela_unity_vk;
++
++namespace
++{
++constexpr std::wstring_view kPluginName = L"nvunityplugin.dll";
++constexpr std::wstring_view kPluginStem = L"nvunityplugin";
++
++std::mutex g_mx;
++std::vector<HMODULE> g_done; // module handles already looked at (a handful at most)
++std::atomic<bool> g_outside { false };
++
++bool Enabled()
++{
++    static const bool on = []
++    {
++        const char* e = std::getenv("VELA_UNITY_VK_OUTSIDE");
++        return !(e != nullptr && e[0] == '0' && e[1] == 0);
++    }();
++    return on;
++}
++
++bool EndsWithNoCase(std::wstring_view text, std::wstring_view lowerSuffix)
++{
++    if (text.size() < lowerSuffix.size())
++        return false;
++    const size_t off = text.size() - lowerSuffix.size();
++    for (size_t i = 0; i < lowerSuffix.size(); i++)
++        if (static_cast<wchar_t>(std::towlower(text[off + i])) != lowerSuffix[i])
++            return false;
++    // a whole file name: the start of the string or a path separator before it
++    return off == 0 || text[off - 1] == L'\\' || text[off - 1] == L'/';
++}
++
++bool IsPluginName(std::wstring_view name)
++{
++    while (!name.empty() && name.back() == L'\0')
++        name.remove_suffix(1);
++    return EndsWithNoCase(name, kPluginName) || EndsWithNoCase(name, kPluginStem);
++}
++
++// inTime: no code of the module ran yet (called from a load hook, before the loader's caller gets the handle back)
++void Handle(HMODULE module, const char* where, bool inTime)
++{
++    // a data-file / image-resource mapping (low bits set) is not code that will run
++    if (module == nullptr || (reinterpret_cast<uintptr_t>(module) & 3) != 0)
++        return;
++
++    std::scoped_lock lock(g_mx);
++    for (HMODULE m : g_done)
++        if (m == module)
++            return;
++    g_done.push_back(module);
++
++    if (!Enabled())
++    {
++        LOG_INFO("Vela Unity VK: off (VELA_UNITY_VK_OUTSIDE=0): NVUnityPlugin.dll {:X} left as it is ({})",
++                 (size_t) module, where);
++        return;
++    }
++    if (!inTime)
++        LOG_INFO("Vela Unity VK: module already loaded at {} ({:X}); a change now may be too late for this run", where,
++                 (size_t) module);
++
++    uint32_t rva = 0;
++    int hits = 0;
++    switch (Patch(reinterpret_cast<uint8_t*>(module), &rva, &hits))
++    {
++    case PatchResult::Patched:
++        LOG_INFO("Vela Unity VK: patched at RVA {:X} ({}): DLSS plugin events render pass precondition 1 (EnsureInside) "
++                 "-> 2 (EnsureOutside); Evaluate gets a command buffer outside the render pass{}",
++                 rva, where, inTime ? "" : " if the plugin's device init has not run yet");
++        if (inTime)
++            g_outside.store(true);
++        break;
++    case PatchResult::AlreadyOutside:
++        LOG_INFO("Vela Unity VK: already outside at RVA {:X} ({}): nothing to change", rva, where);
++        g_outside.store(true);
++        break;
++    case PatchResult::NotFound:
++        LOG_WARN("Vela Unity VK: not found ({}): no ConfigureEvent signature in NVUnityPlugin.dll {:X}, nothing changed "
++                 "(another plugin build)",
++                 where, (size_t) module);
++        break;
++    case PatchResult::Several:
++        LOG_WARN("Vela Unity VK: several hits ({} in NVUnityPlugin.dll {:X}, {}): nothing changed", hits,
++                 (size_t) module, where);
++        break;
++    case PatchResult::ProtectFailed:
++        LOG_ERROR("Vela Unity VK: VirtualProtect failed at RVA {:X} ({}), error {}: nothing changed", rva, where,
++                  (int) GetLastError());
++        break;
++    case PatchResult::NotAnImage:
++        LOG_WARN("Vela Unity VK: {:X} is not an x64 image ({}): nothing changed", (size_t) module, where);
++        break;
++    }
++}
++} // namespace
++
++HMODULE VelaUnityVk::AfterLoad(std::wstring_view name, HMODULE module, const char* where)
++{
++    if (module != nullptr && IsPluginName(name))
++        Handle(module, where, true);
++    return module;
++}
++
++void VelaUnityVk::CheckLoaded(const char* where)
++{
++    HMODULE module = GetModuleHandleW(L"NVUnityPlugin.dll");
++    if (module != nullptr)
++        Handle(module, where, false);
++}
++
++bool VelaUnityVk::OutsidePass() { return g_outside.load(std::memory_order_relaxed); }
+diff --git a/OptiScaler/hooks/VelaUnityVk.h b/OptiScaler/hooks/VelaUnityVk.h
+new file mode 100644
+index 0000000..9eb6d12
+--- /dev/null
++++ b/OptiScaler/hooks/VelaUnityVk.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++// Vela 0044 (unity-vk-outside-pass): Unity's NVIDIA plugin (NVUnityPlugin.dll) asks Unity to call its DLSS events
++// INSIDE a render pass (IUnityGraphicsVulkan::ConfigureEvent, renderPassPrecondition = 1). In process, right after the
++// module is loaded and before any of its code ran, that one immediate becomes 2 (EnsureOutside): Evaluate then gets a
++// command buffer outside any render pass and the upscale records into it, in the same frame (no 0043 deferral).
++// The scan and the change: hooks/VelaUnityVkCore.h.
++//
++//   VELA_UNITY_VK_OUTSIDE   0 = off; unset / 1 = on
++//
++// Log lines start with "Vela Unity VK:".
++
++#include <pch.h>
++
++#include <string_view>
++
++namespace VelaUnityVk
++{
++// After a library load returned (the LdrLoadDll and LoadLibrary* hooks). Returns `module` unchanged.
++HMODULE AfterLoad(std::wstring_view name, HMODULE module, const char* where);
++
++// The module may be loaded already (OptiScaler came later): at OptiScaler init and at NVSDK_NGX_VULKAN_Init.
++void CheckLoaded(const char* where);
++
++// True when the plugin will configure (or already had) EnsureOutside before its device init ran: changed from a load
++// hook, or found already "outside". A change made to a module that was already loaded may be too late for this run
++// (the precondition is read once, at the plugin's device init) and does not count.
++bool OutsidePass();
++} // namespace VelaUnityVk
+diff --git a/OptiScaler/hooks/VelaUnityVkCore.h b/OptiScaler/hooks/VelaUnityVkCore.h
+new file mode 100644
+index 0000000..23ea56b
+--- /dev/null
++++ b/OptiScaler/hooks/VelaUnityVkCore.h
+@@ -0,0 +1,143 @@
++#pragma once
++
++// Vela 0044 (unity-vk-outside-pass): the scan and the one-byte change, free of OptiScaler headers so the same code runs
++// in the host-side test (arm64ec/tests/unity_vk_patch_test.cpp) against the real NVUnityPlugin.dll.
++//
++// NVUnityPlugin.dll (UnityEngine.NVIDIAModule's native half) configures its DLSS plugin events in its Vulkan device init
++// with UnityVulkanPluginEventConfig { renderPassPrecondition = 1, graphicsQueueAccess = 0, flags = 9 }:
++//     C7 44 24 30 01 00 00 00    mov dword ptr [rsp+30h], 1    ; kUnityVulkanRenderPass_EnsureInside
++//     C7 44 24 34 00 00 00 00    mov dword ptr [rsp+34h], 0
++//     C7 44 24 38 09 00 00 00    mov dword ptr [rsp+38h], 9
++// so Unity calls NGX Evaluate inside a render pass, where a compute upscaler cannot record (AUDIT/r8/unity/UNITY_SIDE.md).
++// With the first immediate = 2 (kUnityVulkanRenderPass_EnsureOutside) Unity ends the pass before the event: device job
++// R8B, the same byte changed in the file: the 3D scene is back, no render-pass VUIDs, the upscale in the same frame.
++
++#include <windows.h>
++
++#include <cstdint>
++#include <cstring>
++
++namespace vela_unity_vk
++{
++constexpr size_t kSigSize = 24;
++constexpr size_t kSigValueOffset = 4; // the byte that is 1 (inside) or 2 (outside)
++constexpr uint8_t kInside = 0x01;
++constexpr uint8_t kOutside = 0x02;
++
++inline bool MatchAt(const uint8_t* p, uint8_t value)
++{
++    static const uint8_t sig[kSigSize] = { 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x34,
++                                           0x00, 0x00, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x38, 0x09, 0x00, 0x00, 0x00 };
++    if (p[kSigValueOffset] != value)
++        return false;
++    return std::memcmp(p, sig, kSigValueOffset) == 0 &&
++           std::memcmp(p + kSigValueOffset + 1, sig + kSigValueOffset + 1, kSigSize - kSigValueOffset - 1) == 0;
++}
++
++// hits of the signature with `value` in [p, p + size); *first = the first hit
++inline int CountInRange(const uint8_t* p, size_t size, uint8_t value, const uint8_t** first)
++{
++    int hits = 0;
++    if (p == nullptr || size < kSigSize)
++        return 0;
++    for (size_t i = 0; i + kSigSize <= size; i++)
++    {
++        if (p[i] != 0xC7 || !MatchAt(p + i, value))
++            continue;
++        if (hits++ == 0 && first != nullptr)
++            *first = p + i;
++    }
++    return hits;
++}
++
++struct ScanResult
++{
++    bool validImage = false;
++    int inside = 0;  // hits with value 1
++    int outside = 0; // hits with value 2
++    uint8_t* at = nullptr; // the single hit (inside, else outside)
++    uint32_t rva = 0; // of the value byte (signature start + 4), the address a file patch names
++};
++
++// Walks the executable sections of a module mapped as an image (a loaded DLL).
++inline ScanResult Scan(uint8_t* base)
++{
++    ScanResult r {};
++    if (base == nullptr)
++        return r;
++    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
++    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x1000)
++        return r;
++    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
++    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
++        return r;
++    r.validImage = true;
++
++    const uint32_t imageSize = nt->OptionalHeader.SizeOfImage;
++    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
++    const uint8_t* firstInside = nullptr;
++    const uint8_t* firstOutside = nullptr;
++    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
++    {
++        if ((sec->Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE)) == 0)
++            continue;
++        const uint32_t va = sec->VirtualAddress;
++        uint32_t size = sec->Misc.VirtualSize != 0 ? sec->Misc.VirtualSize : sec->SizeOfRawData;
++        if (va >= imageSize)
++            continue;
++        if (size > imageSize - va)
++            size = imageSize - va;
++        const uint8_t* f = nullptr;
++        const int in = CountInRange(base + va, size, kInside, &f);
++        if (in > 0 && firstInside == nullptr)
++            firstInside = f;
++        r.inside += in;
++        const int out = CountInRange(base + va, size, kOutside, &f);
++        if (out > 0 && firstOutside == nullptr)
++            firstOutside = f;
++        r.outside += out;
++    }
++    const uint8_t* at = r.inside > 0 ? firstInside : firstOutside;
++    if (at != nullptr)
++    {
++        r.at = const_cast<uint8_t*>(at);
++        r.rva = static_cast<uint32_t>(at - base + kSigValueOffset);
++    }
++    return r;
++}
++
++enum class PatchResult
++{
++    Patched,        // exactly one "inside" site: now "outside"
++    AlreadyOutside, // no "inside" site, exactly one "outside" site
++    NotFound,
++    Several, // more than one candidate: nothing changed
++    ProtectFailed,
++    NotAnImage
++};
++
++inline PatchResult Patch(uint8_t* base, uint32_t* rva, int* hits)
++{
++    const ScanResult s = Scan(base);
++    if (rva != nullptr)
++        *rva = s.rva;
++    if (hits != nullptr)
++        *hits = s.inside + s.outside;
++    if (!s.validImage)
++        return PatchResult::NotAnImage;
++    if (s.inside + s.outside > 1)
++        return PatchResult::Several;
++    if (s.inside == 0)
++        return s.outside == 1 ? PatchResult::AlreadyOutside : PatchResult::NotFound;
++
++    uint8_t* target = s.at + kSigValueOffset;
++    DWORD old = 0;
++    if (!VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &old))
++        return PatchResult::ProtectFailed;
++    *target = kOutside;
++    DWORD ignored = 0;
++    VirtualProtect(target, 1, old, &ignored);
++    FlushInstructionCache(GetCurrentProcess(), s.at, kSigSize);
++    return PatchResult::Patched;
++}
++} // namespace vela_unity_vk
+diff --git a/OptiScaler/hooks/VelaVkDefer.cpp b/OptiScaler/hooks/VelaVkDefer.cpp
+index f1a28ff..2ed6df0 100644
+--- a/OptiScaler/hooks/VelaVkDefer.cpp
++++ b/OptiScaler/hooks/VelaVkDefer.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "VelaVkDefer.h"
+ #include "VelaVkDeferCore.h"
++#include "VelaUnityVk.h"
+ 
+ #include <State.h>
+ 
+@@ -297,7 +298,8 @@ void FlushStale()
+ void LogDecision(int mode, VkCommandBuffer cmd, const CbQuery& q, bool defer, bool viaHook)
+ {
+     const int key =
+-        (defer ? 1 : 0) | (viaHook ? 2 : 0) | (q.known ? 4 : 0) | (q.inPass ? 8 : 0) | (q.secondary ? 16 : 0);
++        (defer ? 1 : 0) | (viaHook ? 2 : 0) | (q.known ? 4 : 0) | (q.inPass ? 8 : 0) | (q.secondary ? 16 : 0) |
++        (VelaUnityVk::OutsidePass() ? 32 : 0);
+     if (key == g_lastDecision || g_decisionLogs >= 8)
+         return;
+     g_lastDecision = key;
+@@ -306,7 +308,8 @@ void LogDecision(int mode, VkCommandBuffer cmd, const CbQuery& q, bool defer, bo
+     const std::string seen =
+         q.known ? std::format("seen by the hooks (secondary: {}, inside a render pass: {})", q.secondary ? "yes" : "no",
+                               q.inPass ? "yes" : "no")
+-                : std::format("NOT seen by the hooks (vkBeginCommandBuffer hook hits so far: {})", g_hitBegin.load());
++                : std::format("NOT seen by the hooks (vkBeginCommandBuffer hook hits so far: {}{})", g_hitBegin.load(),
++                              VelaUnityVk::OutsidePass() ? "; NVUnityPlugin.dll was changed to EnsureOutside" : "");
+     const char* path = !defer    ? "not deferred: recorded into the game's command buffer"
+                        : viaHook ? "DEFERRED, submitted by the vkQueueSubmit hook right after the game's submit"
+                                  : "DEFERRED, submitted at the next Evaluate (fallback path, the hooks are blind)";
+@@ -540,9 +543,13 @@ VelaVkDefer::Scope::Scope(VkCommandBuffer gameCmd, VkDevice device, VkPhysicalDe
+     // Inside a render pass instance the upscale's commands are not valid (a secondary begun without
+     // RENDER_PASS_CONTINUE is outside one: nothing to defer). A command buffer the hooks never saw begin: the hooks do
+     // not see this game's calls, so the state is unknown; Unity's NVIDIA plugin is known to call Evaluate inside a pass.
++    // Vela 0044: when NVUnityPlugin.dll was changed to EnsureOutside before its device init (hooks/VelaUnityVk.h), the
++    // unseen buffer of a Unity game is outside the pass: not deferred (a needless frame of lag otherwise).
++    const bool unityInside =
++        State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNITY && !VelaUnityVk::OutsidePass();
+     bool defer = mode == 2;
+     if (mode == 1)
+-        defer = q.known ? q.inPass : State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNITY;
++        defer = q.known ? q.inPass : unityInside;
+     const bool viaHook = q.known;
+ 
+     if (defer && !EnsureGpu(device, pd, q))
+@@ -623,7 +630,8 @@ void VelaVkDefer::Scope::BeforeFeature(NVSDK_NGX_Parameter* params)
+     {
+         NVSDK_NGX_Resource_VK* r = nullptr;
+         params->Get(in.key, (void**) &r);
+-        if (r == nullptr || r->Resource.ImageViewInfo.Image == VK_NULL_HANDLE || in.layout < 0 ||
++        // <= 0: UNDEFINED is neither a layout whose contents survive nor one a barrier may return to (newLayout-01198)
++        if (r == nullptr || r->Resource.ImageViewInfo.Image == VK_NULL_HANDLE || in.layout <= 0 ||
+             in.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+             continue;
+         bool twice = false;
+@@ -662,7 +670,7 @@ void VelaVkDefer::Scope::Commit()
+         LayoutBarrier(_cmd, _inputs[k].image, _inputs[k].range, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                       _inputs[k].layout, VK_ACCESS_SHADER_READ_BIT, kAnyAccess, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+-    if (_output != VK_NULL_HANDLE && l.output >= 0 && l.output != VK_IMAGE_LAYOUT_GENERAL)
++    if (_output != VK_NULL_HANDLE && l.output > 0 && l.output != VK_IMAGE_LAYOUT_GENERAL)
+         LayoutBarrier(_cmd, _output, _outputRange, VK_IMAGE_LAYOUT_GENERAL, (VkImageLayout) l.output, kAnyAccess,
+                       kAnyAccess, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+ 
+@@ -683,7 +691,7 @@ void VelaVkDefer::Scope::Commit()
+         VkCommandBuffer c = g_gpu.clearCmd[_slot];
+         if (vkBeginCommandBuffer(c, &bi) == VK_SUCCESS)
+         {
+-            const VkImageLayout after = l.output >= 0 ? (VkImageLayout) l.output : VK_IMAGE_LAYOUT_GENERAL;
++            const VkImageLayout after = l.output > 0 ? (VkImageLayout) l.output : VK_IMAGE_LAYOUT_GENERAL;
+             const VkClearColorValue black = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+             LayoutBarrier(c, _output, _outputRange, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+index 8cf68d2..46cfa45 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+@@ -19,6 +19,7 @@
+ #include "nvsdk_ngx_vk.h"
+ #include <upscalers/sgsr3/VelaLive.h>
+ #include <hooks/VelaVkDefer.h>
++#include <hooks/VelaUnityVk.h>
+ 
+ VkInstance vkInstance;
+ VkPhysicalDevice vkPD;
+@@ -251,6 +252,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_Init_Ext2(
+ 
+     UpscalerTimeVk::Init(InDevice, InPD);
+ 
++    VelaUnityVk::CheckLoaded("NVSDK_NGX_VULKAN_Init"); // Vela 0044
+     VelaVkDefer::Enable(); // Vela 0043: the hooks track the game's command buffers from here
+ 
+     State::Instance().nvngxVkInited = true;
+diff --git a/arm64ec/tests/unity_vk_patch_test.cpp b/arm64ec/tests/unity_vk_patch_test.cpp
+new file mode 100644
+index 0000000..3548460
+--- /dev/null
++++ b/arm64ec/tests/unity_vk_patch_test.cpp
+@@ -0,0 +1,115 @@
++// Host-side test of Vela 0044 (OptiScaler/hooks/VelaUnityVkCore.h). Not part of the DLL.
++//   x86_64-w64-mingw32-clang++ -std=c++20 -O1 -I OptiScaler/hooks arm64ec/tests/unity_vk_patch_test.cpp -o t.exe
++//   t.exe [path to the game's NVUnityPlugin.dll]
++// With a path, the real plugin is mapped as an image WITHOUT running any of its code (DONT_RESOLVE_DLL_REFERENCES: no
++// imports, no DllMain) and the scan + change run on that private mapping; the file on disk is not written.
++
++#include "VelaUnityVkCore.h"
++
++#include <cstdio>
++#include <vector>
++
++using namespace vela_unity_vk;
++
++static int g_checks = 0, g_failed = 0;
++#define CHECK(x)                                                                                                       \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        g_checks++;                                                                                                    \
++        if (!(x))                                                                                                      \
++        {                                                                                                              \
++            g_failed++;                                                                                                \
++            std::printf("FAIL line %d: %s\n", __LINE__, #x);                                                           \
++        }                                                                                                              \
++    } while (0)
++
++static void Put(std::vector<uint8_t>& b, size_t at, uint8_t value)
++{
++    const uint8_t sig[kSigSize] = { 0xC7, 0x44, 0x24, 0x30, value, 0x00, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x34,
++                                    0x00, 0x00, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x38, 0x09, 0x00, 0x00, 0x00 };
++    std::memcpy(b.data() + at, sig, kSigSize);
++}
++
++static void TestCount()
++{
++    std::vector<uint8_t> b(4096, 0xCC);
++    const uint8_t* first = nullptr;
++    CHECK(CountInRange(b.data(), b.size(), kInside, &first) == 0 && first == nullptr);
++    CHECK(CountInRange(nullptr, 100, kInside, nullptr) == 0);
++    CHECK(CountInRange(b.data(), kSigSize - 1, kInside, nullptr) == 0);
++
++    Put(b, 100, kInside);
++    CHECK(CountInRange(b.data(), b.size(), kInside, &first) == 1 && first == b.data() + 100);
++    CHECK(CountInRange(b.data(), b.size(), kOutside, nullptr) == 0);
++    CHECK(CountInRange(b.data(), 100 + kSigSize, kInside, nullptr) == 1);     // ends exactly at the buffer end
++    CHECK(CountInRange(b.data(), 100 + kSigSize - 1, kInside, nullptr) == 0); // one byte short
++
++    Put(b, 4096 - kSigSize, kInside); // a second one at the very end
++    first = nullptr;
++    CHECK(CountInRange(b.data(), b.size(), kInside, &first) == 2 && first == b.data() + 100);
++
++    Put(b, 100, kOutside);
++    CHECK(CountInRange(b.data(), b.size(), kInside, nullptr) == 1);
++    CHECK(CountInRange(b.data(), b.size(), kOutside, &first) == 1 && first == b.data() + 100);
++
++    // near misses: another stack slot, another flags value, another precondition value
++    std::vector<uint8_t> c(256, 0x90);
++    Put(c, 16, kInside);
++    c[16 + 3] = 0x40;
++    CHECK(CountInRange(c.data(), c.size(), kInside, nullptr) == 0);
++    Put(c, 16, kInside);
++    c[16 + 20] = 0x08;
++    CHECK(CountInRange(c.data(), c.size(), kInside, nullptr) == 0);
++    Put(c, 16, 0x00);
++    CHECK(CountInRange(c.data(), c.size(), kInside, nullptr) == 0 &&
++          CountInRange(c.data(), c.size(), kOutside, nullptr) == 0);
++
++    // not an image
++    std::vector<uint8_t> junk(8192, 0);
++    CHECK(!Scan(junk.data()).validImage && !Scan(nullptr).validImage);
++    uint32_t rva = 0;
++    int hits = 0;
++    CHECK(Patch(junk.data(), &rva, &hits) == PatchResult::NotAnImage);
++}
++
++static void TestRealPlugin(const wchar_t* path)
++{
++    HMODULE m = LoadLibraryExW(path, nullptr, DONT_RESOLVE_DLL_REFERENCES);
++    CHECK(m != nullptr);
++    if (m == nullptr)
++    {
++        std::printf("cannot map the plugin, error %lu\n", GetLastError());
++        return;
++    }
++    auto* base = reinterpret_cast<uint8_t*>(m);
++    const ScanResult s = Scan(base);
++    std::printf("real plugin: valid %d, inside hits %d, outside hits %d, RVA 0x%X\n", (int) s.validImage, s.inside,
++                s.outside, s.rva);
++    CHECK(s.validImage && s.inside == 1 && s.outside == 0);
++    CHECK(s.rva == 0x250EC); // file offset 0x244EC in job R8B
++
++    uint32_t rva = 0;
++    int hits = 0;
++    CHECK(Patch(base, &rva, &hits) == PatchResult::Patched && rva == 0x250EC && hits == 1);
++    CHECK(base[0x250EC] == kOutside && base[0x250E8] == 0xC7);
++    MEMORY_BASIC_INFORMATION mbi {};
++    VirtualQuery(base + 0x250EC, &mbi, sizeof(mbi));
++    std::printf("page protection after the change: 0x%lX\n", mbi.Protect);
++    CHECK(mbi.Protect == PAGE_EXECUTE_READ || mbi.Protect == PAGE_EXECUTE_WRITECOPY || mbi.Protect == PAGE_EXECUTE);
++
++    CHECK(Patch(base, &rva, &hits) == PatchResult::AlreadyOutside && rva == 0x250EC); // a second look changes nothing
++    const ScanResult s2 = Scan(base);
++    CHECK(s2.inside == 0 && s2.outside == 1);
++    FreeLibrary(m);
++}
++
++int wmain(int argc, wchar_t** argv)
++{
++    TestCount();
++    if (argc > 1)
++        TestRealPlugin(argv[1]);
++    else
++        std::printf("no plugin path given: the real-module part is skipped\n");
++    std::printf("unity_vk_patch_test: %d checks, %d failed\n", g_checks, g_failed);
++    return g_failed == 0 ? 0 : 1;
++}
+-- 
+2.54.0.windows.1
+

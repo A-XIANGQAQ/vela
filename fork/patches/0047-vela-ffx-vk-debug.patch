@@ -1,0 +1,169 @@
+From f6b3e1cd855bda03a15dd380b1c479d9c285e46c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 03:56:11 +0100
+Subject: [PATCH] 0047-vela-ffx-vk-debug: test switch VELA_FFX_VK_DEBUG=1
+ (default off) for the FFX upscaler on Vulkan: logs every upscaler version the
+ provider offers, every value handed to ffxCreateContext (flags, sizes,
+ handles, override version) and its raw return code, the device's memory types
+ with the verdict whether one is DEVICE_LOCAL and not HOST_VISIBLE, the
+ extensions AMD's module looks for, and the entry points vkDeviceProcAddr
+ answers null for; sets fpMessage + FFX_UPSCALE_ENABLE_DEBUG_CHECKING and
+ ffxConfigureDescGlobalDebug1. Device run R9F (Haste Demo, Turnip): memory
+ types 7, F, B, 11 -> none that AMD's Vulkan backend accepts for its textures,
+ ffxCreateContext returns 3 (AUDIT/r9/ffx/FFX_VK.md)
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ OptiScaler/upscalers/ffx/FFXFeature_Vk.cpp | 118 +++++++++++++++++++++
+ 1 file changed, 118 insertions(+)
+
+diff --git a/OptiScaler/upscalers/ffx/FFXFeature_Vk.cpp b/OptiScaler/upscalers/ffx/FFXFeature_Vk.cpp
+index 70567f5..e9ace20 100644
+--- a/OptiScaler/upscalers/ffx/FFXFeature_Vk.cpp
++++ b/OptiScaler/upscalers/ffx/FFXFeature_Vk.cpp
+@@ -138,6 +138,96 @@ FFXFeatureVk::FFXFeatureVk(unsigned int InHandleId, NVSDK_NGX_Parameter* InParam
+         LOG_ERROR("Can't load amd_fidelityfx_vk.dll methods!");
+ }
+ 
++// Vela: VELA_FFX_VK_DEBUG=1 (default off) -- what the Vulkan FFX context is created with, what AMD's module answers
++// and what its Vulkan backend reads from the device before it allocates (AUDIT/r9/ffx/FFX_VK.md)
++static bool VelaFfxVkDebug()
++{
++    static const bool on = [] {
++        const char* e = std::getenv("VELA_FFX_VK_DEBUG");
++        return e != nullptr && e[0] == '1';
++    }();
++    return on;
++}
++
++// called by AMD's x64 module: a plain function with the ffxApiMessage signature
++static void VelaFfxVkMessage(uint32_t type, const wchar_t* message)
++{
++    const std::string text = message != nullptr ? wstring_to_string(std::wstring(message)) : std::string("(null)");
++
++    if (type == FFX_API_MESSAGE_TYPE_ERROR)
++        LOG_ERROR("Vela FFX VK debug: FFX error: {}", text);
++    else if (type == FFX_API_MESSAGE_TYPE_WARNING)
++        LOG_WARN("Vela FFX VK debug: FFX warning: {}", text);
++    else
++        LOG_INFO("Vela FFX VK debug: FFX message type {}: {}", type, text);
++}
++
++static void VelaFfxVkDumpCreate(const ffxCreateContextDescUpscale& desc, const ffxCreateBackendVKDesc& backend,
++                                const ffxOverrideVersion& ov, bool gdpaFromGame, bool ditto)
++{
++    const auto& ids = State::Instance().ffxUpscalerVersionIds;
++    const auto& names = State::Instance().ffxUpscalerVersionNames;
++    for (size_t i = 0; i < ids.size(); i++)
++        LOG_INFO("Vela FFX VK debug: upscaler version {}: id {:X} name {}", i, (uint64_t) ids[i],
++                 i < names.size() && names[i] != nullptr ? names[i] : "");
++
++    LOG_INFO("Vela FFX VK debug: create ({}): flags {:X} maxRenderSize {}x{} maxUpscaleSize {}x{} fpMessage {:X}",
++             ditto ? "DittoSR" : "AMD", (uint32_t) desc.flags, desc.maxRenderSize.width, desc.maxRenderSize.height,
++             desc.maxUpscaleSize.width, desc.maxUpscaleSize.height, (uint64_t) (uintptr_t) desc.fpMessage);
++    LOG_INFO("Vela FFX VK debug: backend: vkDevice {:X} vkPhysicalDevice {:X} vkDeviceProcAddr {:X} ({}), override "
++             "versionId {:X}",
++             (uint64_t) (uintptr_t) backend.vkDevice, (uint64_t) (uintptr_t) backend.vkPhysicalDevice,
++             (uint64_t) (uintptr_t) backend.vkDeviceProcAddr,
++             gdpaFromGame ? "given at NGX init" : "OptiScaler's vulkan-1.dll import", (uint64_t) ov.versionId);
++
++    // AMD's backend takes for its own textures only a memory type that is DEVICE_LOCAL and not HOST_VISIBLE
++    VkPhysicalDeviceMemoryProperties mp {};
++    vkGetPhysicalDeviceMemoryProperties(backend.vkPhysicalDevice, &mp);
++    bool deviceLocalOnly = false;
++    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
++    {
++        const VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
++        deviceLocalOnly |= (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
++                           (f & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT)) == 0;
++        LOG_INFO("Vela FFX VK debug: memory type {}: flags {:X} heap {}", i, (uint32_t) f, mp.memoryTypes[i].heapIndex);
++    }
++    LOG_INFO("Vela FFX VK debug: {} memory types, one that is DEVICE_LOCAL and not HOST_VISIBLE: {}",
++             mp.memoryTypeCount, deviceLocalOnly ? "yes" : "NO (AMD's backend cannot allocate its textures)");
++
++    uint32_t extCount = 0;
++    vkEnumerateDeviceExtensionProperties(backend.vkPhysicalDevice, nullptr, &extCount, nullptr);
++    std::vector<VkExtensionProperties> exts(extCount);
++    if (extCount > 0)
++        vkEnumerateDeviceExtensionProperties(backend.vkPhysicalDevice, nullptr, &extCount, exts.data());
++    std::string have;
++    for (const char* want : { "VK_KHR_shader_float16_int8", "VK_EXT_subgroup_size_control",
++                              "VK_EXT_descriptor_indexing", "VK_KHR_dedicated_allocation", "VK_KHR_synchronization2",
++                              "VK_KHR_acceleration_structure", "VK_AMD_buffer_marker",
++                              "VK_AMD_device_coherent_memory" })
++        for (uint32_t i = 0; i < extCount && i < exts.size(); i++)
++            if (strcmp(exts[i].extensionName, want) == 0)
++            {
++                have += std::string(have.empty() ? "" : ", ") + want;
++                break;
++            }
++    LOG_INFO("Vela FFX VK debug: the physical device lists {} device extensions; of the 8 AMD's module looks for: {}",
++             extCount, have.empty() ? "none" : have);
++
++    std::string missing;
++    if (backend.vkDeviceProcAddr != nullptr)
++        for (const char* fn : { "vkCreateImage", "vkGetImageMemoryRequirements", "vkAllocateMemory",
++                                "vkBindImageMemory", "vkCreateImageView", "vkCreateBuffer",
++                                "vkGetBufferMemoryRequirements", "vkBindBufferMemory", "vkMapMemory",
++                                "vkCreateSampler", "vkCreateDescriptorPool",
++                                "vkCreateDescriptorSetLayout", "vkAllocateDescriptorSets", "vkCreatePipelineLayout",
++                                "vkCreateShaderModule", "vkCreateComputePipelines", "vkGetBufferMemoryRequirements2KHR",
++                                "vkSetDebugUtilsObjectNameEXT" })
++            if (backend.vkDeviceProcAddr(backend.vkDevice, fn) == nullptr)
++                missing += std::string(missing.empty() ? "" : ", ") + fn;
++    LOG_INFO("Vela FFX VK debug: vkDeviceProcAddr answers null for: {}",
++             missing.empty() ? "none of the 18 asked" : missing);
++}
++
+ // Vela 0040: the upscaler versions a provider module offers (ffxQuery GET_VERSIONS), into State as QueryVersionsVulkan
+ static void VelaQueryVersionsVk(PfnFfxQuery query)
+ {
+@@ -251,6 +341,13 @@ bool FFXFeatureVk::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+ 
+         InitFlags();
+ 
++
++        if (VelaFfxVkDebug())
++        {
++            _contextDesc.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
++            _contextDesc.fpMessage = VelaFfxVkMessage;
++        }
++
+         ffxCreateBackendVKDesc backendDesc = { 0 };
+         backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+         backendDesc.vkDevice = Device;
+@@ -278,10 +375,31 @@ bool FFXFeatureVk::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+         ov.versionId = State::Instance().ffxUpscalerVersionIds[Config::Instance()->FfxUpscalerIndex.value_or_default()];
+         backendDesc.header.pNext = &ov.header;
+ 
++        if (VelaFfxVkDebug())
++            VelaFfxVkDumpCreate(_contextDesc, backendDesc, ov, GDPA != nullptr, ditto);
++
+         LOG_DEBUG("_createContext!");
+         auto create = ditto ? FfxApiProxy::DittoSRVk_CreateContext() : FfxApiProxy::VULKAN_CreateContext();
+         auto ret = create(&_context, &_contextDesc.header, NULL);
+ 
++
++        if (VelaFfxVkDebug())
++        {
++            LOG_INFO("Vela FFX VK debug: ffxCreateContext returned {} ({}), context {:X}", (uint32_t) ret,
++                     FfxApiProxy::ReturnCodeToString(ret), (uint64_t) (uintptr_t) _context);
++
++            // ffxConfigure needs a context: the module-wide messages can be asked for only after a create that worked
++            if (auto configure = FfxConfigure(); ret == FFX_API_RETURN_OK && configure != nullptr)
++            {
++                ffxConfigureDescGlobalDebug1 globalDebug {};
++                globalDebug.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1;
++                globalDebug.fpMessage = VelaFfxVkMessage;
++                globalDebug.debugLevel = FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_VERBOSE;
++                LOG_INFO("Vela FFX VK debug: ffxConfigure GLOBALDEBUG1 returned {}",
++                         (uint32_t) configure(&_context, &globalDebug.header));
++            }
++        }
++
+         if (ret != FFX_API_RETURN_OK)
+         {
+             if (ditto)
+-- 
+2.54.0.windows.1
+

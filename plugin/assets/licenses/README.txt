@@ -31,7 +31,7 @@ upscale/assets/staticfsr/dxgi.dll     the Resident Evil 4 FSR 2 interceptor (our
 upscale/assets/npu/libVkLayer_VELA_npu.so, VkLayer_VELA_npu.json  our Vulkan layer that hands the FSR 4 network to the NPU:
                               GPL-3.0-only, as the plugin.
 upscale/assets/licenses/*     these texts.
-Not in this zip: the Vela NPU system part (install-vela-npu.sh, its own release asset vela-npu-sysext-15.raw, which carries the
+Not in this zip: the Vela NPU system part (install-vela-npu.sh, its own release asset vela-npu-sysext-17.raw, which carries the
 Qualcomm AI Engine Direct SDK runtime 2.47.0.260601, redistributed by the Vela author, with Qualcomm's licence and Notice File
 in /usr/share/licenses/armada-vela-npu/) and any Qualcomm QNN runtime file.
 Detours-MIT.txt               Microsoft Detours (MIT), linked into upscale/assets/staticfsr/dxgi.dll

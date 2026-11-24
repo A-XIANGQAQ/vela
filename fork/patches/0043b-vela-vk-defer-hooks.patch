@@ -1,0 +1,1111 @@
+From 15de4d8c4cdd40d0c3fbfcb4eb9cdb581498d86f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 00:32:02 +0100
+Subject: [PATCH] 0043-vela-vk-defer hooks: the existing inline Vulkan hooks
+ (VulkanwDx12_Hooks.cpp: vkBeginCommandBuffer, vkResetCommandBuffer,
+ vkAllocate/FreeCommandBuffers, command pool create/reset/destroy,
+ vkCmdBeginRenderPass/2/2KHR, vkCmdBeginRendering/KHR and their ends,
+ vkCmdExecuteCommands, vkQueueSubmit/2/2KHR) feed hooks/VelaVkDefer: a
+ deferred upscale is recorded into a primary command buffer of our own (own
+ pool on the family of the game's pool, else the first graphics+compute
+ family; 4 buffers with fences) and submitted on the game's queue from inside
+ the vkQueueSubmit* hook, after the game's submit returned, same thread; jobs
+ no hook submitted go out at the start of the next Evaluate (fallback path,
+ queue 0 of the family). Game inputs go assumed layout -> SHADER_READ_ONLY ->
+ back around the feature (one table kGameLayoutDefaults: colour 2, depth 3,
+ motion 2, output 1; VELA_VK_DEFER_LAYOUTS=c,d,m,o), a new output image is
+ cleared once ahead of the game's buffers (VELA_VK_DEFER_CLEAR=0 = no), a job
+ older than 1 s is dropped. Nothing calls Enable() yet: the hooks are no-ops
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ OptiScaler/hooks/VelaVkDefer.cpp       | 777 +++++++++++++++++++++++++
+ OptiScaler/hooks/VelaVkDefer.h         | 110 ++++
+ OptiScaler/hooks/VulkanwDx12_Hooks.cpp |  23 +
+ 3 files changed, 910 insertions(+)
+ create mode 100644 OptiScaler/hooks/VelaVkDefer.cpp
+ create mode 100644 OptiScaler/hooks/VelaVkDefer.h
+
+diff --git a/OptiScaler/hooks/VelaVkDefer.cpp b/OptiScaler/hooks/VelaVkDefer.cpp
+new file mode 100644
+index 0000000..f1a28ff
+--- /dev/null
++++ b/OptiScaler/hooks/VelaVkDefer.cpp
+@@ -0,0 +1,777 @@
++#include <pch.h>
++
++#include "VelaVkDefer.h"
++#include "VelaVkDeferCore.h"
++
++#include <State.h>
++
++#include "nvsdk_ngx_vk.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++
++using namespace vela_vk_defer;
++
++namespace
++{
++// ---------------------------------------------------------------------------------------------------------------------
++// The one place for what we assume about the game's images when our command buffer runs (after the game's submit of
++// that frame). NGX hands no layouts and Unity does not transition for the plugin: in the Haste Demo validation run
++// k2lsp8 a sampled input was still COLOR_ATTACHMENT_OPTIMAL when Evaluate's buffer was executed (UNASSIGNED-
++// vkCmdExecuteCommands-commandBuffer-00001) and the output was GENERAL (VUID-VkImageMemoryBarrier-oldLayout-01197:
++// "previously used layout is VK_IMAGE_LAYOUT_GENERAL"). Assumed here: a render target the game does not sample after the
++// upscale is left in its attachment layout. -1 = shader-readable already (no barrier, the behaviour before 0043).
++// Inputs go assumed -> SHADER_READ_ONLY_OPTIMAL before the feature records and back after it; the output is left by the
++// features in GENERAL (SGSR2Feature_Vk.cpp) and goes GENERAL -> assumed when that differs.
++// Override without a rebuild: VELA_VK_DEFER_LAYOUTS=c,d,m,o (VkImageLayout numbers).
++struct GameLayouts
++{
++    int colour, depth, motion, output;
++};
++constexpr GameLayouts kGameLayoutDefaults = { VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
++                                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL };
++
++const GameLayouts& Layouts()
++{
++    static const GameLayouts l = []
++    {
++        GameLayouts g = kGameLayoutDefaults;
++        if (const char* e = std::getenv("VELA_VK_DEFER_LAYOUTS"); e != nullptr)
++        {
++            GameLayouts t = g;
++            if (std::sscanf(e, "%d,%d,%d,%d", &t.colour, &t.depth, &t.motion, &t.output) == 4)
++                g = t;
++        }
++        return g;
++    }();
++    return l;
++}
++
++int EnvDigit(const char* name, int def, int max)
++{
++    const char* e = std::getenv(name);
++    if (e != nullptr && e[0] >= '0' && e[0] <= '0' + max && e[1] == 0)
++        return e[0] - '0';
++    return def;
++}
++
++int Mode()
++{
++    static const int m = EnvDigit("VELA_VK_DEFER", 1, 2);
++    return m;
++}
++
++bool ClearFirst()
++{
++    static const bool c = EnvDigit("VELA_VK_DEFER_CLEAR", 1, 1) == 1;
++    return c;
++}
++
++// a recorded job that waited longer than this is never submitted: the game stopped calling Evaluate (a menu, a level
++// load) and may have destroyed the image views the recording names
++constexpr auto kMaxReadyAge = std::chrono::milliseconds(1000);
++// the only wait on the frame path: the ring is full (4 jobs in flight)
++constexpr uint64_t kRingWaitNs = 50000000ull;
++
++std::atomic<bool> g_enabled { false };
++thread_local int t_own = 0; // > 0: Vulkan calls of this file; the hooks ignore them
++
++struct OwnCall
++{
++    OwnCall() { t_own++; }
++    ~OwnCall() { t_own--; }
++};
++
++bool Tracking() { return g_enabled.load(std::memory_order_relaxed) && Mode() != 0; }
++
++std::mutex g_trackMx; // never held across a Vulkan call
++Tracker g_tracker;
++std::atomic<size_t> g_watch { 0 };
++
++std::mutex g_ringMx; // held across our own Vulkan calls; order: g_ringMx, then g_trackMx
++Ring g_ring;
++
++struct Gpu
++{
++    VkDevice device = VK_NULL_HANDLE;
++    uint32_t family = 0;
++    VkQueue fallbackQueue = VK_NULL_HANDLE;
++    VkCommandPool pool = VK_NULL_HANDLE;
++    VkCommandBuffer cmd[Ring::Size] {};
++    VkCommandBuffer clearCmd[Ring::Size] {};
++    VkFence fence[Ring::Size] {};
++    std::chrono::steady_clock::time_point readySince[Ring::Size] {};
++    bool ok = false;
++} g_gpu;
++std::unordered_map<unsigned int, VkImage> g_lastOutput; // per handle: the output image our clear has seen
++
++std::atomic<uint64_t> g_hitBegin { 0 }, g_hitPass { 0 }, g_hitExecute { 0 }, g_hitSubmit { 0 };
++// under g_ringMx
++uint64_t g_evals = 0, g_evalsKnown = 0, g_deferred = 0, g_direct = 0, g_dropped = 0, g_ringWaits = 0;
++uint64_t g_hookSubmits = 0, g_fallbackSubmits = 0;
++int g_lastDecision = -1, g_decisionLogs = 0;
++
++VkImageAspectFlags AspectOf(VkFormat f)
++{
++    switch (f)
++    {
++    case VK_FORMAT_D16_UNORM:
++    case VK_FORMAT_X8_D24_UNORM_PACK32:
++    case VK_FORMAT_D32_SFLOAT:
++        return VK_IMAGE_ASPECT_DEPTH_BIT;
++    case VK_FORMAT_S8_UINT:
++        return VK_IMAGE_ASPECT_STENCIL_BIT;
++    case VK_FORMAT_D16_UNORM_S8_UINT:
++    case VK_FORMAT_D24_UNORM_S8_UINT:
++    case VK_FORMAT_D32_SFLOAT_S8_UINT:
++        // both aspects: a barrier on a combined format names both unless separateDepthStencilLayouts is on
++        return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++    default:
++        return VK_IMAGE_ASPECT_COLOR_BIT;
++    }
++}
++
++VkImageSubresourceRange RangeOf(const NVSDK_NGX_ImageViewInfo_VK& vi)
++{
++    VkImageSubresourceRange r = vi.SubresourceRange;
++    r.aspectMask = AspectOf(vi.Format);
++    if (r.levelCount == 0)
++        r.levelCount = 1;
++    if (r.layerCount == 0)
++        r.layerCount = 1;
++    return r;
++}
++
++void LayoutBarrier(VkCommandBuffer cmd, VkImage image, const VkImageSubresourceRange& range, VkImageLayout from,
++                   VkImageLayout to, VkAccessFlags srcAccess, VkAccessFlags dstAccess, VkPipelineStageFlags srcStage,
++                   VkPipelineStageFlags dstStage)
++{
++    VkImageMemoryBarrier b { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++    b.oldLayout = from;
++    b.newLayout = to;
++    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    b.image = image;
++    b.subresourceRange = range;
++    b.srcAccessMask = srcAccess;
++    b.dstAccessMask = dstAccess;
++    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
++}
++
++constexpr VkAccessFlags kAnyAccess = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++
++// g_ringMx held. Our pool, command buffers and fences for this device.
++bool EnsureGpu(VkDevice device, VkPhysicalDevice pd, const CbQuery& q)
++{
++    if (g_gpu.ok && g_gpu.device == device)
++        return true;
++    if (device == VK_NULL_HANDLE || pd == VK_NULL_HANDLE)
++        return false;
++
++    OwnCall own;
++    if (g_gpu.device != VK_NULL_HANDLE && g_gpu.device != device)
++    {
++        // another device: the old one may be gone, its objects are left alone
++        LOG_WARN("Vela VK defer: the game's VkDevice changed; the objects of the old one are abandoned");
++        g_ring.Reset();
++        g_lastOutput.clear();
++    }
++    g_gpu = {};
++    g_gpu.device = device;
++
++    if (q.familyKnown)
++    {
++        g_gpu.family = q.family;
++    }
++    else
++    {
++        // the pool of Evaluate's command buffer was not seen: the first family that does graphics and compute
++        uint32_t n = 0;
++        vkGetPhysicalDeviceQueueFamilyProperties(pd, &n, nullptr);
++        std::vector<VkQueueFamilyProperties> props(n);
++        vkGetPhysicalDeviceQueueFamilyProperties(pd, &n, props.data());
++        const VkQueueFlags want = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
++        uint32_t f = 0;
++        while (f < n && (props[f].queueFlags & want) != want)
++            f++;
++        g_gpu.family = f < n ? f : 0;
++    }
++
++    VkCommandPoolCreateInfo pci { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
++    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++    pci.queueFamilyIndex = g_gpu.family;
++    if (vkCreateCommandPool(device, &pci, nullptr, &g_gpu.pool) != VK_SUCCESS)
++    {
++        LOG_ERROR("Vela VK defer: vkCreateCommandPool (queue family {}) failed", g_gpu.family);
++        return false;
++    }
++
++    VkCommandBuffer all[Ring::Size * 2] {};
++    VkCommandBufferAllocateInfo ai { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
++    ai.commandPool = g_gpu.pool;
++    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++    ai.commandBufferCount = Ring::Size * 2;
++    bool good = vkAllocateCommandBuffers(device, &ai, all) == VK_SUCCESS;
++    VkFenceCreateInfo fci { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++    for (int i = 0; good && i < Ring::Size; i++)
++    {
++        g_gpu.cmd[i] = all[i];
++        g_gpu.clearCmd[i] = all[Ring::Size + i];
++        good = vkCreateFence(device, &fci, nullptr, &g_gpu.fence[i]) == VK_SUCCESS;
++    }
++    if (!good)
++    {
++        LOG_ERROR("Vela VK defer: command buffers / fences could not be made");
++        return false;
++    }
++
++    // the queue of the next-Evaluate path; winevulkan answers a queue the device does not have with a null handle
++    vkGetDeviceQueue(device, g_gpu.family, 0, &g_gpu.fallbackQueue);
++    LOG_INFO("Vela VK defer: own command pool on queue family {} ({}), {} command buffers, fallback queue {:X}",
++             g_gpu.family, q.familyKnown ? "the family of the game's pool" : "first graphics+compute family",
++             Ring::Size, (size_t) g_gpu.fallbackQueue);
++    g_gpu.ok = true;
++    return true;
++}
++
++// g_ringMx held. Submits the recorded job of slot i; our command buffer runs after everything submitted to that queue
++// before it.
++void SubmitJob(VkQueue queue, int i, bool fallback)
++{
++    if (!g_gpu.ok || queue == VK_NULL_HANDLE ||
++        std::chrono::steady_clock::now() - g_gpu.readySince[i] > kMaxReadyAge)
++    {
++        g_ring.Fail(i);
++        g_dropped++;
++        return;
++    }
++
++    OwnCall own;
++    vkResetFences(g_gpu.device, 1, &g_gpu.fence[i]);
++    VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++    si.commandBufferCount = 1;
++    si.pCommandBuffers = &g_gpu.cmd[i];
++    const VkResult r = vkQueueSubmit(queue, 1, &si, g_gpu.fence[i]);
++    if (r != VK_SUCCESS)
++    {
++        static int logged = 0;
++        if (logged++ < 4)
++            LOG_ERROR("Vela VK defer: vkQueueSubmit of the deferred upscale failed: {}", (int) r);
++        g_ring.Fail(i);
++        g_dropped++;
++        return;
++    }
++    g_ring.Submitted(i);
++    if (fallback)
++        g_fallbackSubmits++;
++    else
++        g_hookSubmits++;
++}
++
++// g_ringMx held. The one-time clear of a new output image; it runs before the game's buffers of that frame. No fence
++// of its own: the job of the same slot is submitted to the same queue after it.
++void SubmitClear(VkQueue queue, int i)
++{
++    if (!g_gpu.ok || queue == VK_NULL_HANDLE)
++        return;
++    OwnCall own;
++    VkSubmitInfo si { VK_STRUCTURE_TYPE_SUBMIT_INFO };
++    si.commandBufferCount = 1;
++    si.pCommandBuffers = &g_gpu.clearCmd[i];
++    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
++}
++
++// g_ringMx held. The next-Evaluate path: recorded jobs no hook submitted.
++void FlushStale()
++{
++    Job stale[Ring::Size];
++    const int n = g_ring.Stale(stale);
++    for (int k = 0; k < n; k++)
++        SubmitJob(g_gpu.fallbackQueue, stale[k].slot, true);
++}
++
++// g_ringMx held
++void LogDecision(int mode, VkCommandBuffer cmd, const CbQuery& q, bool defer, bool viaHook)
++{
++    const int key =
++        (defer ? 1 : 0) | (viaHook ? 2 : 0) | (q.known ? 4 : 0) | (q.inPass ? 8 : 0) | (q.secondary ? 16 : 0);
++    if (key == g_lastDecision || g_decisionLogs >= 8)
++        return;
++    g_lastDecision = key;
++    g_decisionLogs++;
++
++    const std::string seen =
++        q.known ? std::format("seen by the hooks (secondary: {}, inside a render pass: {})", q.secondary ? "yes" : "no",
++                              q.inPass ? "yes" : "no")
++                : std::format("NOT seen by the hooks (vkBeginCommandBuffer hook hits so far: {})", g_hitBegin.load());
++    const char* path = !defer    ? "not deferred: recorded into the game's command buffer"
++                       : viaHook ? "DEFERRED, submitted by the vkQueueSubmit hook right after the game's submit"
++                                 : "DEFERRED, submitted at the next Evaluate (fallback path, the hooks are blind)";
++    const auto& l = Layouts();
++    LOG_INFO("Vela VK defer: mode {} ({}): Evaluate's command buffer {:X} {} -> {}; assumed layouts colour {} depth {} "
++             "motion {} output {}",
++             mode, mode == 2 ? "always" : "auto", (size_t) cmd, seen, path, l.colour, l.depth, l.motion, l.output);
++}
++
++// g_ringMx held
++void Tick()
++{
++    if (g_evals == 120)
++    {
++        LOG_INFO("Vela VK defer: hooks after 120 Evaluate calls: vkBeginCommandBuffer {}, render pass begin/end {}, "
++                 "vkCmdExecuteCommands {}, vkQueueSubmit* {}; Evaluate's command buffer seen by the hooks in {} of 120",
++                 g_hitBegin.load(), g_hitPass.load(), g_hitExecute.load(), g_hitSubmit.load(), g_evalsKnown);
++    }
++    if (g_evals % 600 == 0 && (g_deferred != 0 || Mode() == 2))
++    {
++        LOG_INFO("Vela VK defer: {} Evaluate calls: deferred {}, submitted by the submit hook {}, by the next-Evaluate "
++                 "fallback {}, dropped {}, ring waits {}, not deferred {}",
++                 g_evals, g_deferred, g_hookSubmits, g_fallbackSubmits, g_dropped, g_ringWaits, g_direct);
++    }
++}
++
++template <typename CollectFn> int TakeJobs(CollectFn&& collect, int slots[Ring::Size], uint64_t seqs[Ring::Size])
++{
++    std::vector<Job> jobs;
++    {
++        std::scoped_lock lock(g_trackMx);
++        collect(jobs);
++        g_watch.store(g_tracker.WatchCount(), std::memory_order_relaxed);
++    }
++    int n = 0;
++    for (const Job& j : jobs)
++    {
++        if (n == Ring::Size)
++            break;
++        slots[n] = j.slot;
++        seqs[n++] = j.seq;
++    }
++    return n;
++}
++} // namespace
++
++// ---------------------------------------------------------------------------------------------------------------- hooks
++
++void VelaVkDefer::Enable()
++{
++    if (g_enabled.exchange(true))
++        return;
++    if (Mode() == 0)
++        LOG_INFO("Vela VK defer: off (VELA_VK_DEFER=0): the upscale is recorded into the game's command buffer");
++    else
++        LOG_INFO("Vela VK defer: mode {} ({}); the Vulkan hooks track the game's command buffers from now", Mode(),
++                 Mode() == 2 ? "always" : "auto");
++}
++
++void VelaVkDefer::OnCreatePool(VkCommandPool pool, uint32_t family)
++{
++    if (!Tracking() || t_own > 0)
++        return;
++    std::scoped_lock lock(g_trackMx);
++    g_tracker.OnCreatePool((Handle) pool, family);
++}
++
++void VelaVkDefer::OnDestroyPool(VkCommandPool pool)
++{
++    if (!Tracking() || t_own > 0)
++        return;
++    std::scoped_lock lock(g_trackMx);
++    g_tracker.OnDestroyPool((Handle) pool);
++    g_watch.store(g_tracker.WatchCount(), std::memory_order_relaxed);
++}
++
++void VelaVkDefer::OnResetPool(VkCommandPool pool)
++{
++    if (!Tracking() || t_own > 0)
++        return;
++    std::scoped_lock lock(g_trackMx);
++    g_tracker.OnResetPool((Handle) pool);
++    g_watch.store(g_tracker.WatchCount(), std::memory_order_relaxed);
++}
++
++void VelaVkDefer::OnAllocate(VkCommandPool pool, uint32_t count, const VkCommandBuffer* cbs, VkCommandBufferLevel level)
++{
++    if (!Tracking() || t_own > 0 || cbs == nullptr)
++        return;
++    std::scoped_lock lock(g_trackMx);
++    for (uint32_t i = 0; i < count; i++)
++        g_tracker.OnAllocate((Handle) pool, (Handle) cbs[i], level == VK_COMMAND_BUFFER_LEVEL_SECONDARY);
++}
++
++void VelaVkDefer::OnFree(uint32_t count, const VkCommandBuffer* cbs)
++{
++    if (!Tracking() || t_own > 0 || cbs == nullptr)
++        return;
++    std::scoped_lock lock(g_trackMx);
++    for (uint32_t i = 0; i < count; i++)
++        g_tracker.OnFree((Handle) cbs[i]);
++    g_watch.store(g_tracker.WatchCount(), std::memory_order_relaxed);
++}
++
++void VelaVkDefer::OnBegin(VkCommandBuffer cb, const VkCommandBufferBeginInfo* info)
++{
++    if (!Tracking() || t_own > 0)
++        return;
++    g_hitBegin.fetch_add(1, std::memory_order_relaxed);
++    const bool rpc = info != nullptr && (info->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) != 0;
++    std::scoped_lock lock(g_trackMx);
++    g_tracker.OnBegin((Handle) cb, rpc);
++    g_watch.store(g_tracker.WatchCount(), std::memory_order_relaxed);
++}
++
++void VelaVkDefer::OnReset(VkCommandBuffer cb)
++{
++    if (!Tracking() || t_own > 0)
++        return;
++    std::scoped_lock lock(g_trackMx);
++    g_tracker.OnReset((Handle) cb);
++    g_watch.store(g_tracker.WatchCount(), std::memory_order_relaxed);
++}
++
++void VelaVkDefer::OnPass(VkCommandBuffer cb, bool begin)
++{
++    if (!Tracking() || t_own > 0)
++        return;
++    g_hitPass.fetch_add(1, std::memory_order_relaxed);
++    std::scoped_lock lock(g_trackMx);
++    g_tracker.OnPass((Handle) cb, begin);
++}
++
++void VelaVkDefer::OnExecute(VkCommandBuffer cb, uint32_t count, const VkCommandBuffer* cbs)
++{
++    if (!Tracking() || t_own > 0)
++        return;
++    g_hitExecute.fetch_add(1, std::memory_order_relaxed);
++    if (g_watch.load(std::memory_order_relaxed) == 0)
++        return;
++    static_assert(sizeof(VkCommandBuffer) == sizeof(Handle));
++    std::scoped_lock lock(g_trackMx);
++    g_tracker.OnExecute((Handle) cb, count, reinterpret_cast<const Handle*>(cbs));
++}
++
++VelaVkDefer::SubmitScope::SubmitScope(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* submits) : _queue(queue)
++{
++    if (!Tracking() || t_own > 0 || submits == nullptr)
++        return;
++    g_hitSubmit.fetch_add(1, std::memory_order_relaxed);
++    if (g_watch.load(std::memory_order_relaxed) == 0)
++        return;
++    _count = TakeJobs(
++        [&](std::vector<Job>& jobs)
++        {
++            for (uint32_t i = 0; i < submitCount; i++)
++                for (uint32_t j = 0; j < submits[i].commandBufferCount; j++)
++                    g_tracker.TakeForSubmit((Handle) submits[i].pCommandBuffers[j], jobs);
++        },
++        _slot, _seq);
++    Before();
++}
++
++VelaVkDefer::SubmitScope::SubmitScope(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* submits) : _queue(queue)
++{
++    if (!Tracking() || t_own > 0 || submits == nullptr)
++        return;
++    g_hitSubmit.fetch_add(1, std::memory_order_relaxed);
++    if (g_watch.load(std::memory_order_relaxed) == 0)
++        return;
++    _count = TakeJobs(
++        [&](std::vector<Job>& jobs)
++        {
++            for (uint32_t i = 0; i < submitCount; i++)
++                for (uint32_t j = 0; j < submits[i].commandBufferInfoCount; j++)
++                    g_tracker.TakeForSubmit((Handle) submits[i].pCommandBufferInfos[j].commandBuffer, jobs);
++        },
++        _slot, _seq);
++    Before();
++}
++
++void VelaVkDefer::SubmitScope::Before()
++{
++    if (_count == 0)
++        return;
++    std::scoped_lock lock(g_ringMx);
++    for (int k = 0; k < _count; k++)
++    {
++        const Job j { _slot[k], _seq[k] };
++        if (g_ring.IsReady(j) && g_ring.At(j.slot).clearFirst)
++            SubmitClear(_queue, j.slot);
++    }
++}
++
++VelaVkDefer::SubmitScope::~SubmitScope()
++{
++    if (_count == 0)
++        return;
++    // the game's submit has returned: its command buffers are queued, ours go behind them
++    std::scoped_lock lock(g_ringMx);
++    for (int k = 0; k < _count; k++)
++    {
++        const Job j { _slot[k], _seq[k] };
++        if (g_ring.IsReady(j))
++            SubmitJob(_queue, j.slot, false);
++    }
++}
++
++// ------------------------------------------------------------------------------------------------------------- Evaluate
++
++VelaVkDefer::Scope::Scope(VkCommandBuffer gameCmd, VkDevice device, VkPhysicalDevice pd, unsigned int handleId)
++    : _gameCmd(gameCmd), _cmd(gameCmd), _handleId(handleId)
++{
++    const int mode = Mode();
++    if (mode == 0 || gameCmd == VK_NULL_HANDLE)
++        return;
++
++    CbQuery q;
++    {
++        std::scoped_lock lock(g_trackMx);
++        q = g_tracker.Query((Handle) gameCmd);
++    }
++
++    std::scoped_lock lock(g_ringMx);
++    g_evals++;
++    if (q.known)
++        g_evalsKnown++;
++    if (g_gpu.ok)
++        FlushStale();
++
++    // Inside a render pass instance the upscale's commands are not valid (a secondary begun without
++    // RENDER_PASS_CONTINUE is outside one: nothing to defer). A command buffer the hooks never saw begin: the hooks do
++    // not see this game's calls, so the state is unknown; Unity's NVIDIA plugin is known to call Evaluate inside a pass.
++    bool defer = mode == 2;
++    if (mode == 1)
++        defer = q.known ? q.inPass : State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNITY;
++    const bool viaHook = q.known;
++
++    if (defer && !EnsureGpu(device, pd, q))
++        defer = false;
++    if (defer && !viaHook && g_gpu.fallbackQueue == VK_NULL_HANDLE)
++    {
++        static bool logged = false;
++        if (!logged)
++        {
++            logged = true;
++            LOG_ERROR("Vela VK defer: no queue 0 in family {} for the fallback path; not deferred", g_gpu.family);
++        }
++        defer = false;
++    }
++
++    LogDecision(mode, gameCmd, q, defer, viaHook);
++    if (!defer)
++    {
++        g_direct++;
++        Tick();
++        return;
++    }
++
++    OwnCall own;
++    const int next = g_ring.NextIndex();
++    if (g_ring.At(next).state == SlotState::InFlight)
++    {
++        VkResult fr = vkGetFenceStatus(g_gpu.device, g_gpu.fence[next]);
++        if (fr == VK_NOT_READY)
++        {
++            g_ringWaits++;
++            fr = vkWaitForFences(g_gpu.device, 1, &g_gpu.fence[next], VK_TRUE, kRingWaitNs);
++        }
++        if (fr == VK_SUCCESS)
++            g_ring.Complete(next);
++    }
++    bool droppedReady = false;
++    const int slot = g_ring.Acquire(handleId, viaHook, &droppedReady);
++    if (droppedReady)
++        g_dropped++;
++
++    VkCommandBufferBeginInfo bi { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    if (slot < 0 || vkBeginCommandBuffer(g_gpu.cmd[slot], &bi) != VK_SUCCESS)
++    {
++        // 4 jobs still on the GPU after the wait, or the device is lost: this frame gets no upscale (recording it into
++        // the game's buffer would be the invalid path again)
++        if (slot >= 0)
++            g_ring.Cancel(slot);
++        g_dropped++;
++        _cmd = VK_NULL_HANDLE;
++        Tick();
++        return;
++    }
++
++    _slot = slot;
++    _viaHook = viaHook;
++    _cmd = g_gpu.cmd[slot];
++    Tick();
++}
++
++void VelaVkDefer::Scope::BeforeFeature(NVSDK_NGX_Parameter* params)
++{
++    if (_slot < 0 || params == nullptr)
++        return;
++
++    const auto& l = Layouts();
++    const struct
++    {
++        const char* key;
++        int layout;
++    } inputs[3] = { { NVSDK_NGX_Parameter_Color, l.colour },
++                    { NVSDK_NGX_Parameter_Depth, l.depth },
++                    { NVSDK_NGX_Parameter_MotionVectors, l.motion } };
++
++    OwnCall own;
++    for (const auto& in : inputs)
++    {
++        NVSDK_NGX_Resource_VK* r = nullptr;
++        params->Get(in.key, (void**) &r);
++        if (r == nullptr || r->Resource.ImageViewInfo.Image == VK_NULL_HANDLE || in.layout < 0 ||
++            in.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
++            continue;
++        bool twice = false;
++        for (int k = 0; k < _inputCount; k++)
++            twice = twice || _inputs[k].image == r->Resource.ImageViewInfo.Image;
++        if (twice)
++            continue;
++        Input& i = _inputs[_inputCount++];
++        i.image = r->Resource.ImageViewInfo.Image;
++        i.range = RangeOf(r->Resource.ImageViewInfo);
++        i.layout = (VkImageLayout) in.layout;
++        LayoutBarrier(_cmd, i.image, i.range, i.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, kAnyAccess,
++                      VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
++    }
++
++    NVSDK_NGX_Resource_VK* out = nullptr;
++    params->Get(NVSDK_NGX_Parameter_Output, (void**) &out);
++    if (out != nullptr)
++    {
++        _output = out->Resource.ImageViewInfo.Image;
++        _outputRange = RangeOf(out->Resource.ImageViewInfo);
++    }
++}
++
++void VelaVkDefer::Scope::Commit()
++{
++    if (_slot < 0 || _committed)
++        return;
++    _committed = true;
++
++    const auto& l = Layouts();
++    std::scoped_lock lock(g_ringMx);
++    OwnCall own;
++    for (int k = 0; k < _inputCount; k++)
++        LayoutBarrier(_cmd, _inputs[k].image, _inputs[k].range, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                      _inputs[k].layout, VK_ACCESS_SHADER_READ_BIT, kAnyAccess, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++    if (_output != VK_NULL_HANDLE && l.output >= 0 && l.output != VK_IMAGE_LAYOUT_GENERAL)
++        LayoutBarrier(_cmd, _output, _outputRange, VK_IMAGE_LAYOUT_GENERAL, (VkImageLayout) l.output, kAnyAccess,
++                      kAnyAccess, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++
++    if (vkEndCommandBuffer(_cmd) != VK_SUCCESS)
++    {
++        g_ring.Cancel(_slot);
++        g_dropped++;
++        return;
++    }
++
++    // a new output image (first frame, a re-created feature, a new size): the game reads it in this frame before our
++    // first upscale lands, so it is cleared once, ahead of the game's buffers
++    bool clearFirst = false;
++    if (ClearFirst() && _output != VK_NULL_HANDLE && g_lastOutput[_handleId] != _output)
++    {
++        VkCommandBufferBeginInfo bi { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        VkCommandBuffer c = g_gpu.clearCmd[_slot];
++        if (vkBeginCommandBuffer(c, &bi) == VK_SUCCESS)
++        {
++            const VkImageLayout after = l.output >= 0 ? (VkImageLayout) l.output : VK_IMAGE_LAYOUT_GENERAL;
++            const VkClearColorValue black = { { 0.0f, 0.0f, 0.0f, 1.0f } };
++            LayoutBarrier(c, _output, _outputRange, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
++                          VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                          VK_PIPELINE_STAGE_TRANSFER_BIT);
++            vkCmdClearColorImage(c, _output, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &_outputRange);
++            LayoutBarrier(c, _output, _outputRange, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, after,
++                          VK_ACCESS_TRANSFER_WRITE_BIT, kAnyAccess, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++            clearFirst = vkEndCommandBuffer(c) == VK_SUCCESS;
++        }
++    }
++    g_lastOutput[_handleId] = _output;
++
++    const Job job { _slot, g_ring.At(_slot).seq };
++    g_gpu.readySince[_slot] = std::chrono::steady_clock::now();
++    g_ring.Commit(_slot, clearFirst && _viaHook);
++    g_deferred++;
++
++    if (_viaHook)
++    {
++        std::scoped_lock tl(g_trackMx);
++        g_tracker.Watch((Handle) _gameCmd, job);
++        g_watch.store(g_tracker.WatchCount(), std::memory_order_relaxed);
++    }
++    else if (clearFirst)
++    {
++        // no hook will run for this job: the clear goes now, before the game submits this frame
++        SubmitClear(g_gpu.fallbackQueue, _slot);
++    }
++}
++
++VelaVkDefer::Scope::~Scope()
++{
++    if (_slot < 0 || _committed)
++        return;
++    // the feature did not record a whole upscale (a backend change in progress, a failed Evaluate): the recording may
++    // name objects of a feature that is going away and is never submitted. The next begin resets the command buffer.
++    std::scoped_lock lock(g_ringMx);
++    OwnCall own;
++    vkEndCommandBuffer(_cmd);
++    g_ring.Cancel(_slot);
++}
++
++void VelaVkDefer::DropHandle(unsigned int handleId)
++{
++    if (Mode() == 0)
++        return;
++    std::scoped_lock lock(g_ringMx);
++    const int n = g_ring.DropHandle(handleId);
++    g_dropped += n;
++    g_lastOutput.erase(handleId);
++    if (n > 0)
++        LOG_INFO("Vela VK defer: handle {}: {} recorded upscale(s) dropped before the feature goes away", handleId, n);
++}
++
++void VelaVkDefer::Shutdown()
++{
++    if (Mode() == 0)
++        return;
++    std::scoped_lock lock(g_ringMx);
++    g_dropped += g_ring.DropHandle(0xFFFFFFFFu);
++    g_lastOutput.clear();
++    if (!g_gpu.ok)
++        return;
++
++    OwnCall own;
++    bool idle = true;
++    for (int i = 0; i < Ring::Size; i++)
++    {
++        if (g_ring.At(i).state != SlotState::InFlight)
++            continue;
++        if (vkWaitForFences(g_gpu.device, 1, &g_gpu.fence[i], VK_TRUE, 200000000ull) == VK_SUCCESS)
++            g_ring.Complete(i);
++        else
++            idle = false;
++    }
++    if (idle)
++    {
++        for (VkFence f : g_gpu.fence)
++            vkDestroyFence(g_gpu.device, f, nullptr);
++        vkDestroyCommandPool(g_gpu.device, g_gpu.pool, nullptr);
++    }
++    else
++    {
++        LOG_WARN("Vela VK defer: shutdown with deferred work still on the GPU; our pool and fences are left alone");
++    }
++    g_ring.Reset();
++    g_gpu = {};
++    LOG_INFO("Vela VK defer: shut down ({} deferred, {} by the submit hook, {} by the fallback, {} dropped)", g_deferred,
++             g_hookSubmits, g_fallbackSubmits, g_dropped);
++}
+diff --git a/OptiScaler/hooks/VelaVkDefer.h b/OptiScaler/hooks/VelaVkDefer.h
+new file mode 100644
+index 0000000..257ea47
+--- /dev/null
++++ b/OptiScaler/hooks/VelaVkDefer.h
+@@ -0,0 +1,110 @@
++#pragma once
++
++// Vela 0043 (vk-defer): the upscale of a native Vulkan game runs in OUR command buffer when NGX Evaluate is handed a
++// command buffer in which compute dispatches, blits and barriers are not valid: one inside a render pass instance
++// (Unity 2022.3 / NVUnityPlugin: a secondary begun with RENDER_PASS_CONTINUE, Haste Demo validation run k2lsp8:
++// VUID-vkCmdDispatch-renderpass, VUID-vkCmdBlitImage-renderpass, VUID-vkCmdPipelineBarrier-None-07889; Turnip drops
++// that work, the 3D scene stays blank).
++//
++// The whole upscale is recorded during Evaluate into a primary command buffer of our own and submitted on the game's
++// queue right after the game's vkQueueSubmit* that carries the command buffer Evaluate was called with (or the primary
++// that executes it): same queue = it runs after everything the game recorded for that frame. When the hooks do not see
++// the game's command buffers, the job is submitted at the start of the next Evaluate instead. The output is therefore
++// one frame late for what the game does with it in the same frame.
++//
++//   VELA_VK_DEFER          0 = off (the upscale goes into the game's command buffer, as before 0043)
++//                          1 = auto (default): defer when the command buffer is inside a render pass; when the hooks
++//                              never saw that command buffer begin: defer in a Unity game, do not defer elsewhere
++//                          2 = always defer
++//   VELA_VK_DEFER_LAYOUTS  c,d,m,o = the VkImageLayout numbers the game's colour, depth, motion vectors and output are
++//                          assumed to be in when our buffer runs (-1 = shader-readable already, no barrier); default
++//                          2,3,2,1 (kGameLayoutDefaults in VelaVkDefer.cpp, the one place)
++//   VELA_VK_DEFER_CLEAR    0 = do not clear a new output image before its first deferred frame (default 1)
++
++#include <pch.h>
++
++#include <vulkan/vulkan.hpp>
++
++struct NVSDK_NGX_Parameter;
++
++namespace VelaVkDefer
++{
++// NVSDK_NGX_VULKAN_Init*: from here on the hooks track the game's command buffers
++void Enable();
++
++// ---- hooks (hooks/VulkanwDx12_Hooks.cpp); cheap no-ops until Enable() and when VELA_VK_DEFER=0
++void OnCreatePool(VkCommandPool pool, uint32_t family);
++void OnDestroyPool(VkCommandPool pool);
++void OnResetPool(VkCommandPool pool);
++void OnAllocate(VkCommandPool pool, uint32_t count, const VkCommandBuffer* cbs, VkCommandBufferLevel level);
++void OnFree(uint32_t count, const VkCommandBuffer* cbs);
++void OnBegin(VkCommandBuffer cb, const VkCommandBufferBeginInfo* info);
++void OnReset(VkCommandBuffer cb);
++void OnPass(VkCommandBuffer cb, bool begin);
++void OnExecute(VkCommandBuffer cb, uint32_t count, const VkCommandBuffer* cbs);
++
++// One object at the top of each vkQueueSubmit* hook. Constructor (before the game's submit): takes the jobs that wait
++// for a command buffer of this submit and submits their one-time output clears. Destructor (after the game's submit
++// returned, same thread, where the game itself synchronises the queue): submits the jobs.
++class SubmitScope
++{
++  public:
++    SubmitScope(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* submits);
++    SubmitScope(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* submits);
++    ~SubmitScope();
++    SubmitScope(const SubmitScope&) = delete;
++    SubmitScope& operator=(const SubmitScope&) = delete;
++
++  private:
++    void Before();
++    VkQueue _queue = VK_NULL_HANDLE;
++    int _count = 0;
++    int _slot[4] {};
++    uint64_t _seq[4] {};
++};
++
++// ---- NVSDK_NGX_VULKAN_EvaluateFeature
++// Decides per call whether the upscale is deferred. Cmd() is the command buffer everything of this Evaluate records
++// into: the game's (not deferred) or ours. A scope that is not committed throws its recording away.
++class Scope
++{
++  public:
++    Scope(VkCommandBuffer gameCmd, VkDevice device, VkPhysicalDevice pd, unsigned int handleId);
++    ~Scope();
++    Scope(const Scope&) = delete;
++    Scope& operator=(const Scope&) = delete;
++
++    bool Deferred() const { return _slot >= 0; }
++    // deferring was decided but no command buffer of ours is free (4 jobs on the GPU): this Evaluate records nothing
++    bool Skipped() const { return _cmd == VK_NULL_HANDLE; }
++    VkCommandBuffer Cmd() const { return _cmd; }
++
++    // right before the feature records: the game's inputs go from their assumed layouts to shader-readable
++    void BeforeFeature(NVSDK_NGX_Parameter* params);
++    // right after the feature recorded successfully: inputs back, command buffer ended, job queued
++    void Commit();
++
++  private:
++    VkCommandBuffer _gameCmd = VK_NULL_HANDLE;
++    VkCommandBuffer _cmd = VK_NULL_HANDLE;
++    unsigned int _handleId = 0;
++    int _slot = -1;
++    bool _viaHook = false;
++    bool _committed = false;
++    struct Input
++    {
++        VkImage image = VK_NULL_HANDLE;
++        VkImageSubresourceRange range {};
++        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
++    };
++    Input _inputs[3] {};
++    int _inputCount = 0;
++    VkImage _output = VK_NULL_HANDLE;
++    VkImageSubresourceRange _outputRange {};
++};
++
++// the feature of this handle is about to be destroyed or re-created: its unsubmitted jobs are dropped
++void DropHandle(unsigned int handleId);
++// NVSDK_NGX_VULKAN_Shutdown: drops unsubmitted jobs, waits (bounded) for submitted ones, frees our objects
++void Shutdown();
++} // namespace VelaVkDefer
+diff --git a/OptiScaler/hooks/VulkanwDx12_Hooks.cpp b/OptiScaler/hooks/VulkanwDx12_Hooks.cpp
+index 6155088..594e375 100644
+--- a/OptiScaler/hooks/VulkanwDx12_Hooks.cpp
++++ b/OptiScaler/hooks/VulkanwDx12_Hooks.cpp
+@@ -1,6 +1,7 @@
+ #include <pch.h>
+ 
+ #include "VulkanwDx12_Hooks.h"
++#include "VelaVkDefer.h" // Vela 0043: deferred upscale (render pass / submit tracking)
+ 
+ #include <State.h>
+ #include <Config.h>
+@@ -1276,6 +1277,7 @@ void Vulkan_wDx12::hk_vkCmdPushConstants(VkCommandBuffer commandBuffer, VkPipeli
+ void Vulkan_wDx12::hk_vkCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin,
+                                            VkSubpassContents contents)
+ {
++    VelaVkDefer::OnPass(commandBuffer, true); // Vela 0043
+     VkCommandBuffer cmdBuffer = commandBuffer;
+     auto mappedVirtualCmdBuffer = GetVirtualCommandBuffer(commandBuffer);
+ 
+@@ -1320,6 +1322,7 @@ void Vulkan_wDx12::hk_vkCmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassC
+ 
+ void Vulkan_wDx12::hk_vkCmdEndRenderPass(VkCommandBuffer commandBuffer)
+ {
++    VelaVkDefer::OnPass(commandBuffer, false); // Vela 0043
+     VkCommandBuffer cmdBuffer = commandBuffer;
+     auto mappedVirtualCmdBuffer = GetVirtualCommandBuffer(commandBuffer);
+ 
+@@ -1432,6 +1435,7 @@ void Vulkan_wDx12::hk_vkCmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+                                             const VkRenderPassBeginInfo* pRenderPassBegin,
+                                             const VkSubpassBeginInfo* pSubpassBeginInfo)
+ {
++    VelaVkDefer::OnPass(commandBuffer, true); // Vela 0043
+     VkCommandBuffer cmdBuffer = commandBuffer;
+ 
+     auto mappedVirtualCmdBuffer = GetVirtualCommandBuffer(cmdBuffer);
+@@ -1473,6 +1477,7 @@ void Vulkan_wDx12::hk_vkCmdNextSubpass2(VkCommandBuffer commandBuffer, const VkS
+ 
+ void Vulkan_wDx12::hk_vkCmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo)
+ {
++    VelaVkDefer::OnPass(commandBuffer, false); // Vela 0043
+     VkCommandBuffer cmdBuffer = commandBuffer;
+ 
+     auto mappedVirtualCmdBuffer = GetVirtualCommandBuffer(cmdBuffer);
+@@ -1718,6 +1723,7 @@ void Vulkan_wDx12::hk_vkCmdResolveImage2(VkCommandBuffer commandBuffer, const Vk
+ 
+ void Vulkan_wDx12::hk_vkCmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo* pRenderingInfo)
+ {
++    VelaVkDefer::OnPass(commandBuffer, true); // Vela 0043
+     VkCommandBuffer cmdBuffer = commandBuffer;
+ 
+     auto mappedVirtualCmdBuffer = GetVirtualCommandBuffer(cmdBuffer);
+@@ -1738,6 +1744,7 @@ void Vulkan_wDx12::hk_vkCmdBeginRendering(VkCommandBuffer commandBuffer, const V
+ 
+ void Vulkan_wDx12::hk_vkCmdEndRendering(VkCommandBuffer commandBuffer)
+ {
++    VelaVkDefer::OnPass(commandBuffer, false); // Vela 0043
+     VkCommandBuffer cmdBuffer = commandBuffer;
+ 
+     auto mappedVirtualCmdBuffer = GetVirtualCommandBuffer(cmdBuffer);
+@@ -2394,6 +2401,7 @@ void Vulkan_wDx12::hk_vkCmdDecodeVideoKHR(VkCommandBuffer commandBuffer, const V
+ 
+ void Vulkan_wDx12::hk_vkCmdBeginRenderingKHR(VkCommandBuffer commandBuffer, const VkRenderingInfo* pRenderingInfo)
+ {
++    VelaVkDefer::OnPass(commandBuffer, true); // Vela 0043
+     VkCommandBuffer cmdBuffer = commandBuffer;
+ 
+     auto mappedVirtualCmdBuffer = GetVirtualCommandBuffer(cmdBuffer);
+@@ -2414,6 +2422,7 @@ void Vulkan_wDx12::hk_vkCmdBeginRenderingKHR(VkCommandBuffer commandBuffer, cons
+ 
+ void Vulkan_wDx12::hk_vkCmdEndRenderingKHR(VkCommandBuffer commandBuffer)
+ {
++    VelaVkDefer::OnPass(commandBuffer, false); // Vela 0043
+     VkCommandBuffer cmdBuffer = commandBuffer;
+ 
+     auto mappedVirtualCmdBuffer = GetVirtualCommandBuffer(cmdBuffer);
+@@ -2522,6 +2531,7 @@ void Vulkan_wDx12::hk_vkCmdBeginRenderPass2KHR(VkCommandBuffer commandBuffer,
+                                                const VkRenderPassBeginInfo* pRenderPassBegin,
+                                                const VkSubpassBeginInfo* pSubpassBeginInfo)
+ {
++    VelaVkDefer::OnPass(commandBuffer, true); // Vela 0043
+     VkCommandBuffer cmdBuffer = commandBuffer;
+ 
+     auto mappedVirtualCmdBuffer = GetVirtualCommandBuffer(cmdBuffer);
+@@ -2563,6 +2573,7 @@ void Vulkan_wDx12::hk_vkCmdNextSubpass2KHR(VkCommandBuffer commandBuffer, const
+ 
+ void Vulkan_wDx12::hk_vkCmdEndRenderPass2KHR(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo)
+ {
++    VelaVkDefer::OnPass(commandBuffer, false); // Vela 0043
+     VkCommandBuffer cmdBuffer = commandBuffer;
+ 
+     auto mappedVirtualCmdBuffer = GetVirtualCommandBuffer(cmdBuffer);
+@@ -6057,6 +6068,7 @@ VkResult Vulkan_wDx12::hk_vkCreateCommandPool(VkDevice device, const VkCommandPo
+             std::scoped_lock lock(mutexCommandPoolToQueueFamilyMap);
+             commandPoolToQueueFamilyMap[*pCommandPool] = pCreateInfo->queueFamilyIndex;
+         }
++        VelaVkDefer::OnCreatePool(*pCommandPool, pCreateInfo->queueFamilyIndex); // Vela 0043
+ 
+         LOG_DEBUG("Command pool {:X} created for queue family {}", (size_t) *pCommandPool,
+                   pCreateInfo->queueFamilyIndex);
+@@ -6068,6 +6080,7 @@ VkResult Vulkan_wDx12::hk_vkCreateCommandPool(VkDevice device, const VkCommandPo
+ void Vulkan_wDx12::hk_vkCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCount,
+                                            const VkCommandBuffer* pCommandBuffers)
+ {
++    VelaVkDefer::OnExecute(commandBuffer, commandBufferCount, pCommandBuffers); // Vela 0043
+ #ifdef LOG_ALL_RECORDS
+     LOG_DEBUG("commandBuffer: {:X}, commandBufferCount: {}, pCommandBuffers: {:X}", (size_t) commandBuffer,
+               commandBufferCount, (size_t) pCommandBuffers);
+@@ -6191,6 +6204,7 @@ static const VkTimelineSemaphoreSubmitInfo* FindTimelineSubmitInfo(const void* p
+ VkResult Vulkan_wDx12::hk_vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
+                                         VkFence fence)
+ {
++    VelaVkDefer::SubmitScope velaDefer(queue, submitCount, pSubmits); // Vela 0043
+     if (pSubmits == nullptr || o_vkQueueSubmit == nullptr)
+     {
+         LOG_ERROR("Invalid parameters to hk_vkQueueSubmit");
+@@ -6465,6 +6479,7 @@ static VkResult Submit2WithDx12Interop(SubmitFn originalSubmit, VkQueue queue, u
+ VkResult Vulkan_wDx12::hk_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
+                                          VkFence fence)
+ {
++    VelaVkDefer::SubmitScope velaDefer(queue, submitCount, pSubmits); // Vela 0043
+     if (pSubmits == nullptr || o_vkQueueSubmit2 == nullptr)
+     {
+         LOG_ERROR("Invalid parameters to hk_vkQueueSubmit2");
+@@ -6506,6 +6521,7 @@ VkResult Vulkan_wDx12::hk_vkQueueSubmit2(VkQueue queue, uint32_t submitCount, co
+ VkResult Vulkan_wDx12::hk_vkQueueSubmit2KHR(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits,
+                                             VkFence fence)
+ {
++    VelaVkDefer::SubmitScope velaDefer(queue, submitCount, pSubmits); // Vela 0043
+     if (pSubmits == nullptr || o_vkQueueSubmit2KHR == nullptr)
+     {
+         LOG_ERROR("Invalid parameters to hk_vkQueueSubmit2KHR");
+@@ -6547,6 +6563,7 @@ VkResult Vulkan_wDx12::hk_vkQueueSubmit2KHR(VkQueue queue, uint32_t submitCount,
+ VkResult Vulkan_wDx12::hk_vkBeginCommandBuffer(VkCommandBuffer commandBuffer,
+                                                const VkCommandBufferBeginInfo* pBeginInfo)
+ {
++    VelaVkDefer::OnBegin(commandBuffer, pBeginInfo); // Vela 0043
+     if (GetVirtualCommandBuffer(commandBuffer) == VK_NULL_HANDLE)
+         cmdBufferStateTracker.OnBegin(commandBuffer, pBeginInfo);
+ 
+@@ -6580,6 +6597,7 @@ VkResult Vulkan_wDx12::hk_vkEndCommandBuffer(VkCommandBuffer commandBuffer)
+ 
+ VkResult Vulkan_wDx12::hk_vkResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags)
+ {
++    VelaVkDefer::OnReset(commandBuffer); // Vela 0043
+ #ifdef LOG_ALL_RECORDS
+     LOG_DEBUG("commandBuffer: {:X}", (size_t) commandBuffer);
+ #endif
+@@ -6593,6 +6611,7 @@ VkResult Vulkan_wDx12::hk_vkResetCommandBuffer(VkCommandBuffer commandBuffer, Vk
+ void Vulkan_wDx12::hk_vkFreeCommandBuffers(VkDevice device, VkCommandPool commandPool, uint32_t commandBufferCount,
+                                            const VkCommandBuffer* pCommandBuffers)
+ {
++    VelaVkDefer::OnFree(commandBufferCount, pCommandBuffers); // Vela 0043
+ #ifdef LOG_ALL_RECORDS
+     LOG_DEBUG("device: {:X}, commandPool: {:X}, commandBufferCount: {}", (size_t) device, (size_t) commandPool,
+               commandBufferCount);
+@@ -6616,6 +6635,8 @@ VkResult Vulkan_wDx12::hk_vkAllocateCommandBuffers(VkDevice device, const VkComm
+ 
+     if (result == VK_SUCCESS && pAllocateInfo != nullptr && pCommandBuffers != nullptr)
+     {
++        VelaVkDefer::OnAllocate(pAllocateInfo->commandPool, pAllocateInfo->commandBufferCount, pCommandBuffers,
++                                pAllocateInfo->level); // Vela 0043
+         std::optional<uint32_t> queueFamily;
+ 
+         {
+@@ -6643,6 +6664,7 @@ VkResult Vulkan_wDx12::hk_vkAllocateCommandBuffers(VkDevice device, const VkComm
+ void Vulkan_wDx12::hk_vkDestroyCommandPool(VkDevice device, VkCommandPool commandPool,
+                                            const VkAllocationCallbacks* pAllocator)
+ {
++    VelaVkDefer::OnDestroyPool(commandPool); // Vela 0043
+ #ifdef LOG_ALL_RECORDS
+     LOG_DEBUG("device: {:X}, commandPool: {:X}", (size_t) device, (size_t) commandPool);
+ #endif
+@@ -6660,6 +6682,7 @@ void Vulkan_wDx12::hk_vkDestroyCommandPool(VkDevice device, VkCommandPool comman
+ 
+ VkResult Vulkan_wDx12::hk_vkResetCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolResetFlags flags)
+ {
++    VelaVkDefer::OnResetPool(commandPool); // Vela 0043
+ #ifdef LOG_ALL_RECORDS
+     LOG_DEBUG("device: {:X}, commandPool: {:X}, flags: {:X}", (size_t) device, (size_t) commandPool, (uint32_t) flags);
+ #endif
+-- 
+2.54.0.windows.1
+
