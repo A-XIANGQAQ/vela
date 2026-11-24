@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.8.26 — 2026-11-24
+
+Games started from launchers: Heroic, Xodus Nexus and other non-Steam shortcuts. Contributed by indiesaudi (#3, #4, #5), tested on an Odin 2 mini by iloveswiming909.
+
+New
+- **Launcher games (#3).** Vela now finds the game behind a non-Steam shortcut made by a launcher: through the launcher's own config (Heroic, Lutris) or, when there is none (Xodus Nexus, store clients inside a Proton prefix), from the running game itself. The game gets its own Vela setup like a Steam game.
+- **Live settings in launcher games (#4).** Model changes in the Vela panel now reach games whose launcher hides the Steam id, including Heroic games started through umu.
+- **DirectX 12 for Unreal launcher games (#5).** For an Unreal game started from a launcher, Vela turns on DirectX 12 through the game's Engine.ini while Vela is on, and puts the file back byte for byte when it is off.
+
+Checked on our Retroid Pocket 6: a Haste Demo shortcut made by Heroic 2.22.4 (found through Heroic's config, live model changes reached the game), and Steam games unchanged:
+
+| game | model | 0.8.25 | 0.8.26 |
+|---|---|---|---|
+| Deep Rock Galactic 1920x1080 | FSR 4 | 66.9 | 77.7 (cool start) |
+| Deep Rock Galactic 1920x1080 | SGSR 2 | 99.5 | 103.1 (cool start) |
+| Manor Lords 1280x720 | FSR 4 | 59.6 | 59.4 |
+| Manor Lords 1280x720 | SGSR 2 | 59.8 | 59.7 |
+
+The 0.8.26 Deep Rock Galactic run started on a cool device, so it is higher than a warm run; the launcher change does not touch the upscaler.
+
+Known issues
+- DirectX 12 through Engine.ini (#5) is covered by tests only; we have no Unreal game from a launcher on our device. Please report how it goes.
+- Native Vulkan games on Unity: Vela can draw through their DLSS path, but Unity only offers DLSS on NVIDIA GPUs, so players can't reach it yet.
+- FSR 3 and DittoSR in native Vulkan games don't start on our device; Vela uses SGSR 2 there. FSR 4 is not offered in native Vulkan games yet.
+- On some Retroid Pocket 6 units the NPU gives wrong results even with the smaller graphs (#2); there the NPU stays off and FSR 4 runs on the GPU.
+- Scenes without a depth buffer still use FSR 1.
+- FSR 4 Fast: black rectangles in some games on 8 Elite. We don't see them on 8 Gen 2.
+
 ## 0.8.25 — 2026-11-24
 
 Faster NPU graphs, a fix for units whose NPU gives wrong FSR 4 output, and a fix for SGSR 2 colours.
