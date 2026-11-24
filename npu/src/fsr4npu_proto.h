@@ -52,6 +52,10 @@ enum { F_PINGPONG = 16u };
  * 0 = not granted). Kick bit 33 (FSR4NPU_KICK_OUT1) or RUN F_PINGPONG + v[0] bit 1 writes the outputs to slot 1. Old daemons: v[5] = 0. */
 enum { F_PINGPONG_OUT = 32u };
 #define FSR4NPU_KICK_OUT1 ((1ull << 33) | 1ull)
+/* ANF graph family (context with graphs <name>_p0.._pN): the jitter phase picks the graph. Kick value bits 40..47, or RUN F_PHASE + v[1] = phase.
+ * Phase >= graph count runs phase 0 (counted). A graph that is alone in its context ignores it. */
+enum { F_PHASE = 64u };
+#define FSR4NPU_KICK_PHASE(p) (((uint64_t)((p) & 0xff) << 40) | 1ull)
 #define FSR4NPU_KICK_IN1 ((1ull << 32) | 1ull)
 enum fsr4npu_status {
   S_OK = 0, E_PROTO = -1, E_SIZE = -2, E_FD = -3, E_STATE = -4, E_EXEC = -5, E_BUSY = -6, E_FENCE = -7,

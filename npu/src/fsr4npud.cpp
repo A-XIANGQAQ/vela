@@ -307,8 +307,11 @@ struct Graph {
   uint32_t nt = 0; uint64_t bytes[FSR4NPU_MAXT] = {}; int stubDelayUs = -1; int pins = 0;   // pins: connected clients
   // valid while LOADED; the loader thread owns them during LOADING and UNLOADING
   Qnn_GraphHandle_t G = nullptr; Qnn_ContextHandle_t CTX = nullptr; QnnSystemContext_Handle_t sc = nullptr; vector<uint8_t> bin; Qnn_Tensor_t T[FSR4NPU_MAXT];
+  // ANF graph family (one context holding graphs <name>_p0 .. _p<ng-1>): ng > 1; the phase of a frame picks GP[phase] / TP[phase]. ng == 1: unused.
+  int ng = 1; Qnn_GraphHandle_t GP[64] = {}; Qnn_Tensor_t TP[64][2];
 };
 static vector<Graph*> graphs; static bool isQnn = false;
+static bool optLoadConc = false;   // experiment: contexts load without gQnnMu
 
 // ---------------- QNN state
 // The QNN documents do not say that QnnContext_createFromBinary or QnnContext_free may run beside QnnGraph_execute (only QnnBackend_create is called
@@ -342,7 +345,7 @@ static bool qnnOpen() {   // backend, device, power id, rpcmem: the fastrpc sess
   return rAlloc && rToFd;
 }
 // What a graph file says, with no context and no DSP. sc stays alive with T[]: their dimensions point into it.
-struct Parsed { vector<uint8_t> bin; QnnSystemContext_Handle_t sc = nullptr; Qnn_Tensor_t T[FSR4NPU_MAXT]; uint32_t nt = 0; uint64_t bytes[FSR4NPU_MAXT] = {}; string name; int stubDelayUs = -1, stubLoadMs = 0; };
+struct Parsed { int ng = 1; string names[64]; Qnn_Tensor_t TP[64][2]; vector<uint8_t> bin; QnnSystemContext_Handle_t sc = nullptr; Qnn_Tensor_t T[FSR4NPU_MAXT]; uint32_t nt = 0; uint64_t bytes[FSR4NPU_MAXT] = {}; string name; int stubDelayUs = -1, stubLoadMs = 0; };
 static bool parseStub(const Graph* g, Parsed& o) {
   unsigned long long b = optStubBytes; int nout = optStubNout; o.stubLoadMs = optStubLoadMs; o.name = g->name;
   if (!g->path.empty()) { FILE* f = fopen(g->path.c_str(), "r"); if (!f) { logf("FAIL cannot open graph file %s", g->path.c_str()); return false; }
@@ -366,6 +369,21 @@ static bool parseGraph(const Graph* g, Parsed& o) {
   if (nOut == 2) { int iu = strcmp(gout[0].v1.name, "p3u_o") == 0 ? 0 : 1; o.T[1] = gout[iu]; o.T[2] = gout[1 - iu]; }   // with two outputs, the one named p3u_o goes first
   else for (uint32_t k = 0; k < nOut; k++) o.T[1 + k] = gout[k];
   o.nt = 1 + nOut; o.name = gname; for (uint32_t k = 0; k < o.nt; k++) o.bytes[k] = tensorBytes(o.T[k]);
+  // ANF family: more than one graph in the context, each named <family>_p<phase> with 1 input and 1 output of the same sizes
+  const uint32_t ngr = bi->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1 ? bi->contextBinaryInfoV1.numGraphs : bi->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2 ? bi->contextBinaryInfoV2.numGraphs : bi->contextBinaryInfoV3.numGraphs;
+  if (ngr > 1) {
+    if (ngr > 64 || nOut != 1) { logf("FAIL context has %u graphs (a family needs 2..64 graphs with 1 output)", ngr); return false; }
+    for (uint32_t k = 0; k < ngr; k++) {
+      const QnnSystemContext_GraphInfo_t* gk = gi + k; const char* nm; const Qnn_Tensor_t *ki, *ko; uint32_t no;
+      if (gk->version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1) { nm = gk->graphInfoV1.graphName; ki = gk->graphInfoV1.graphInputs; ko = gk->graphInfoV1.graphOutputs; no = gk->graphInfoV1.numGraphOutputs; }
+      else if (gk->version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_2) { nm = gk->graphInfoV2.graphName; ki = gk->graphInfoV2.graphInputs; ko = gk->graphInfoV2.graphOutputs; no = gk->graphInfoV2.numGraphOutputs; }
+      else { nm = gk->graphInfoV3.graphName; ki = gk->graphInfoV3.graphInputs; ko = gk->graphInfoV3.graphOutputs; no = gk->graphInfoV3.numGraphOutputs; }
+      const char* us = strrchr(nm, '_'); int pk = (us && us[1] == 'p' && isdigit((unsigned char)us[2])) ? atoi(us + 2) : -1;
+      if (pk < 0 || pk >= (int)ngr || !o.names[pk].empty() || no != 1 || tensorBytes(ki[0]) != o.bytes[0] || tensorBytes(ko[0]) != o.bytes[1]) { logf("FAIL graph %s is not a phase of a family of %u (name _p<k>, k < count, 1 output, same sizes)", nm, ngr); return false; }
+      o.names[pk] = nm; o.TP[pk][0] = ki[0]; o.TP[pk][1] = ko[0];
+    }
+    o.ng = (int)ngr; o.name = o.names[0]; o.T[0] = o.TP[0][0]; o.T[1] = o.TP[0][1];
+  }
   return true;
 }
 static void parsedFree(Parsed& o) { if (o.sc) S.systemContextFree(o.sc); o.sc = nullptr; vector<uint8_t>().swap(o.bin); }
@@ -760,7 +778,8 @@ static void dtHashOut(Client* c, uint64_t* h) { const uint8_t* b = (const uint8_
 // buffer after cleanFd, so civac never writes back data.
 static int gStInv = -1, gStDiag = 0; static vector<uint8_t> gStA;
 static void civac(const uint8_t* p, uint64_t n) { for (uintptr_t x = (uintptr_t)p & ~63ul, e = (uintptr_t)p + n; x < e; x += 64) asm volatile("dc civac, %0" ::"r"(x) : "memory"); asm volatile("dsb sy" ::: "memory"); }
-static int execute(Client* c, double* exMs, int slot = 0) {
+static long gPhaseBad = 0;
+static int execute(Client* c, double* exMs, int slot = 0, int phase = 0) {
   const Qnn_Tensor_t* qin = ((slot & 1) && c->alt) ? &c->qtAlt : &c->qt[0];   // ping-pong input (slot bit 0)
   const bool o1 = (slot & 2) && c->altOut; Qnn_Tensor_t* qout = o1 ? &c->qtOut1[1] : &c->qt[1];   // ping-pong output (slot bit 1)
   if (dtHash < 0) { dtHash = getenv("FSR4NPUD_HASH_OUTPUT") ? atoi(getenv("FSR4NPUD_HASH_OUTPUT")) : 0; dtRerun = getenv("FSR4NPUD_RERUN") ? atoi(getenv("FSR4NPUD_RERUN")) : 0;
@@ -777,7 +796,11 @@ static int execute(Client* c, double* exMs, int slot = 0) {
   std::unique_lock<std::mutex> ql(gQnnMu, std::defer_lock); if (isQnn) ql.lock();   // before the clock: the timeouts count the execute, not a load beside it
   double t0 = now_ms(); int st = S_OK;
   uint64_t myId = ++gExecId; gExecSock = c->sock; gExecDone = c->done; gExecStart = t0;
-  if (isQnn) { Qnn_ErrorHandle_t e = Q.graphExecute(c->g->G, qin, 1, qout, c->nt - 1, nullptr, nullptr); if (e != QNN_SUCCESS) { logf("client %d graphExecute rc 0x%lx", c->id, (unsigned long)e); st = E_EXEC; }
+  if (isQnn) { Qnn_GraphHandle_t GH = c->g->G; Qnn_Tensor_t pin, pout;
+    if (c->g->ng > 1) {   // ANF family: the graph and the tensor ids of this frame's jitter phase
+      if (phase < 0 || phase >= c->g->ng) { if (gPhaseBad++ % 100 == 0) logf("client %d phase %d >= %d graphs: phase 0 (%ld so far)", c->id, phase, c->g->ng, gPhaseBad); phase = 0; }
+      GH = c->g->GP[phase]; pin = *qin; pin.v1.id = c->g->TP[phase][0].v1.id; pin.v1.name = c->g->TP[phase][0].v1.name; pout = *qout; pout.v1.id = c->g->TP[phase][1].v1.id; pout.v1.name = c->g->TP[phase][1].v1.name; qin = &pin; qout = &pout; }
+    Qnn_ErrorHandle_t e = Q.graphExecute(GH, qin, 1, qout, c->nt - 1, nullptr, nullptr); if (e != QNN_SUCCESS) { logf("client %d graphExecute rc 0x%lx", c->id, (unsigned long)e); st = E_EXEC; }
     if (dtSync & 2) for (int i = 0; i < c->nfd; i++) { dsync(c->fds[i], DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW); dsync(c->fds[i], DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW); }
     if (dh) { dtHashOut(c, hB);
       { uint64_t h1[FSR4NPU_MAXT], h5[FSR4NPU_MAXT]; usleep(1000); dtHashOut(c, h1); usleep(4000); dtHashOut(c, h5);
@@ -810,12 +833,13 @@ static int execute(Client* c, double* exMs, int slot = 0) {
 static void onRun(Client* c, const fsr4npu_msg& m, int* fds, int nfd, double tRecv) {
   fsr4npu_msg r; msgInit(r, M_DONE); r.seq = m.seq; double fenceMs = 0;
   if (!c->ready) { for (int i = 0; i < nfd; i++) close(fds[i]); sendErr(c, E_STATE, m.seq, "RUN before SETUP/ALLOC"); return; }
+  if (!c->registered && c->g->ng > 1) { for (int i = 0; i < nfd; i++) close(fds[i]); sendErr(c, E_BUSY, m.seq, "family still loading"); return; }
   if ((m.flags & F_SYNCFD) && nfd >= 1) {
     double f0 = now_ms(); pollfd p{fds[0], POLLIN, 0}; int pr = poll(&p, 1, 1000); fenceMs = now_ms() - f0;
     for (int i = 0; i < nfd; i++) close(fds[i]);
     if (pr != 1) { sendErr(c, E_FENCE, m.seq, pr == 0 ? "sync_file not signalled within 1000 ms" : "sync_file poll error"); return; }
   } else for (int i = 0; i < nfd; i++) close(fds[i]);
-  gExecSeq = m.seq; double ex = 0; int st = execute(c, &ex, (m.flags & F_PINGPONG) ? int(m.v[0] & 3) : 0); if (c->timedOut) { dropClient(c, "execute exceeded the soft timeout (client was told E_TIMEOUT)"); return; }
+  gExecSeq = m.seq; double ex = 0; int st = execute(c, &ex, (m.flags & F_PINGPONG) ? int(m.v[0] & 3) : 0, (m.flags & F_PHASE) ? int(m.v[1] & 0xff) : 0); if (c->timedOut) { dropClient(c, "execute exceeded the soft timeout (client was told E_TIMEOUT)"); return; }
   r.status = st; r.v[0] = (uint64_t)(ex * 1e6); r.v[1] = (uint64_t)(fenceMs * 1e6);
   if (!isQnn && st == S_OK && (m.flags & F_VERIFY)) { r.v[2] = fnv64((const uint8_t*)c->map[c->t[0].fd_idx] + c->t[0].off, c->g->bytes[0]); r.v[3] = fnv64((const uint8_t*)c->map[c->t[1].fd_idx] + c->t[1].off, c->g->bytes[1]); }
   if (st) c->errors++; else { c->frames++; c->vExec.push_back(ex); c->vFence.push_back(fenceMs); }
@@ -888,7 +912,8 @@ static void handleMsg(Client* c) {
 static void onKick(Client* c) {
   uint64_t v; if (read(c->kick, &v, 8) != 8) return; double tRecv = now_ms();
   uint64_t out; if (!c->ready) out = 2 + (uint64_t)(-E_STATE);
-  else { double ex = 0; int st = execute(c, &ex, int((v >> 32) & 3)); if (c->timedOut) { dropClient(c, "execute exceeded the soft timeout (client was told E_TIMEOUT)"); return; }
+  else if (!c->registered) out = 2 + (uint64_t)(-E_BUSY);   // only reached by a family (ng > 1): not ready, the client runs its fallback
+  else { double ex = 0; int st = execute(c, &ex, int((v >> 32) & 3), int((v >> 40) & 0xff)); if (c->timedOut) { dropClient(c, "execute exceeded the soft timeout (client was told E_TIMEOUT)"); return; }
     out = st ? 2 + (uint64_t)(-st) : 1; if (st) c->errors++; else { c->frames++; c->vExec.push_back(ex); } }
   c->vSvc.push_back(now_ms() - tRecv); if (c->ready && out == 1) winAdd(c->vExec.back(), c->vSvc.back());
   if (write(c->done, &out, 8) != 8) logf("client %d done eventfd write failed", c->id);
@@ -898,18 +923,22 @@ static void onKick(Client* c) {
 // ---------------- loader thread: file reads and context create/free, never on the frame path. The main thread owns the graph states; a job and its result pass through a locked queue.
 enum JobType { J_INFO, J_LOAD, J_UNLOAD };
 struct Job { JobType type; Graph* g; };
-struct Result { JobType type = J_INFO; Graph* g = nullptr; bool ok = false, ctxFail = false; double ms = 0; Parsed p; Qnn_ContextHandle_t ctx = nullptr; Qnn_GraphHandle_t gh = nullptr; };
+struct Result { Qnn_GraphHandle_t gp[64] = {}; JobType type = J_INFO; Graph* g = nullptr; bool ok = false, ctxFail = false; double ms = 0; Parsed p; Qnn_ContextHandle_t ctx = nullptr; Qnn_GraphHandle_t gh = nullptr; };
 static std::mutex gJobMu; static std::condition_variable gJobCv; static deque<Job> gJobs; static deque<Result*> gResults; static bool gJobQuit = false; static int gWakeFd = -1;
 static std::atomic<double> gLoadStart{0};
 static void post(JobType t, Graph* g) { std::lock_guard<std::mutex> l(gJobMu); gJobs.push_back({t, g}); gJobCv.notify_one(); }
 static bool contextLoad(Result* r) {
   Graph* g = r->g; if (!parseGraph(g, r->p)) return false;
   if (!isQnn) { if (r->p.stubLoadMs > 0) usleep(r->p.stubLoadMs * 1000); return true; }
-  std::lock_guard<std::mutex> ql(gQnnMu); gLoadStart = now_ms();   // the hung-load clock starts with the call into the DSP
+  std::unique_lock<std::mutex> ql(gQnnMu, std::defer_lock); if (!optLoadConc) ql.lock(); gLoadStart = now_ms();   // the hung-load clock starts with the call into the DSP
   Qnn_ErrorHandle_t e = Q.contextCreateFromBinary(BE, DV, nullptr, r->p.bin.data(), r->p.bin.size(), &r->ctx, nullptr);
   if (e != QNN_SUCCESS) { logf("graph %s: contextCreateFromBinary rc 0x%lx", g->sock.c_str(), (unsigned long)e); gLoadStart = 0; r->ctx = nullptr; r->ctxFail = true; return false; }
   e = Q.graphRetrieve(r->ctx, r->p.name.c_str(), &r->gh);
   if (e != QNN_SUCCESS) { logf("graph %s: graphRetrieve rc 0x%lx", g->sock.c_str(), (unsigned long)e); Q.contextFree(r->ctx, nullptr); r->ctx = nullptr; gLoadStart = 0; return false; }
+  for (int k = 1; r->p.ng > 1 && k < r->p.ng; k++) {   // ANF family: every phase graph of the context by name
+    e = Q.graphRetrieve(r->ctx, r->p.names[k].c_str(), &r->gp[k]);
+    if (e != QNN_SUCCESS) { logf("graph %s: graphRetrieve %s rc 0x%lx", g->sock.c_str(), r->p.names[k].c_str(), (unsigned long)e); Q.contextFree(r->ctx, nullptr); r->ctx = nullptr; gLoadStart = 0; return false; } }
+  r->gp[0] = r->gh;
   gLoadStart = 0; return true; }
 static void loaderMain() {
   for (;;) { Job j; { std::unique_lock<std::mutex> l(gJobMu); gJobCv.wait(l, [] { return gJobQuit || !gJobs.empty(); }); if (gJobQuit) return; j = gJobs.front(); gJobs.pop_front(); }
@@ -924,19 +953,21 @@ static string loadedList() { string s; for (Graph* g : graphs) if (g->st == Grap
 static string optGraphSet = "auto", gSetTxt = "released (no self-check)";
 static void statusLine() { string st = "STATUS=serving " + to_string(graphs.size()) + " socket(s), alloc " + (isQnn ? gAllocName : string(gMemfd ? "memfd" : "vk")) + ", graphs: " + gSetTxt + ", loaded: " + loadedList(); sdNotify(st.c_str()); }
 static int loadedCount() { int n = 0; for (Graph* g : graphs) if (g->st == Graph::LOADED || g->st == Graph::LOADING) n++; return n; }
+static int optMaxGraphs = 0;   // 0 = off; the DSP session runs only about 52 graphs in total (measured), an ANF family counts its phase graphs
+static int loadedGraphs() { int n = 0; for (Graph* g : graphs) if (g->st == Graph::LOADED || g->st == Graph::LOADING) n += g->ng > 0 ? g->ng : 1; return n; }
 static Graph* lruIdle() { Graph* b = nullptr; for (Graph* g : graphs) if (g->st == Graph::LOADED && g->pins == 0 && !g->keep && (!b || g->lastUse < b->lastUse)) b = g; return b; }
 static void startUnload(Graph* g, const char* why) { logf("graph %s: unloading (%s)", g->sock.c_str(), why); g->st = Graph::UNLOADING; post(J_UNLOAD, g); }
 static void startLoad(Graph* g) {
-  while (loadedCount() + 1 > optMaxLoaded) { Graph* v = lruIdle(); if (!v) { logf("graph %s: every loaded graph has a client, going over --max-loaded %d", g->sock.c_str(), optMaxLoaded); break; } startUnload(v, "least recently used"); }
+  while (loadedCount() + 1 > optMaxLoaded || (optMaxGraphs > 0 && loadedGraphs() + (g->infoReady && g->ng > 0 ? g->ng : 1) > optMaxGraphs)) { Graph* v = lruIdle(); if (!v) { logf("graph %s: every loaded graph has a client, going over --max-loaded %d", g->sock.c_str(), optMaxLoaded); break; } startUnload(v, "least recently used"); }
   g->st = Graph::LOADING; post(J_LOAD, g); }
-static void trimLoaded() { while (loadedCount() > optMaxLoaded) { Graph* v = lruIdle(); if (!v) break; startUnload(v, "least recently used"); } }
+static void trimLoaded() { while (loadedCount() > optMaxLoaded || (optMaxGraphs > 0 && loadedGraphs() > optMaxGraphs)) { Graph* v = lruIdle(); if (!v) break; startUnload(v, "least recently used"); } }
 static void graphWanted(Graph* g) {   // a client connected
   g->lastUse = now_ms();
   if (g->st == Graph::IDLE) startLoad(g);
   else if (g->st == Graph::UNLOADING) g->reload = true;
   else if (g->st == Graph::FAILED && now_ms() >= g->retryAt) startLoad(g); }
-static void infoApply(Graph* g, const Parsed& p) { g->nt = p.nt; memcpy(g->bytes, p.bytes, sizeof g->bytes); g->name = p.name; g->stubDelayUs = p.stubDelayUs; g->infoReady = true; }
-static void loadedApply(Graph* g, Result* r) { infoApply(g, r->p); g->CTX = r->ctx; g->G = r->gh; g->sc = r->p.sc; r->p.sc = nullptr; g->bin.swap(r->p.bin); memcpy(g->T, r->p.T, sizeof g->T); g->st = Graph::LOADED; g->evictRetried = false; g->lastUse = now_ms(); }
+static void infoApply(Graph* g, const Parsed& p) { g->ng = p.ng; g->nt = p.nt; memcpy(g->bytes, p.bytes, sizeof g->bytes); g->name = p.name; g->stubDelayUs = p.stubDelayUs; g->infoReady = true; }
+static void loadedApply(Graph* g, Result* r) { g->ng = r->p.ng; if (g->ng > 1) { for (int k = 0; k < 64; k++) g->GP[k] = r->gp[k]; memcpy(g->TP, r->p.TP, sizeof g->TP); logf("graph %s: ANF family of %d phase graphs in one context", g->sock.c_str(), g->ng); } infoApply(g, r->p); g->CTX = r->ctx; g->G = r->gh; g->sc = r->p.sc; r->p.sc = nullptr; g->bin.swap(r->p.bin); memcpy(g->T, r->p.T, sizeof g->T); g->st = Graph::LOADED; g->evictRetried = false; g->lastUse = now_ms(); }
 static void graphFailed(Graph* g) {
   g->st = Graph::FAILED; g->retryAt = now_ms() + optGraphRetryMs; g->evictRetried = false;
   vector<Client*> mine; for (Client* c : clients) if (c->g == g && c->ready) mine.push_back(c);   // these were told SETUP_OK; a client before ALLOC gets the error as its answer
@@ -1034,7 +1065,7 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; i++) { string a = argv[i]; auto nx = [&]() -> const char* { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", a.c_str()); exit(2); } return argv[++i]; };
     if (a == "--name") optName = nx(); else if (a == "--backend") optBackend = nx(); else if (a == "--ctx") optCtx = nx();
     else if (a == "--stub-bytes") optStubBytes = strtoull(nx(), 0, 10); else if (a == "--stub-nout") optStubNout = atoi(nx()); else if (a == "--stub-delay-us") optStubDelayUs = atoi(nx()); else if (a == "--stub-load-ms") optStubLoadMs = atoi(nx());
-    else if (a == "--graphs") optGraphs = nx(); else if (a == "--graph-dir") optGraphDir = nx(); else if (a == "--socket-prefix") optSocketPrefix = nx(); else if (a == "--max-loaded") optMaxLoaded = atoi(nx());
+    else if (a == "--graphs") optGraphs = nx(); else if (a == "--graph-dir") optGraphDir = nx(); else if (a == "--socket-prefix") optSocketPrefix = nx(); else if (a == "--max-loaded") optMaxLoaded = atoi(nx()); else if (a == "--max-loaded-graphs") optMaxGraphs = atoi(nx()); else if (a == "--load-concurrent") optLoadConc = true;
     else if (a == "--graph-idle-ms") optGraphIdleMs = atoi(nx()); else if (a == "--graph-retry-ms") optGraphRetryMs = atoi(nx()); else if (a == "--load-hard-timeout-ms") optLoadHardMs = atoi(nx());
     else if (a == "--max-clients") optMaxClients = atoi(nx()); else if (a == "--allow-uid") allowUid.push_back((uid_t)atoi(nx())); else if (a == "--allow-gid") allowGid.push_back((gid_t)atoi(nx())); else if (a == "--exec-timeout-ms") optExecTimeoutMs = atoi(nx());
     else if (a == "--exit-after-clients") optExitAfter = atoi(nx()); else if (a == "--max-seconds") optMaxSec = atoi(nx()); else if (a == "--qnn-log") optQnnLog = atoi(nx()); else if (a == "--alloc") optAlloc = nx();
@@ -1111,7 +1142,7 @@ int main(int argc, char** argv) {
     for (Client* c : clients) { Graph* g = c->g;
       // A client waits by not being read: until the sizes and the allocator are known, and after SETUP_OK until its handles are registered. Its kick stays in the eventfd. A hang-up is still seen.
       const bool wait = g->st != Graph::FAILED && (!g->infoReady || (isQnn && !gAllocReady) || (c->ready && !c->registered));
-      p.push_back({c->sock, short(wait ? 0 : POLLIN), 0}); who.push_back({c, 0}); if (c->ready && c->registered && c->kick >= 0) { p.push_back({c->kick, POLLIN, 0}); who.push_back({c, 1}); } }
+      p.push_back({c->sock, short(wait ? 0 : POLLIN), 0}); who.push_back({c, 0}); if (c->ready && (c->registered || c->g->ng > 1) && c->kick >= 0) { p.push_back({c->kick, POLLIN, 0}); who.push_back({c, 1}); } }
     int to = 1000; if (gVoted && clients.empty()) to = max(0, min(1000, (int)(gIdleSince + optPowerGraceMs - now_ms()) + 1));
     if (!optPowerLive.empty()) to = min(to, 200);   // NPUPWR: a control-file change lands within ~200 ms even between jobs
     int pr = poll(p.data(), p.size(), to); if (pr < 0) { if (errno == EINTR) continue; logf("poll: %s", strerror(errno)); gExitCode = 1; break; }

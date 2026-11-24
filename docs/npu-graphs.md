@@ -1,6 +1,6 @@
 # How the Vela NPU graphs are built
 
-This page describes how the 34 graph files in `vela-npu-sysext-14.raw` (the same files are in `vela-npu-sysext-15.raw`; package 17 has new v73 files, see [`npu/graphs/pkg17/README.md`](../npu/graphs/pkg17/README.md)) were made: 17 for HTP v73 (Snapdragon 8 Gen 2,
+This page describes how the 34 graph files in `vela-npu-sysext-14.raw` (the same files are in `vela-npu-sysext-15.raw`; package 17 has new v73 files, see [`npu/graphs/pkg17/README.md`](../npu/graphs/pkg17/README.md); package 18 adds the five ANF graph families, see [`npu/graphs/pkg18/README.md`](../npu/graphs/pkg18/README.md)) were made: 17 for HTP v73 (Snapdragon 8 Gen 2,
 SM8550) and the same 17 for HTP v79 (Snapdragon 8 Elite, SM8750). It lists the inputs, the tool versions, the commands,
 and the hashes a correct build gives.
 

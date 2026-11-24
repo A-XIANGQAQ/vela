@@ -32,8 +32,8 @@ Every file in the release zip, who wrote it and under which licence. Licence tex
 
 ## Not in the zip: the Vela NPU system part
 
-The NPU system extension `vela-npu-sysext-17.raw` (package 17, sha256
-`8795c509be690e643f6739112aa4033d4c1fff3a5e55a0c58ce4178963046bc6`, its own release asset, installed as
+The NPU system extension `vela-npu-sysext-18.raw` (package 18, sha256
+`b4f2f260be4fc2f9339411fafe480ac7ee505caa34e3e9428550a0754e700807`, its own release asset, installed as
 `armada-vela-npu.raw`) is **not** in the release zip. It contains:
 
 - `fsr4npud` (the NPU daemon) and `fsr4npu-check`: ours, GPL-3.0-or-later with a GPL-3.0 section 7 additional permission
@@ -50,7 +50,7 @@ reads them from the device's own dsp partition.
 
 ## Qualcomm AI Engine Direct (QNN) runtime
 
-- **Included** (only inside `vela-npu-sysext-17.raw`, never as a separate download): `libQnnHtp.so`,
+- **Included** (only inside `vela-npu-sysext-18.raw`, never as a separate download): `libQnnHtp.so`,
   `libQnnHtpV73Stub.so`, `libQnnSystem.so`, `libQnnHtpV73Skel.so`, `libQairtHtpV73Skel.so`, `libQnnHtpV73.so`,
   `libQnnHtpV79Stub.so`, `libQnnHtpV79Skel.so`, `libQairtHtpV79Skel.so`, `libQnnHtpV79.so`, `libQnnHtpV75Stub.so`,
   `libQnnHtpV75Skel.so`, `libQairtHtpV75Skel.so`, `libQnnHtpV75.so` from the
@@ -108,3 +108,13 @@ and validation data, Vela's overlay in `overlay/ov`, `overlay/ov2`, `overlay/gen
 `vela_assets/fsr411`, build scripts and README with the build steps), the OptiScaler fork in `fork/`, the RE4 interceptor in
 `interceptor/` and the NPU layer in `npu-layer/`. `upscale/assets/licenses/README.txt` in the zip gives the same overview
 in short form.
+
+## ANF (Adreno Neural Fusion network)
+
+- **What:** the five graph families `anf360s32.bin`, `anf480s32.bin`, `anf540s32.bin`, `anf648s32.bin` and `anf720s32.bin` inside
+  `vela-npu-sysext-18.raw` (Vela 0.9.0), the model `ANF` in the panel and fork patches 0050-0056.
+- **Source of the network:** Qualcomm's Adreno Neural Fusion SDK, <https://github.com/SnapdragonGameStudios/adreno-neural-fusion>. We
+  rebuilt its 2x super-resolution network as integer graphs for the Hexagon NPU (`npu/graphs/pkg18/README.md`). The graph files are in the
+  system image only, not in the plugin zip.
+- **Ours:** the graph generator, the daemon changes, the fork patches and the plugin code (GPL-3.0, `LICENSING.md`).
+- No other third-party code or data is new in 0.9.0.

@@ -1,21 +1,21 @@
-# Vela NPU system part (package 17)
+# Vela NPU system part (package 18)
 
-It lets Vela run FSR 4 and FSR 4 Fast on the Hexagon NPU of the Snapdragon 8 Gen 2 (SM8550, HTP v73), of the Snapdragon 8 Gen 3
+It lets Vela run FSR 4, FSR 4 Fast and (package 18) ANF on the Hexagon NPU of the Snapdragon 8 Gen 2 (SM8550, HTP v73), of the Snapdragon 8 Gen 3
 (SM8650, HTP v75: the same v73 graphs on the v75 runtime) and, experimentally,
 of the Snapdragon 8 Elite (SM8750, HTP v79: the AYN Odin 3 and other devices with this chip). Without it Vela runs them on the GPU. It is a system part, so installing it needs **sudo once** (your password).
 
 ## Install (Desktop mode → Konsole, game closed)
 
-1. Run: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.25/install-vela-npu.sh | sudo sh`
+1. Run: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.9.0/install-vela-npu.sh | sudo sh`
    Nothing else to download: the image carries the Qualcomm QNN runtime; the installer reads 3 DSP files from your device.
 2. It ends with `Vela NPU: OK - all NPU graphs checked work` or `Vela NPU: FAILED - <reason>`. Start the game again; the Vela
    panel shows "on the NPU".
 
 When the NPU service starts, it checks one graph with a known input (the start self-check). If the result is wrong on your unit,
 it switches to the `low4/` graphs, which are planned for a smaller memory window. If those are wrong too, the NPU stays off and
-Vela runs FSR 4 on the GPU. Details and the environment variables: section "Package 17" below.
+Vela runs FSR 4 on the GPU. Details and the environment variables: sections "Package 17" and "Package 18" below. If the check fails on both sets, the installer says so ("Vela NPU: off on this unit ...", exit code 3) instead of "FAILED".
 
-Remove: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.25/uninstall-vela-npu.sh | sudo sh`
+Remove: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.9.0/uninstall-vela-npu.sh | sudo sh`
 
 ## Game resolutions on the NPU
 
@@ -33,11 +33,12 @@ Package 17 has the FSR 4 networks of package 14 (rebuilt in a faster form, same 
 
 | where | what | from |
 |---|---|---|
-| `/var/lib/extensions/armada-vela-npu.raw` | release asset `vela-npu-sysext-17.raw` (squashfs systemd system extension, sha256 `8795c509be690e643f6739112aa4033d4c1fff3a5e55a0c58ce4178963046bc6`, list in `vela-npu-sysext-17.contents.txt`) | `mk_public_sysext.sh`, byte-reproducible (the same sha256 in five of six builds, see below) |
+| `/var/lib/extensions/armada-vela-npu.raw` | release asset `vela-npu-sysext-18.raw` (squashfs systemd system extension, 64 061 440 bytes, sha256 `b4f2f260be4fc2f9339411fafe480ac7ee505caa34e3e9428550a0754e700807`, list in `vela-npu-sysext-18.contents.txt`) | `mk_public_sysext.sh`, byte-reproducible (package 18: two builds, the same sha256; package 17: five of six, see below) |
 | inside: `/usr/lib64/vela-npu/fsr4npud`, `fsr4npu-check` | the NPU daemon (one process for all FSR 4 graphs) and its checker | ours, GPL-3.0-or-later; source and build steps: [`src/`](src/README.md) |
 | inside: `/usr/lib64/vela-npu/nf4*.bin` (17) | the FSR 4.1.1 network compiled for HTP v73 (also used on SM8650, with the HTP v75 runtime): 1920x1080 / 1600x900 / 1280x720 / 1600x904 / 1440x810 / 1280x800 / 1152x648 / 960x540 output × Performance / Ultra Performance, + exact | ours (from AMD's FSR 4 network) |
 | inside: `/usr/lib64/vela-npu/low4/nf4*.bin` (17) + `low4/SELFCHECK` | the same 17 graphs planned for a 4 MB memory window, for units whose NPU gives wrong results with the main set; used only if the start self-check fails | ours; recipe and hashes: [`graphs/pkg17/`](graphs/pkg17/README.md) |
 | inside: `/usr/lib64/vela-npu/v79/nf4*.bin` (17) | the same 17 graphs compiled for HTP v79 (SM8750), same file names | ours (from AMD's FSR 4 network) |
+| inside: `/usr/lib64/vela-npu/anf{360,480,540,648,720}s32.bin` (5) | the ANF super-resolution network as five graph families for HTP v73 (Snapdragon 8 Gen 2), 32 phase graphs per family, for the render canvases 640x360, 854x480, 960x540, 1152x648 and 1280x720 | compiled by us; recipe and hashes: [`graphs/pkg18/`](graphs/pkg18/README.md) |
 | inside: `cdsprpcd`, `libcdsprpc.so`, `libcdsp_default_listener.so` | the FastRPC client and the cDSP listener | quic/fastrpc a56e9d4, BSD-3-Clause |
 | inside: `/usr/lib64/vela-npu/libQnnHtp.so`, `libQnnHtpV73Stub.so`, `libQnnSystem.so`; `/usr/lib/rfsa/adsp/libQnnHtpV73Skel.so`, `libQairtHtpV73Skel.so`, `libQnnHtpV73.so` | the Qualcomm AI Engine Direct (QNN) runtime 2.47.0.260601 (host part + HTP v73 part) | Qualcomm AI Engine Direct SDK runtime, unmodified, Qualcomm AI Stack License (sha256 of each file in `mk_public_sysext.sh`) |
 | inside: `/usr/lib64/vela-npu/libQnnHtpV79Stub.so`; `/usr/lib/rfsa/adsp/libQnnHtpV79Skel.so`, `libQairtHtpV79Skel.so`, `libQnnHtpV79.so` | the same runtime's HTP v79 part (SM8750) | same |
@@ -82,7 +83,7 @@ Package 16 (not released on its own) and package 17 add three things to package 
   spare, and raises it again when the NPU starts to hold the frame back. `FSR4NPUD_POWER_GOV=0` turns it off (the fixed `turbo`
   vote of package 15). `--power-corner` / `FSR4NPUD_POWER_CORNER` still set the level it starts from.
 
-The image is the same as package 15 apart from these graph files, the daemon, and the two text files that carry the package number.
+The image is the same as package 17 apart from the daemon, the unit, the five ANF graph files and the text files that carry the package number (list of differences: package 18 section below). Package 17 was the same as package 15 apart from these graph files, the daemon, and the two text files that carry the package number.
 The package 17 image build is byte-reproducible in five of the six builds we made (the same sha256); one build gave another sha256 and
 could not be examined afterwards (the build output was lost). The file contents and the listing of the five equal builds are the
 shipped ones.
@@ -108,3 +109,25 @@ shipped ones.
   (`LICENSING.md`).
 - The source of `fsr4npud` and `fsr4npu-check` is in [`src/`](src/README.md) (file table, licences, build steps, and how the image's
   binaries relate to it).
+
+## Package 18 (Vela 0.9.0)
+
+Package 18 is package 17 plus ANF. Everything FSR 4 uses is unchanged: the 17 + 17 + 17 FSR 4 graphs, the self-check and the `low4/` set.
+
+- **ANF graphs.** Five files `anf360s32.bin`, `anf480s32.bin`, `anf540s32.bin`, `anf648s32.bin`, `anf720s32.bin` (HTP v73 only; the
+  Snapdragon 8 Elite and the Snapdragon 8 Gen 3 do not get ANF). Each holds 32 graphs, one per jitter phase. What they are, how
+  they were built and md5/sha256 of each file: [`graphs/pkg18/README.md`](graphs/pkg18/README.md).
+- **The daemon** (`fsr4npud`, md5 `97a022306f16e5cf364c822e6afe82e6` in the image, source in [`src/`](src/README.md)) opens one
+  socket per graph name, the 17 FSR 4 names and the five `fsr4npud_anf<canvas>s32` ones. A game reaches the family of its own
+  render size only. A family loads when its first client connects (about 0.2 to 0.4 s; meanwhile the daemon answers "busy" and the
+  upscaler shows SGSR 2), idle families unload, least recently used first.
+- **The unit** (`units/vela-npu.service`, md5 `7871586a2e343ce3a4f3488c3860ba49`): the five family sockets are added to `--graphs`,
+  and `--max-loaded 4 --max-loaded-graphs 48` replaces `--max-loaded 3` (a family counts 32 graphs, an FSR 4 graph 1; the DSP
+  session holds about 52). Known gap: a family requested while every loaded context has a client and the total would pass 48 is
+  loaded anyway.
+- **The installer** checks the output hash of phase 0 of each family on a Snapdragon 8 Gen 2 (other chips: "not checked"), and says
+  "Vela NPU: off on this unit - the NPU gives wrong results here (checked at start); Vela runs FSR 4 on the GPU" when the daemon
+  stops with exit code 4 (both FSR 4 graph sets wrong on the start self-check, issue #2), with exit code 3.
+- Differences to package 17 (md5 of the files that changed): `diff_17_18` is in the build log of the release; the changed files are
+  the daemon, the unit, `MANIFEST.md5`, `extension-release.armada-vela-npu`, the licence `README.txt` and the five ANF files.
+- The package 18 image build is byte-reproducible: two builds gave the same sha256.

@@ -17,7 +17,7 @@ kept in `assets/licenses/decky-plugin-template-BSD-3-Clause.txt`.
 
 ## Vela NPU system part (`npu/`)
 
-- `vela-npu-sysext-17.raw` (sha256 `8795c509be690e643f6739112aa4033d4c1fff3a5e55a0c58ce4178963046bc6`) contains Vela's
+- `vela-npu-sysext-18.raw` (sha256 `b4f2f260be4fc2f9339411fafe480ac7ee505caa34e3e9428550a0754e700807`) contains Vela's
   files (the daemon `fsr4npud`, the checker `fsr4npu-check`, systemd units and drop-ins, a udev rule and 17 compiled FSR 4
   graphs, each for HTP v73 and HTP v79),
   quic/fastrpc (BSD-3-Clause, its text is inside the image) and the **Qualcomm AI Engine Direct SDK runtime
@@ -28,6 +28,10 @@ kept in `assets/licenses/decky-plugin-template-BSD-3-Clause.txt`.
 - The 17 graphs are the AMD FSR 4.1.1 network (AMD's MIT licence, see `THIRD_PARTY_NOTICES.md`), compiled with Qualcomm's
   QAIRT tools into QNN context binaries for HTP v73 (SM8550; SM8650 runs the same files on the HTP v75 runtime) and HTP v79
   (SM8750, in `v79/`).
+- The five ANF graph families (`anf*s32.bin`, HTP v73 only, since package 18) are the ANF super-resolution network of Qualcomm's
+  Adreno Neural Fusion SDK (<https://github.com/SnapdragonGameStudios/adreno-neural-fusion>), rebuilt by us as integer QNN graphs and
+  compiled with QAIRT; recipe and hashes in `npu/graphs/pkg18/README.md`. The code around it is ours, GPL-3.0: fork patches
+  0050-0056, the daemon's family sockets, the plugin's ANF model.
 - No DSP firmware file is in the image: `install-vela-npu.sh` reads `fastrpc_shell_unsigned_3`, `libc++.so.1` and
   `libc++abi.so.1` from the device's own dsp partition.
 - Qualcomm's licence for the 10 runtime files, the **Qualcomm AI Stack License** (the SDK's `LICENSE.pdf`), and its Notice

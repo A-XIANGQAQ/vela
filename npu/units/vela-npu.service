@@ -1,6 +1,6 @@
 # Vela NPU: one fsr4npud for all FSR 4 graphs, so they share one cDSP fastrpc session (the cDSP has 7).
 # It listens on @fsr4npud_<graph> for every graph from the start, and a graph's QNN context is loaded when its first client connects.
-# Idle cost: one fastrpc session, no graph. At most 3 graphs stay loaded; a graph without a client is unloaded after 120 s.
+# Idle cost: one fastrpc session, no graph. ANF families (anf<canvas>s32, 32 phase graphs each) load when a game asks for one; at most 4 contexts and 48 graphs stay loaded; a graph without a client is unloaded after 120 s.
 [Unit]
 Description=Vela NPU: FSR 4 helper daemon for all graphs (QNN HTP on the cDSP)
 # vela-npu-setup.service waits for the device nodes (a ConditionPathExists on them raced
@@ -16,7 +16,7 @@ Type=notify
 NotifyAccess=main
 # The listener must have attached to the cDSP root PD before the session is opened.
 ExecStartPre=/usr/bin/sleep 2
-ExecStart=/usr/lib64/vela-npu/fsr4npud --graphs nf4_k1h,nf4_k1h_360,nf4_k1h_450,nf4up_k1h,nf4up_k1h_450,nf4up_k1h_360,nf4_exact,nf4_k1h_452,nf4up_k1h_452,nf4_k1h_405,nf4up_k1h_405,nf4_k1h_400,nf4up_k1h_400,nf4_k1h_324,nf4up_k1h_324,nf4_k1h_270,nf4up_k1h_270 --graph-dir /usr/lib64/vela-npu --max-loaded 3 --graph-idle-ms 120000 --backend qnn --allow-uid 1000 --max-clients 4 --alloc auto --exec-timeout-ms 2000 --exec-hard-timeout-ms 10000 --power-grace-ms 2000
+ExecStart=/usr/lib64/vela-npu/fsr4npud --graphs nf4_k1h,nf4_k1h_360,nf4_k1h_450,nf4up_k1h,nf4up_k1h_450,nf4up_k1h_360,nf4_exact,nf4_k1h_452,nf4up_k1h_452,nf4_k1h_405,nf4up_k1h_405,nf4_k1h_400,nf4up_k1h_400,nf4_k1h_324,nf4up_k1h_324,nf4_k1h_270,nf4up_k1h_270,anf360s32,anf480s32,anf540s32,anf648s32,anf720s32 --graph-dir /usr/lib64/vela-npu --max-loaded 4 --max-loaded-graphs 48 --graph-idle-ms 120000 --backend qnn --allow-uid 1000 --max-clients 4 --alloc auto --exec-timeout-ms 2000 --exec-hard-timeout-ms 10000 --power-grace-ms 2000
 # --alloc auto: rpcmem on /dev/dma_heap/system when it can be opened, else a Turnip-exported
 # buffer; the journal line 'allocator:' says which. With the Vulkan path the daemon creates a
 # Vulkan device, and a dynamic user has no writable home for a shader cache.

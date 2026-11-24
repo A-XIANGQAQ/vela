@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the Vela NPU system part, package 17: the systemd system extension vela-npu-sysext-17.raw.
+# Builds the Vela NPU system part, package 18: the systemd system extension vela-npu-sysext-18.raw.
 # Since package 16: low4/: the 17 v73 graphs planned for a 4 MB VTCM window (GRAPHS_LOW: nf4*.bin + SELFCHECK), which the daemon
 # loads on units whose released graphs fail its start self-check.
 # Contents: the NPU daemon fsr4npud and its checker, the 17 FSR 4 graphs for HTP v73 (Snapdragon 8 Gen 2, SM8550) and the same
@@ -33,7 +33,7 @@
 #     registry.fedoraproject.org/fedora:44 sh /npu/mk_public_sysext.sh
 set -e
 umask 022
-VER=17
+VER=18
 EPOCH=1761955200   # 2025-11-01 00:00 UTC
 SYSLIB=/usr/lib64/vela-npu
 dnf -y -q install squashfs-tools patchelf binutils >/dev/null 2>&1
@@ -73,6 +73,7 @@ GRAPH_LIST="nf4_k1h nf4_k1h_360 nf4_k1h_450 nf4up_k1h nf4up_k1h_450 nf4up_k1h_36
 for u in $GRAPH_LIST; do install -m 0644 $G/$u.bin $L/$u.bin; done
 for u in $GRAPH_LIST; do install -m 0644 $G79/$u.bin $L/v79/$u.bin; done
 for u in $GRAPH_LIST; do install -m 0644 $GLOW/$u.bin $L/low4/$u.bin; done; install -m 0644 $GLOW/SELFCHECK $L/low4/SELFCHECK
+for u in anf360s32 anf480s32 anf540s32 anf648s32 anf720s32; do install -m 0644 /w/anf/$u.bin $L/$u.bin; done
 # the Qualcomm runtime: host libraries 0755 (as on the tested device), DSP-side skels 0644; each sha256-checked
 echo "$QNN_FILES" | while read -r sha dst src; do
   case $dst in usr/lib64/*) m=0755;; *) m=0644;; esac
@@ -99,7 +100,7 @@ done
 cat > $D/README.txt <<R
 Vela NPU system part, package $VER (public image).
 Ours: fsr4npud, fsr4npu-check (the NPU daemon and its checker), the 17 FSR 4 graphs nf4*.bin (HTP v73, Snapdragon 8 Gen 2 SM8550; on Snapdragon 8 Gen 3 SM8650 with the HTP v75 runtime)
-and v79/nf4*.bin (the same graphs for HTP v79, Snapdragon 8 Elite SM8750), the systemd units and drop-ins, the udev rule.
+and v79/nf4*.bin (the same graphs for HTP v79, Snapdragon 8 Elite SM8750), the systemd units and drop-ins, the udev rule; since package 18 the five ANF graph families anf*s32.bin (HTP v73 only, 32 phase graphs each).
 low4/nf4*.bin: the 17 HTP v73 graphs planned for a 4 MB VTCM window, with the same outputs; fsr4npud checks one released graph at
 start (low4/SELFCHECK) and uses low4/ on units where it gives a wrong result (faulty upper VTCM window).
 quic/fastrpc (BSD-3-Clause, fastrpc-BSD-3-Clause.txt): cdsprpcd, libcdsprpc, libcdsp_default_listener, built from source.
@@ -122,7 +123,7 @@ ARCHITECTURE=arm64
 # Not used by systemd-sysext: what is inside.
 X_VELA_NPU_PACKAGE=$VER
 X_VELA_NPU_PART=base + Qualcomm QNN runtime (public r2; the device's DSP shell: extension armada-vela-npu-qnn)
-X_VELA_NPU_GRAPHS=nf4_k1h nf4_k1h_360 nf4_k1h_450 nf4up_k1h nf4up_k1h_450 nf4up_k1h_360 nf4_exact nf4_k1h_452 nf4up_k1h_452 nf4_k1h_405 nf4up_k1h_405 nf4_k1h_400 nf4up_k1h_400 nf4_k1h_324 nf4up_k1h_324 nf4_k1h_270 nf4up_k1h_270
+X_VELA_NPU_GRAPHS=nf4_k1h nf4_k1h_360 nf4_k1h_450 nf4up_k1h nf4up_k1h_450 nf4up_k1h_360 nf4_exact nf4_k1h_452 nf4up_k1h_452 nf4_k1h_405 nf4up_k1h_405 nf4_k1h_400 nf4up_k1h_400 nf4_k1h_324 nf4up_k1h_324 nf4_k1h_270 nf4up_k1h_270 anf360s32 anf480s32 anf540s32 anf648s32 anf720s32
 X_VELA_NPU_UNIT=vela-npu.service
 X_VELA_NPU_CHIPS=SM8550 (HTP v73) SM8650 (HTP v73 graphs, HTP v75 runtime) SM8750 (HTP v79, graphs in v79/)
 X_VELA_NPU_QAIRT=$QAIRT_VER

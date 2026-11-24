@@ -1,24 +1,24 @@
 #!/bin/sh
-# Vela NPU system part, package 17: lets Vela run FSR 4 / FSR 4 Fast on the Hexagon NPU (Snapdragon 8 Gen 2, SM8550;
+# Vela NPU system part, package 18: lets Vela run FSR 4 / FSR 4 Fast on the Hexagon NPU (Snapdragon 8 Gen 2, SM8550;
 # Snapdragon 8 Gen 3, SM8650; Snapdragon 8 Elite, SM8750, experimental).
 # Needs sudo ONCE (it adds a system extension, a udev rule and system services). Run in Desktop mode -> Konsole, game closed:
-#   curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.8.21/install-vela-npu.sh | sudo sh
+#   curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/latest/download/install-vela-npu.sh | sudo sh
 # What it does:
-#   1. downloads vela-npu-sysext-17.raw (NPU daemon, 17 FSR 4 graphs for HTP v73 and for HTP v79, quic/fastrpc, and the
+#   1. downloads vela-npu-sysext-18.raw (NPU daemon, 17 FSR 4 graphs for HTP v73 and for HTP v79, 5 ANF graph families for HTP v73, quic/fastrpc, and the
 #      Qualcomm AI Engine Direct (QNN) runtime 2.47.0.260601, unmodified) and checks its sha256;
 #   2. reads the DSP shell and C++ runtime (3 files) read-only from your device's own dsp partition;
 #   3. installs both as systemd system extensions in /var/lib/extensions (nothing in armadaOS is overwritten), enables the
 #      NPU daemon, and checks each graph with a fixed input. Prints "Vela NPU: OK" or "Vela NPU: FAILED" + the reason.
-# Remove: uninstall-vela-npu.sh (same release). Options: --image <local vela-npu-sysext-17.raw>, --force.
+# Remove: uninstall-vela-npu.sh (same release). Options: --image <local vela-npu-sysext-18.raw>, --force.
 # The image carries the QNN runtime (no SDK download); library search paths: /usr/lib64/vela-npu only; root:root, umask 022.
 set -u
 umask 022
-VER=17
-# TAG: the release that carries vela-npu-sysext-17.raw
-TAG=v0.8.25
+VER=18
+# TAG: the release that carries vela-npu-sysext-18.raw (the Vela 0.9.0 candidate; check it against the real release before publishing)
+TAG=v0.9.0
 BASE_URL="https://github.com/zrprod9-cmyk/vela/releases/download/$TAG"
 IMAGE=vela-npu-sysext-$VER.raw
-IMAGE_SHA256=8795c509be690e643f6739112aa4033d4c1fff3a5e55a0c58ce4178963046bc6
+IMAGE_SHA256=b4f2f260be4fc2f9339411fafe480ac7ee505caa34e3e9428550a0754e700807
 EXT=/var/lib/extensions
 QDIR=/var/lib/extensions/armada-vela-npu-qnn
 # One daemon serves all graphs (one cDSP session). The graphs are loaded on first use, so the check below loads each one in turn.
@@ -69,6 +69,15 @@ fsr4npud_nf4_k1h_324 8b967666e675804b
 fsr4npud_nf4up_k1h_324 0cfda9f2b7cabc25
 fsr4npud_nf4_k1h_270 501dbf44d6b0410d
 fsr4npud_nf4up_k1h_270 a71e9b4f04112039"
+# ANF (package 18), HTP v73 graphs, checked on the Snapdragon 8 Gen 2 only: the output hash of phase 0 of each graph family on the
+# fixed ramp input (fsr4npu-check, no --phases). These are the x86 HTP simulator's hashes; the 8 Gen 2 device gave the same hash in
+# every phase of every family it ran (ANF/IMPL1.md, "Device vs simulator").
+ANF_GRAPHS="anf360s32 anf480s32 anf540s32 anf648s32 anf720s32"
+WANT_ANF="fsr4npud_anf360s32 45c31095dabc20bf
+fsr4npud_anf480s32 576f25a7bd307737
+fsr4npud_anf540s32 2077348c1927bdf2
+fsr4npud_anf648s32 6d7313cc7eb723af
+fsr4npud_anf720s32 92c727792706acad"
 
 say() { printf '%s\n' "$*"; }
 fail() { say ""; say "Vela NPU: FAILED - $*"; say "Vela keeps running FSR 4 on the GPU."; exit 1; }
@@ -177,7 +186,15 @@ mv -f "$B.tmp" "$B"
 systemctl daemon-reload
 systemctl enable $UNIT vela-npu-boot.service >/dev/null 2>&1 || fail "systemctl enable failed"
 systemctl restart vela-npu-setup.service || fail "vela-npu-setup.service failed (journalctl -u vela-npu-setup)"
-systemctl restart $UNIT || fail "$UNIT did not start (journalctl -b -u $UNIT -u vela-npu-listener)"
+# The daemon checks its graphs when it starts; when both graph sets give wrong results it ends with exit code 4 ("FAIL graph set: NONE")
+# and does not come back: a unit whose NPU computes wrongly. That is not an install error: Vela runs FSR 4 on the GPU there.
+npu_exit4() { systemctl show -p ExecMainStatus $UNIT 2>/dev/null | grep -qx "ExecMainStatus=4" || journalctl -b -u $UNIT --no-pager 2>/dev/null | grep -q "FAIL graph set: NONE"; }
+npu_off() { say ""; say "Vela NPU: off on this unit - the NPU gives wrong results here (checked at start); Vela runs FSR 4 on the GPU."
+  say "Test 8 helps us find out why: https://github.com/zrprod9-cmyk/vela/releases/tag/npu-rp6-test8 (post its result in issue #2)."
+  say "Nothing else is wrong with the install. To remove it: uninstall-vela-npu.sh (with sudo)"; exit 3; }
+if ! systemctl restart $UNIT; then npu_exit4 && npu_off; fail "$UNIT did not start (journalctl -b -u $UNIT -u vela-npu-listener)"; fi
+sleep 3
+[ "$(systemctl is-active $UNIT)" = active ] || ! npu_exit4 || npu_off
 
 say "== 6. check every graph with a fixed input (each one is loaded in turn)"
 bad=0; nohash=0
@@ -195,6 +212,18 @@ for g in $GRAPHS; do s=fsr4npud_$g; w=$(echo "$WANT" | sed -n "s/^$s //p")
     say "  ok $g (runs on the NPU, hash $h, no reference hash)"; nohash=$((nohash + 1))
   else say "  FAILED $g (service $up, hash ${h:-none}, expected ${w:-any})"; bad=$((bad + 1)); fi
 done
+if [ "$CHIP" = SM8550 ]; then
+  say "  ANF graph families (Vela's own upscaler; a family loads on its first use, so a check is tried again for a few seconds)"
+  for g in $ANF_GRAPHS; do s=fsr4npud_$g; w=$(echo "$WANT_ANF" | sed -n "s/^$s //p"); ok=0; tries=0; h=""
+    while [ $tries -lt 6 ]; do tries=$((tries + 1))
+      o=$(runuser -u "$USER_NAME" -- /usr/lib64/vela-npu/fsr4npu-check --name "$s" --runs 20 2>&1) || true
+      h=$(echo "$o" | grep -oE 'output hash [0-9a-f]+' | cut -d' ' -f3)
+      if [ "$(systemctl is-active "$UNIT")" = active ] && echo "$o" | grep -q "RESULT OK" && [ -n "$w" ] && [ "$h" = "$w" ]; then ok=1; break; fi
+      sleep 1
+    done
+    if [ $ok = 1 ]; then say "  ok $g"; else say "  FAILED $g (service $(systemctl is-active "$UNIT"), hash ${h:-none}, expected $w)"; bad=$((bad + 1)); fi
+  done
+else say "  ANF graphs are not checked on $CHIP (Vela's ANF runs on the Snapdragon 8 Gen 2 only for now)"; fi
 [ $nohash = 0 ] || say "  $nohash graphs have no reference hash yet"
 if [ $bad = 0 ]; then
   say ""; say "Vela NPU: OK - all NPU graphs checked work. Start your game again; the Vela panel shows \"on the NPU\"."

@@ -1,7 +1,7 @@
 # Source of the Vela NPU daemon and its checker
 
-The Vela NPU system image (`vela-npu-sysext-17.raw`, release asset, sha256
-`8795c509be690e643f6739112aa4033d4c1fff3a5e55a0c58ce4178963046bc6`) ships two programs of ours as binaries:
+The Vela NPU system image (`vela-npu-sysext-18.raw`, release asset, sha256
+`b4f2f260be4fc2f9339411fafe480ac7ee505caa34e3e9428550a0754e700807`) ships two programs of ours as binaries:
 `/usr/lib64/vela-npu/fsr4npud` (the NPU daemon) and `/usr/lib64/vela-npu/fsr4npu-check` (its checker). This folder is their
 complete source and build recipe (GPL-3.0-or-later, see [Licence](#licence)). Nothing from Qualcomm is in this folder.
 
@@ -55,6 +55,12 @@ library search path of `fsr4npud` with `patchelf --force-rpath --set-rpath /usr/
   `fsr4npud.cpp` with md5 `7dfde51fee9250bd1423530b5dedc1e6` (the file in this folder). Compared with package 15, this source adds the
   power governor (on by default), the start self-check and the graph-set choice (`--graph-set auto|released|low`, see
   [`../graphs/pkg17/README.md`](../graphs/pkg17/README.md)).
+
+- Package 18 ships a daemon with the ANF graph families (several sockets, family loading, graph phases): `fsr4npud` in the image has md5
+  `97a022306f16e5cf364c822e6afe82e6` (the stripped build `0b5975490b7d97b30f3498bedea95271` with the RPATH set by `patchelf`), built from
+  `fsr4npud.cpp` with md5 `d16de77c0fdb021a56013b18d5cf1964` and `fsr4npu_proto.h` (the file in this folder; it adds the phase flag `F_PHASE`
+  and the kick value `FSR4NPU_KICK_PHASE`). `fsr4npu-check` in the image is the one of package 17; its sources here are not changed and it was
+  not rebuilt for package 18. The daemon was built once from these sources; a second build was not made.
 
 ## Licence
 
