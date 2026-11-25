@@ -1,0 +1,41 @@
+From 5e9b13e90070caca35690d6dd1040f8e9d651065 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 23:45:54 +0100
+Subject: [PATCH 64/65] round 7: input_common xefg_xell uses
+ OptiAtomicSharedPtr (ARM64EC libc++ atomic<shared_ptr>)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/low_latency/input/input_common.cpp | 2 +-
+ OptiScaler/low_latency/input/input_common.h   | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/OptiScaler/low_latency/input/input_common.cpp b/OptiScaler/low_latency/input/input_common.cpp
+index 62a7e8a6..c1c32d70 100644
+--- a/OptiScaler/low_latency/input/input_common.cpp
++++ b/OptiScaler/low_latency/input/input_common.cpp
+@@ -20,7 +20,7 @@
+ #include <deque>
+ 
+ // Vela base B: currently_active_tech is an inline static of InputCommon (input_common.h)
+-std::atomic<std::shared_ptr<LowLatencyTech>> InputCommon::xefg_xell;
++OptiAtomicSharedPtr<LowLatencyTech> InputCommon::xefg_xell;
+ 
+ static bool marker_supported(InputMarkerMode mode, MarkerType type)
+ {
+diff --git a/OptiScaler/low_latency/input/input_common.h b/OptiScaler/low_latency/input/input_common.h
+index c858cb20..855491b1 100644
+--- a/OptiScaler/low_latency/input/input_common.h
++++ b/OptiScaler/low_latency/input/input_common.h
+@@ -56,7 +56,7 @@ class InputCommon
+     // OptiScaler's XeFG paces with an XeLL context. With the XeLL output it's that output's own (which then stays the
+     // output until XeFG lets go of it), with a Reflex or AntiLag 2 output XeFG gets one of its own that follows the
+     // game's markers while the output does the sleeping.
+-    static std::atomic<std::shared_ptr<LowLatencyTech>> xefg_xell;
++    static OptiAtomicSharedPtr<LowLatencyTech> xefg_xell;
+     inline static std::atomic_bool xefg_uses_output_xell = false;
+     // The output XeFG started with, None while it doesn't run
+     inline static std::atomic<LowLatencyMode> xefg_started_output = LowLatencyMode::None;
+-- 
+2.54.0.windows.1
+

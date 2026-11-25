@@ -1,0 +1,85 @@
+From 0f9192a35494322ff65c5d1304f74c2b3f57cbb0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 17:42:38 +0100
+Subject: [PATCH 49/65] 0051-vela-anf-sgsr2-until-npu: show SGSR 2 (v1f)
+ instead of the plain upscale until the ANF family answers (NpuUp); ANF passes
+ still run for probe/acks
+
+(cherry picked from commit e688419b5adeb9a5aae11b0e3bc6b9457389dd4e)
+---
+ OptiScaler/upscalers/sgsr3/AnfVkBridge.h      |  2 ++
+ .../upscalers/sgsr3/SGSR3Feature_Dx12.cpp     | 23 ++++++++++++++++++-
+ .../upscalers/sgsr3/SGSR3Feature_Dx12.h       |  2 ++
+ 3 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/OptiScaler/upscalers/sgsr3/AnfVkBridge.h b/OptiScaler/upscalers/sgsr3/AnfVkBridge.h
+index 1a525f41..927a488e 100644
+--- a/OptiScaler/upscalers/sgsr3/AnfVkBridge.h
++++ b/OptiScaler/upscalers/sgsr3/AnfVkBridge.h
+@@ -96,6 +96,8 @@ class AnfVkBridge
+     }
+ 
+     bool Ready() const { return _ready; }
++    // the NPU answers (family loaded, probe acked): the frame runs the network. Before that the caller shows SGSR 2 (anf2).
++    bool NpuUp() const { return _layer == 2 && _zbase != 0; }
+     bool SizesMatch(uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh) const
+     {
+         return rw == _rw && rh == _rh && dw == _dw && dh == _dh;
+diff --git a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
+index a1423f58..f02bac1d 100644
+--- a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
++++ b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
+@@ -934,8 +934,27 @@ bool SGSR3FeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList
+                         fits(paramVelocity, mvW, mvH) && fits(paramOutput, dwNow, dhNow) &&
+                         (paramOutput->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+     const bool stFits = vkFits && _student.SizesMatch(rwNow, rhNow, dwNow, dhNow);
++    // anf2: ANF's family is not up yet (probe in flight, family loading 0.2-0.4 s, no daemon): SGSR 2 (v1f) shows the frame
++    // instead of the plain upscale; the ANF passes still run first on the same frame (they send the probe and read the acks)
++    const bool anfWait = _frameMode == Mode::Student && _anf.Ready() && _anf.SizesMatch(rwNow, rhNow, dwNow, dhNow) &&
++                         !_anf.NpuUp() && vkFits && !_studentFailed && (_fast.Ready() || !_fastTried);
++    if (anfWait)
++    {
++        ++_anfWaitFrames;
++        if (!_anfWaitLogged)
++        {
++            _anfWaitLogged = true;
++            LOG_INFO("Vela ANF: NPU not up yet, SGSR 2 shows the frames until it answers");
++        }
++    }
++    else if (_anfWaitLogged && _anf.Ready() && _anf.NpuUp())
++    {
++        _anfWaitLogged = false;
++        LOG_INFO("Vela ANF: NPU up after {} SGSR 2 frames, ANF from this frame", _anfWaitFrames);
++        _anfWaitFrames = 0;
++    }
+     const bool vkPath = (_frameMode == Mode::Student || _frameMode == Mode::VkBlit) && _student.Ready() && stFits &&
+-                        !_studentFailed;
++                        !_studentFailed && !anfWait;
+     if ((_frameMode == Mode::Student || _frameMode == Mode::VkBlit) && !vkPath)
+     {
+         if (_student.Ready() && !stFits && !_loggedVkSize)
+@@ -1165,6 +1184,8 @@ bool SGSR3FeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList
+             if (_timingEnabled)
+                 InCommandList->EndQuery(_timestampHeap, D3D12_QUERY_TYPE_TIMESTAMP,
+                                         _ringIndex * TimestampsPerFrame + 2);
++            if (anfWait)  // anf2: the ANF passes first (probe, acks, history), then SGSR 2 writes the frame over their stand-in
++                EvaluateAnf(InCommandList, InParameters, paramColor, useDepth ? paramDepth : nullptr, paramVelocity, paramOutput);
+             const bool ok = fast.Evaluate(
+                 InCommandList, { paramColor, SRV }, { useDepth ? paramDepth : nullptr, SRV }, { paramVelocity, SRV },
+                 { (_constants.flags & SGSR3Flags::HasReactive) ? paramReactive : nullptr, SRV },
+diff --git a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.h b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.h
+index e7d69b7a..fc244a15 100644
+--- a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.h
++++ b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.h
+@@ -94,6 +94,8 @@ class SGSR3FeatureDx12 : public SGSR3Feature, public IFeature_Dx12
+     bool _flatLogged = false;
+     ID3D12Resource* FlatDepth(ID3D12GraphicsCommandList* cl);
+     bool _loggedVkSize = false;
++    uint64_t _anfWaitFrames = 0;   // anf2: frames shown by SGSR 2 while the ANF family loads (the NPU not up yet)
++    bool _anfWaitLogged = false;
+     bool _studentFailed = false;  // the student's Evaluate failed: v1f from then on
+     float _amaxLogged = -1.0f;    // the student's amax last logged (it follows the upscale ratio)
+     // amax = min(C, K (2 / ratio)^P) (Vela 0.4.13; the training's formula, sgsr3.py amax_for keeps the same numbers).
+-- 
+2.54.0.windows.1
+

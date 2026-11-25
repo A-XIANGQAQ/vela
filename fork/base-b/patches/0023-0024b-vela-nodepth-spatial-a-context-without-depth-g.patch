@@ -1,0 +1,211 @@
+From e4b55889aae8f050ea5232be016fca1680f8f804 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 14:03:50 +0100
+Subject: [PATCH 23/65] 0024b-vela-nodepth-spatial: a context without depth
+ gets FSR 1 EASU of the colour instead of SGSR 2 (its no-depth path drew Manor
+ Lords dark)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit b2533da99c12b93d6f87c06bce8d2f34414830c7)
+---
+ OptiScaler/shaders/output_scaling/OS_Dx12.cpp | 39 ++++++++-------
+ OptiScaler/shaders/output_scaling/OS_Dx12.h   |  6 ++-
+ .../upscalers/sgsr2/SGSR2Feature_Dx12.cpp     | 47 +++++++++++++++++++
+ .../upscalers/sgsr2/SGSR2Feature_Dx12.h       |  3 ++
+ 4 files changed, 78 insertions(+), 17 deletions(-)
+
+diff --git a/OptiScaler/shaders/output_scaling/OS_Dx12.cpp b/OptiScaler/shaders/output_scaling/OS_Dx12.cpp
+index fb937f12..770c68a8 100644
+--- a/OptiScaler/shaders/output_scaling/OS_Dx12.cpp
++++ b/OptiScaler/shaders/output_scaling/OS_Dx12.cpp
+@@ -52,6 +52,16 @@ void OS_Dx12::SetBufferState(ID3D12GraphicsCommandList* InCommandList, D3D12_RES
+ }
+ 
+ bool OS_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InResource, ID3D12Resource* OutResource)
++{
++    if (State::Instance().currentFeature == nullptr)
++        return false;
++    const uint32_t tw = State::Instance().currentFeature->TargetWidth(), th = State::Instance().currentFeature->TargetHeight();
++    return DispatchSized(InCmdList, InResource, OutResource, tw, th, tw, th, State::Instance().currentFeature->DisplayWidth(),
++                         State::Instance().currentFeature->DisplayHeight());
++}
++
++bool OS_Dx12::DispatchSized(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InResource, ID3D12Resource* OutResource,
++                            uint32_t InViewW, uint32_t InViewH, uint32_t InTexW, uint32_t InTexH, uint32_t OutW, uint32_t OutH)
+ {
+     if (!_init || _device == nullptr || InCmdList == nullptr || InResource == nullptr || OutResource == nullptr)
+         return false;
+@@ -67,24 +77,21 @@ bool OS_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
+     CreateShaderResourceView(_device, InResource, currentHeap.GetSrvCPU(0));
+     CreateUnorderedAccessView(_device, OutResource, currentHeap.GetUavCPU(0), 0);
+ 
+-    FsrEasuCon(fsr1Constants.const0, fsr1Constants.const1, fsr1Constants.const2, fsr1Constants.const3,
+-               State::Instance().currentFeature->TargetWidth(), State::Instance().currentFeature->TargetHeight(),
+-               State::Instance().currentFeature->TargetWidth(), State::Instance().currentFeature->TargetHeight(),
+-               State::Instance().currentFeature->DisplayWidth(), State::Instance().currentFeature->DisplayHeight());
++    FsrEasuCon(fsr1Constants.const0, fsr1Constants.const1, fsr1Constants.const2, fsr1Constants.const3, InViewW, InViewH, InTexW,
++               InTexH, OutW, OutH);
+ 
+     // EASU only upscales, downscaling stays on the shader's bilinear path
+     fsr1Constants.squaredRadius =
+-        State::Instance().currentFeature->TargetWidth() < State::Instance().currentFeature->DisplayWidth() ? UINT32_MAX
+-                                                                                                           : 0;
++        InViewW < OutW ? UINT32_MAX : 0;
+ 
+-    constants.srcWidth = State::Instance().currentFeature->TargetWidth();
+-    constants.srcHeight = State::Instance().currentFeature->TargetHeight();
+-    constants.destWidth = State::Instance().currentFeature->DisplayWidth();
+-    constants.destHeight = State::Instance().currentFeature->DisplayHeight();
++    constants.srcWidth = InViewW;
++    constants.srcHeight = InViewH;
++    constants.destWidth = OutW;
++    constants.destHeight = OutH;
+ 
+     // fsr upscaling
+     bool createdConstantsBuffer = false;
+-    if (Config::Instance()->OutputScalingDownscaler.value_or_default() == Scaler::FSR1)
++    if (_fsr1)
+     {
+         createdConstantsBuffer = CreateConstantsBuffer(_device, currentHeap, fsr1Constants, currentHeap.GetCbvCPU(0));
+     }
+@@ -110,16 +117,15 @@ bool OS_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InR
+     UINT dispatchWidth = 0;
+     UINT dispatchHeight = 0;
+ 
+-    dispatchWidth =
+-        static_cast<UINT>((State::Instance().currentFeature->DisplayWidth() + InNumThreadsX - 1) / InNumThreadsX);
+-    dispatchHeight = (State::Instance().currentFeature->DisplayHeight() + InNumThreadsY - 1) / InNumThreadsY;
++    dispatchWidth = static_cast<UINT>((OutW + InNumThreadsX - 1) / InNumThreadsX);
++    dispatchHeight = (OutH + InNumThreadsY - 1) / InNumThreadsY;
+ 
+     InCmdList->Dispatch(dispatchWidth, dispatchHeight, 1);
+ 
+     return true;
+ }
+ 
+-OS_Dx12::OS_Dx12(std::string InName, ID3D12Device* InDevice, bool InUpsample)
++OS_Dx12::OS_Dx12(std::string InName, ID3D12Device* InDevice, bool InUpsample, bool InForceFsr1)
+     : Shader_Dx12(InName, InDevice), _upsample(InUpsample)
+ {
+     if (InDevice == nullptr)
+@@ -140,7 +146,8 @@ OS_Dx12::OS_Dx12(std::string InName, ID3D12Device* InDevice, bool InUpsample)
+         return;
+     }
+ 
+-    auto downscalerConfig = Config::Instance()->OutputScalingDownscaler.value_or_default();
++    auto downscalerConfig = InForceFsr1 ? Scaler::FSR1 : Config::Instance()->OutputScalingDownscaler.value_or_default();
++    _fsr1 = downscalerConfig == Scaler::FSR1;
+ 
+     const void* csoData = nullptr;
+     size_t csoSize = 0;
+diff --git a/OptiScaler/shaders/output_scaling/OS_Dx12.h b/OptiScaler/shaders/output_scaling/OS_Dx12.h
+index 661d059e..c02f6477 100644
+--- a/OptiScaler/shaders/output_scaling/OS_Dx12.h
++++ b/OptiScaler/shaders/output_scaling/OS_Dx12.h
+@@ -11,6 +11,7 @@ class OS_Dx12 : public Shader_Dx12
+ {
+   private:
+     bool _upsample = false;
++    bool _fsr1 = false; // 0024b: the FSR 1 EASU pipeline was built (constants follow the pipeline, not today's config)
+ 
+     FrameDescriptorHeap _frameHeaps[OS_NUM_OF_HEAPS];
+ 
+@@ -25,12 +26,15 @@ class OS_Dx12 : public Shader_Dx12
+                               D3D12_RESOURCE_STATES InState);
+     void SetBufferState(ID3D12GraphicsCommandList* InCommandList, D3D12_RESOURCE_STATES InState);
+     bool Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InResource, ID3D12Resource* OutResource);
++    // 0024b: explicit sizes: the input's viewport (the render size), the input texture's own size, the output size
++    bool DispatchSized(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InResource, ID3D12Resource* OutResource,
++                       uint32_t InViewW, uint32_t InViewH, uint32_t InTexW, uint32_t InTexH, uint32_t OutW, uint32_t OutH);
+ 
+     ID3D12Resource* Buffer() { return _buffer; }
+     bool IsUpsampling() const { return _upsample; }
+     bool CanRender() const { return _init && _buffer != nullptr; }
+ 
+-    OS_Dx12(std::string InName, ID3D12Device* InDevice, bool InUpsample);
++    OS_Dx12(std::string InName, ID3D12Device* InDevice, bool InUpsample, bool InForceFsr1 = false);
+ 
+     ~OS_Dx12();
+ };
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp
+index e6331c72..d7eab9b2 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp
++++ b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp
+@@ -7,6 +7,7 @@
+ #include <Util.h>
+ #include <shaders/Shader_Common.h>
+ #include <MathUtils.h>
++#include <shaders/output_scaling/OS_Dx12.h>
+ 
+ #include <d3dcompiler.h>
+ #include <algorithm>
+@@ -944,6 +945,52 @@ bool SGSR2FeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList
+                         (D3D12_RESOURCE_STATES) Config::Instance()->MaskResourceBarrier.value(),
+                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+ 
++    // Vela 0.8.22 (0024b, lead 2026-11-11): no depth -> no SGSR 2. Its no-depth permutation drew Manor Lords' 3D scene ~4.5x darker
++    // (frame luma 17 vs 76 on FSR 4; SGSR 2 WITH depth was fine, 83), and without depth its history can only ghost. A plain spatial
++    // upscale of the game's colour instead: FSR 1 EASU, no history, the colour as the game gave it (no pre-exposure maths).
++    // OPTI_VELA_NODEPTH_HISTORY=1 keeps the old SGSR 2 no-depth path for comparisons.
++    static const bool keepSgsr2NoDepth = std::getenv("OPTI_VELA_NODEPTH_HISTORY") != nullptr;
++    if (paramDepth == nullptr && !keepSgsr2NoDepth)
++    {
++        if (_spatial == nullptr)
++            _spatial = std::make_unique<OS_Dx12>("Vela no-depth FSR1", Device, true, true);
++        const bool direct = (paramOutput->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
++        ID3D12Resource* target = direct ? paramOutput : _outputBuffer;
++        if (direct && outputState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
++            ResourceBarrier(InCommandList, paramOutput, (D3D12_RESOURCE_STATES) outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++        const auto cd = paramColor->GetDesc();
++        const bool ok = _spatial->DispatchSized(InCommandList, paramColor, target, RenderWidth(), RenderHeight(), (uint32_t) cd.Width,
++                                                cd.Height, TargetWidth(), TargetHeight());
++        if (!_loggedSpatial)
++        {
++            _loggedSpatial = true;
++            LOG_INFO("Vela: no depth buffer: FSR 1 EASU of the colour {0}x{1} -> {2}x{3} instead of SGSR 2 (no history, no ghosting){4}",
++                     RenderWidth(), RenderHeight(), TargetWidth(), TargetHeight(), ok ? "" : " -- FAILED to dispatch");
++        }
++        if (direct)
++        {
++            if (outputState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
++                ResourceBarrier(InCommandList, paramOutput, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, (D3D12_RESOURCE_STATES) outputState);
++        }
++        else
++        {
++            ResourceBarrier(InCommandList, _outputBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
++            ResourceBarrier(InCommandList, paramOutput, (D3D12_RESOURCE_STATES) outputState, D3D12_RESOURCE_STATE_COPY_DEST);
++            InCommandList->CopyResource(paramOutput, _outputBuffer);
++            ResourceBarrier(InCommandList, _outputBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++            ResourceBarrier(InCommandList, paramOutput, D3D12_RESOURCE_STATE_COPY_DEST, (D3D12_RESOURCE_STATES) outputState);
++        }
++        ResourceBarrier(InCommandList, paramColor, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, (D3D12_RESOURCE_STATES) colorState);
++        ResourceBarrier(InCommandList, paramVelocity, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, (D3D12_RESOURCE_STATES) mvState);
++        if (paramReactive != nullptr && Config::Instance()->MaskResourceBarrier.has_value())
++            ResourceBarrier(InCommandList, paramReactive, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                            (D3D12_RESOURCE_STATES) Config::Instance()->MaskResourceBarrier.value());
++        _historyValid = false; // depth may come back: SGSR 2 then starts from a fresh history
++        _ringIndex = (_ringIndex + 1) % FrameRingDepth;
++        _frameCount++;
++        return ok;
++    }
++
+     if (_constants.debugMode == 5u)
+         DumpVelocity(InCommandList, paramVelocity);
+ 
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.h b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.h
+index 7a63d7c3..55b83020 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.h
++++ b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.h
+@@ -82,6 +82,9 @@ class SGSR2FeatureDx12 : public SGSR2Feature, public IFeature_Dx12
+     // Whether the "no depth buffer" warning has been emitted; it is the same
+     // every frame and only useful once.
+     bool _loggedNoDepth = false;
++    // 0024b: a context without depth: FSR 1 EASU of the colour instead of SGSR 2 (whose no-depth path drew Manor Lords' scene dark)
++    std::unique_ptr<OS_Dx12> _spatial;
++    bool _loggedSpatial = false;
+ 
+     // GPU timing, opt-in via OPTI_SGSR2_TIMING=1.
+     static constexpr uint32_t TimestampsPerFrame = 4;
+-- 
+2.54.0.windows.1
+

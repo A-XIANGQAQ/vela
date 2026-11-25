@@ -1,0 +1,27 @@
+From 2296167f775855bcbdadd271114c7121a87adfe0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 15:52:35 +0100
+Subject: [PATCH 42/65] 0040-vela-vk-live fix: NVNGX_DLSS_Vk.cpp includes
+ nvsdk_ngx_vk.h for NVSDK_NGX_Resource_VK (the per-handle format line)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit d90faddce28ad43ea91c71b81e8c363a34cf0d83)
+---
+ OptiScaler/inputs/NVNGX_DLSS_Vk.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+index 8824dd32..4f660176 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+@@ -16,6 +16,7 @@
+ #include <ankerl/unordered_dense.h>
+ #include <imgui/ImGuiNotify.hpp>
+ #include <misc/IdentifyGpu.h>
++#include "nvsdk_ngx_vk.h"
+ #include <upscalers/sgsr3/VelaLive.h>
+ 
+ VkInstance vkInstance;
+-- 
+2.54.0.windows.1
+

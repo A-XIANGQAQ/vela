@@ -1,0 +1,668 @@
+From ca3db4e1fafd0e3a22ecce2a502fdca86673a4ab Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 11:47:03 +0100
+Subject: [PATCH 39/65] 0038-vela-ue-xess-depth: port of upstream OptiScaler
+ 7e94156 (2026-11-17, Extract depth and MVs for XeSS inputs in Unreal Engine
+ games; no follow-up fixes upstream up to 2026-11-22): in an Unreal game the
+ XeSS input finds the UE XeSS plugin's velocity flattening (texture names
+ Upscaled Velocity Texture / XeSS::FlattenedVelocity / XeSS::UpscaledVelocity
+ in the exe or an *xess* module), records its SceneDepth FRDGTexture, resolves
+ the ID3D12Resource behind it and copies it (R32F, DS shader) in queue order
+ right before the command list that runs XeSS; only an XeSS execute without
+ depth gets the copy (DepthInverted set for it, OptiScaler.DepthState =
+ NON_PIXEL_SHADER_RESOURCE, honoured by SGSR 2 / SGSR 3 / frame generation).
+ ARM64EC changes: no SEH (VirtualQuery-checked reads), local scanner helpers
+ with the function start from the game's x64 .pdata, a present-counted release
+ queue instead of DeferredRelease. VELA_UE_XESS_DEPTH=0 = off (default on);
+ upstream's render-size motion vectors (GetSecondaryViewRectSize hook,
+ bUpsample=false) are opt-in with VELA_UE_XESS_RENDER_MV=1. Vela depth lines:
+ capture on/off once, plugin not found once, per XeSS context: copy used
+ (size, format), stopped / back, not found in 120 frames
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit af75c1d1ec6938c233797f6f36f49e13d63f5803)
+---
+ OptiScaler/OptiTypes.h                        |   2 +-
+ OptiScaler/inputs/XeSS_Dx12.cpp               |  66 +++-
+ OptiScaler/inputs/XeSS_UE_Dx12.cpp            | 297 ++++++++++++++++--
+ OptiScaler/inputs/XeSS_UE_Dx12.h              |   3 +
+ OptiScaler/shaders/depth_scale/DS_Dx12.h      |   4 +-
+ .../upscalers/sgsr2/SGSR2Feature_Dx12.cpp     |   6 +
+ .../upscalers/sgsr3/SGSR3Feature_Dx12.cpp     |   6 +
+ 7 files changed, 351 insertions(+), 33 deletions(-)
+
+diff --git a/OptiScaler/OptiTypes.h b/OptiScaler/OptiTypes.h
+index a7f96018..090a84a4 100644
+--- a/OptiScaler/OptiTypes.h
++++ b/OptiScaler/OptiTypes.h
+@@ -29,7 +29,7 @@ inline constexpr CString FSR_ViewSpaceToMetersFactor = "FSR.viewSpaceToMetersFac
+ inline constexpr CString FSR_TransparencyAndComp = "FSR.transparencyAndComposition";
+ inline constexpr CString FSR_Reactive = "FSR.reactive";
+ 
+-// D3D12_RESOURCE_STATES the depth input is in, 0 when unknown
++// D3D12_RESOURCE_STATES the depth input is in, 0 when unknown (0038, upstream 7e94156: the UE XeSS scene depth copy)
+ inline constexpr CString DepthState = "OptiScaler.DepthState";
+ 
+ } // namespace OptiKeys
+diff --git a/OptiScaler/inputs/XeSS_Dx12.cpp b/OptiScaler/inputs/XeSS_Dx12.cpp
+index 918cd9a3..31a84de7 100644
+--- a/OptiScaler/inputs/XeSS_Dx12.cpp
++++ b/OptiScaler/inputs/XeSS_Dx12.cpp
+@@ -20,6 +20,19 @@ static bool _nvngxInited = false;
+ // Motion vector resolution the feature was created with
+ static std::unordered_map<xess_context_handle_t, bool> _lowResMVs;
+ 
++// 0038 (upstream 7e94156): motion vector resolution the feature was created with
++static std::unordered_map<xess_context_handle_t, bool> _lowResMVs;
++
++// 0038: per context, what the UE scene depth capture gave (logged once each)
++struct VelaUeDepth
++{
++    uint64_t executes = 0;
++    bool found = false;
++    bool lost = false;
++    bool notFoundLogged = false;
++};
++static std::unordered_map<xess_context_handle_t, VelaUeDepth> _velaUeDepth;
++
+ static bool CreateDLSSContext(xess_context_handle_t handle, ID3D12GraphicsCommandList* commandList,
+                               const xess_d3d12_execute_params_t* pExecParams, bool lowResMVs)
+ {
+@@ -37,8 +50,9 @@ static bool CreateDLSSContext(xess_context_handle_t handle, ID3D12GraphicsComman
+     if ((initParams->initFlags & XESS_INIT_FLAG_LDR_INPUT_COLOR) == 0)
+         initFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+ 
+-    // Unreal Engine renders with reversed Z
+-    if ((initParams->initFlags & XESS_INIT_FLAG_INVERTED_DEPTH) || XeSSUnreal::Hooked())
++    // 0038 (upstream 7e94156): Unreal Engine renders with reversed Z; only for the captured depth (the game gave none)
++    if ((initParams->initFlags & XESS_INIT_FLAG_INVERTED_DEPTH) ||
++        (XeSSUnreal::Hooked() && pExecParams->pDepthTexture == nullptr))
+         initFlags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+ 
+     if (initParams->initFlags & XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE)
+@@ -153,6 +167,11 @@ xess_result_t hk_xessD3D12CreateContext(ID3D12Device* pDevice, xess_context_hand
+         _nvngxInited = true;
+     }
+ 
++    // 0038: an Unreal game's XeSS plugin sends no depth with display-size motion vectors; find its velocity flattening
++    // for the scene depth (VELA_UE_XESS_DEPTH=0: off)
++    if (State::Instance().gameEngine == GameEngineType::Unreal)
++        XeSSUnreal::Hook();
++
+     _d3d12Device = pDevice;
+     *phContext = (xess_context_handle_t) ++_handleCounter;
+ 
+@@ -214,12 +233,51 @@ xess_result_t hk_xessD3D12Execute(xess_context_handle_t hContext, ID3D12Graphics
+     auto depthState = D3D12_RESOURCE_STATE_COMMON;
+     auto ueSceneDepth = false;
+ 
+-    // Captured scene depth shares the scene color's view rect
++    // 0038 (upstream 7e94156): only when the game gave no depth. Captured scene depth shares the scene color's view rect
+     if (depth == nullptr && XeSSUnreal::Hooked())
+     {
+         depth = XeSSUnreal::SceneDepth(pCommandList, pExecParams, depthState);
+         depthBase = pExecParams->inputColorBase;
+         ueSceneDepth = depth != nullptr;
++
++        auto& vd = _velaUeDepth[hContext];
++        vd.executes++;
++
++        if (ueSceneDepth && !vd.found)
++        {
++            vd.found = true;
++            auto dd = depth->GetDesc();
++            LOG_INFO("Vela depth: XeSS context {0:X} came without depth: the UE scene depth copy ({1}x{2} fmt {3}, from "
++                     "the plugin's velocity flattening) is its depth (VELA_UE_XESS_DEPTH)",
++                     (size_t) hContext, dd.Width, dd.Height, (int) dd.Format);
++        }
++        else if (!ueSceneDepth && vd.found && !vd.lost)
++        {
++            vd.lost = true;
++            LOG_WARN("Vela depth: XeSS context {0:X}: the UE scene depth copy stopped; frames go without depth until it "
++                     "is back",
++                     (size_t) hContext);
++        }
++        else if (ueSceneDepth && vd.lost)
++        {
++            vd.lost = false;
++            LOG_INFO("Vela depth: XeSS context {0:X}: the UE scene depth copy is back", (size_t) hContext);
++        }
++        else if (!vd.found && !vd.notFoundLogged && vd.executes == 120)
++        {
++            vd.notFoundLogged = true;
++            LOG_WARN("Vela depth: XeSS context {0:X} came without depth and no UE scene depth was found in 120 frames: "
++                     "the no-depth path stays",
++                     (size_t) hContext);
++        }
++    }
++    else if (depth == nullptr && State::Instance().gameEngine == GameEngineType::Unreal &&
++             !_velaUeDepth[hContext].notFoundLogged)
++    {
++        _velaUeDepth[hContext].notFoundLogged = true;
++        LOG_INFO("Vela depth: XeSS context {0:X} came without depth; the UE XeSS plugin was not hooked{1}: the no-depth "
++                 "path stays",
++                 (size_t) hContext, XeSSUnreal::Enabled() ? "" : " (VELA_UE_XESS_DEPTH=0)");
+     }
+ 
+     auto initParams = &_d3d12InitParams[hContext];
+@@ -292,7 +350,7 @@ xess_result_t hk_xessD3D12Execute(xess_context_handle_t hContext, ID3D12Graphics
+     params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, pExecParams->inputHeight);
+     params->Set(NVSDK_NGX_Parameter_Depth, depth);
+ 
+-    // The captured depth is left in whatever read state the engine chose, frame generation transitions from it
++    // 0038: the captured depth is in NON_PIXEL_SHADER_RESOURCE; the upscalers and frame generation transition from it
+     params->Set(OptiKeys::DepthState, ueSceneDepth ? (unsigned int) depthState : 0u);
+     params->Set(NVSDK_NGX_Parameter_ExposureTexture, pExecParams->pExposureScaleTexture);
+ 
+diff --git a/OptiScaler/inputs/XeSS_UE_Dx12.cpp b/OptiScaler/inputs/XeSS_UE_Dx12.cpp
+index 1e84eafd..13ce9e29 100644
+--- a/OptiScaler/inputs/XeSS_UE_Dx12.cpp
++++ b/OptiScaler/inputs/XeSS_UE_Dx12.cpp
+@@ -5,12 +5,39 @@
+ 
+ #include <psapi.h>
+ #include <detours/detours.h>
+-#include <misc/DeferredRelease.h>
+-#include <scanner/scanner.h>
+ #include <shaders/depth_scale/DS_Dx12.h>
+ 
++#include <array>
++#include <atomic>
++#include <filesystem>
++#include <mutex>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++// Vela 0038: port of upstream OptiScaler 7e94156 (2026-11-17, "Extract depth and MVs for XeSS inputs in Unreal Engine
++// games"; no upstream follow-ups to it as of 2026-11-22). Changes for the ARM64EC build:
++// - no SEH (__try is not used anywhere in this build): SafeRead checks the range with VirtualQuery first
++// - the scanner helpers (wide string, lea rip reference, function start from the module's x64 .pdata) are local, and
++//   the function start reads the game's exception directory itself instead of RtlLookupFunctionEntry
++// - DeferredRelease (not in our base) is a small release queue counted in presents
++// - VELA_UE_XESS_DEPTH=0 turns the whole capture off (default on); the render-size motion vectors upstream also makes
++//   (GetSecondaryViewRectSize hook, bUpsample = false) change the game's own pass, so they are opt-in:
++//   VELA_UE_XESS_RENDER_MV=1
++// - the capture only feeds an XeSS execute that came without depth (XeSS_Dx12.cpp)
++
+ namespace
+ {
++bool VelaRenderMV()
++{
++    static const bool on = []
++    {
++        const char* e = std::getenv("VELA_UE_XESS_RENDER_MV");
++        return e != nullptr && e[0] == '1';
++    }();
++    return on;
++}
++
+ // Most plugin versions have a function shaped like
+ // FRDGTextureRef (FRDGBuilder&, FRDGTextureRef SceneDepth, FRDGTextureRef SceneVelocity, const FViewInfo&)
+ // that names the flattened velocity texture. The stack arguments are passed through in case a build has more.
+@@ -136,31 +163,213 @@ PFN_ExecuteCommandLists o_ExecuteCommandLists = nullptr;
+ 
+ bool IsUserPointer(uintptr_t value) { return value >= 0x10000 && value < 0x7FFFFFFF0000 && (value & 7) == 0; }
+ 
+-// Engine memory can already be freed and reused
++// Vela: the committed, readable region a read was last checked in. Reset at the start of every probe, so a region the
++// engine released since cannot be taken from the cache
++thread_local uintptr_t t_readableBase = 0;
++thread_local uintptr_t t_readableEnd = 0;
++
++void ResetReadCache() { t_readableBase = t_readableEnd = 0; }
++
++bool IsReadable(uintptr_t address, size_t size)
++{
++    for (int region = 0; region < 4 && size != 0; region++)
++    {
++        if (address < t_readableBase || address >= t_readableEnd)
++        {
++            MEMORY_BASIC_INFORMATION mbi {};
++
++            if (VirtualQuery((LPCVOID) address, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
++                (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 || (mbi.Protect & 0xFF) == PAGE_EXECUTE ||
++                mbi.Protect == 0)
++            {
++                return false;
++            }
++
++            t_readableBase = (uintptr_t) mbi.BaseAddress;
++            t_readableEnd = t_readableBase + mbi.RegionSize;
++        }
++
++        auto inRegion = std::min<size_t>(size, t_readableEnd - address);
++        address += inRegion;
++        size -= inRegion;
++    }
++
++    return size == 0;
++}
++
++// Engine memory can already be freed and reused (no SEH in this build: the range is checked first)
+ template <typename T> bool SafeRead(uintptr_t address, T& out)
+ {
+-    __try
++    if (!IsReadable(address, sizeof(T)))
++        return false;
++
++    memcpy(&out, (const void*) address, sizeof(T));
++    return true;
++}
++
++// Called only on an object whose first field is the vtable of a known ID3D12Resource
++bool SafeGetDesc(ID3D12Resource* resource, D3D12_RESOURCE_DESC& desc)
++{
++    desc = resource->GetDesc();
++    return true;
++}
++
++// Vela: DeferredRelease is not in our base. A replaced candidate can still be in command lists the GPU runs, so it is
++// released some presents later
++std::vector<std::pair<ID3D12Resource*, uint64_t>> _toRelease;
++
++void DeferRelease(ID3D12Resource* resource) { _toRelease.push_back({ resource, State::Instance().frameCount }); }
++
++void ReleaseDeferred()
++{
++    auto now = State::Instance().frameCount;
++
++    for (size_t i = 0; i < _toRelease.size();)
+     {
+-        memcpy(&out, (const void*) address, sizeof(T));
+-        return true;
++        if (now - _toRelease[i].second > 16 || _toRelease.size() > 64)
++        {
++            _toRelease[i].first->Release();
++            _toRelease.erase(_toRelease.begin() + i);
++            continue;
++        }
++
++        i++;
+     }
+-    __except (EXCEPTION_EXECUTE_HANDLER)
++}
++
++// Vela: the scanner helpers upstream added in the same commit, local here
++struct SectionRange
++{
++    uint8_t* start;
++    uint8_t* end;
++};
++
++std::vector<SectionRange> GetSections(HMODULE module, bool executable)
++{
++    std::vector<SectionRange> sections;
++    auto base = (uint8_t*) module;
++    auto dos = (IMAGE_DOS_HEADER*) base;
++
++    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
++        return sections;
++
++    auto nt = (IMAGE_NT_HEADERS64*) (base + dos->e_lfanew);
++
++    if (nt->Signature != IMAGE_NT_SIGNATURE)
++        return sections;
++
++    auto first = IMAGE_FIRST_SECTION(nt);
++
++    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++)
+     {
+-        return false;
++        auto& s = first[i];
++        auto isExecutable = (s.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
++
++        if (executable ? isExecutable : !isExecutable && (s.Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA))
++            sections.push_back({ base + s.VirtualAddress, base + s.VirtualAddress + s.Misc.VirtualSize });
+     }
++
++    return sections;
+ }
+ 
+-bool SafeGetDesc(ID3D12Resource* resource, D3D12_RESOURCE_DESC& desc)
++// Null terminated wide string in the module's initialized data
++uintptr_t FindWideString(HMODULE module, std::wstring_view text)
++{
++    // Includes the terminator so a longer string with the same prefix doesn't match
++    auto needle = reinterpret_cast<const uint8_t*>(text.data());
++    auto needleSize = (text.size() + 1) * sizeof(wchar_t);
++
++    for (auto& section : GetSections(module, false))
++    {
++        auto found = std::search(section.start, section.end, needle, needle + needleSize);
++
++        if (found != section.end)
++            return reinterpret_cast<uintptr_t>(found);
++    }
++
++    return 0;
++}
++
++// First lea r64, [rip + disp32] in the module's code that loads target
++uintptr_t FindRipReference(HMODULE module, uintptr_t target)
+ {
+-    __try
++    for (auto& section : GetSections(module, true))
+     {
+-        desc = resource->GetDesc();
+-        return true;
++        for (auto p = section.start; p + 7 <= section.end; p++)
++        {
++            if ((p[0] != 0x48 && p[0] != 0x4C) || p[1] != 0x8D || (p[2] & 0xC7) != 0x05)
++                continue;
++
++            if (reinterpret_cast<uintptr_t>(p + 7) + *reinterpret_cast<int32_t*>(p + 3) == target)
++                return reinterpret_cast<uintptr_t>(p);
++        }
++    }
++
++    return 0;
++}
++
++// Start of the x64 function containing address, the first chunk of a split function, from the module's own exception
++// directory (the game is x64; RtlLookupFunctionEntry from ARM64EC code is not relied on)
++uintptr_t GetFunctionStart(HMODULE module, uintptr_t address)
++{
++    struct X64RuntimeFunction
++    {
++        DWORD begin;
++        DWORD end;
++        DWORD unwind;
++    };
++
++    auto base = (uint8_t*) module;
++    auto dos = (IMAGE_DOS_HEADER*) base;
++    auto nt = (IMAGE_NT_HEADERS64*) (base + dos->e_lfanew);
++
++    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
++        nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXCEPTION)
++    {
++        return 0;
+     }
+-    __except (EXCEPTION_EXECUTE_HANDLER)
++
++    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
++    auto functions = (const X64RuntimeFunction*) (base + dir.VirtualAddress);
++    size_t count = dir.Size / sizeof(X64RuntimeFunction);
++    auto rva = (DWORD) (address - (uintptr_t) base);
++
++    size_t low = 0;
++    size_t high = count;
++    const X64RuntimeFunction* function = nullptr;
++
++    while (low < high)
+     {
+-        return false;
++        auto mid = (low + high) / 2;
++
++        if (rva < functions[mid].begin)
++            high = mid;
++        else if (rva >= functions[mid].end)
++            low = mid + 1;
++        else
++        {
++            function = &functions[mid];
++            break;
++        }
++    }
++
++    // UNWIND_INFO: version and flags, prolog size, code count, frame; UNW_FLAG_CHAININFO (4) puts the parent function's
++    // RUNTIME_FUNCTION after the (even padded) unwind codes
++    for (int depth = 0; function != nullptr && depth < 32; depth++)
++    {
++        auto unwind = base + (function->unwind & ~1u);
++
++        if ((unwind[0] >> 3) & 4)
++        {
++            auto codes = (unwind[2] + 1) & ~1;
++            function = (const X64RuntimeFunction*) (unwind + 4 + codes * 2);
++            continue;
++        }
++
++        return (uintptr_t) base + function->begin;
+     }
++
++    return 0;
+ }
+ 
+ // FRDGTexture { vtable, const TCHAR* Name, FRHIResource* ResourceRHI } in UE 4.26+ and UE 5
+@@ -313,7 +522,7 @@ int AddCandidateLocked(ID3D12Resource* depth)
+     if (previous != nullptr)
+     {
+         _queueStates.erase(previous);
+-        DeferredRelease::Release(previous);
++        DeferRelease(previous);
+     }
+     else
+     {
+@@ -529,6 +738,7 @@ void STDMETHODCALLTYPE hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumC
+ 
+     {
+         std::scoped_lock lock(_mutex);
++        ReleaseDeferred();
+         UINT start = 0;
+ 
+         for (UINT i = 0; i < NumCommandLists; i++)
+@@ -681,6 +891,7 @@ void ProbeSceneDepth()
+ {
+     static std::mutex mutex;
+     std::scoped_lock lock(mutex);
++    ResetReadCache();
+ 
+     auto vtable = _resourceVtable.load();
+ 
+@@ -761,6 +972,7 @@ int32_t* __fastcall hkGetSecondaryViewRectSize(void* view, int32_t* outSize, voi
+ 
+ void RecordSceneDepth(void* sceneDepth)
+ {
++    ResetReadCache();
+     RdgTexture rdg {};
+     std::wstring name;
+ 
+@@ -810,7 +1022,9 @@ void* __fastcall hkFlattenVelocity(void* graphBuilder, void* sceneDepth, void* s
+     if (name == _xessVelocityName)
+     {
+         RecordSceneDepth(sceneDepth);
+-        upsample = false;
++
++        if (VelaRenderMV())
++            upsample = false;
+     }
+ 
+     return o_FlattenVelocity(graphBuilder, sceneDepth, sceneVelocity, view, name, event, upsample);
+@@ -835,6 +1049,7 @@ template <typename Visitor> void WalkInstructions(uintptr_t start, uintptr_t end
+ // Target of call rel32 or call [rip + disp32], the latter being how modular builds call other modules' exports
+ uintptr_t CallTarget(uintptr_t address, uintptr_t next)
+ {
++    ResetReadCache();
+     auto code = (uint8_t*) address;
+ 
+     if (code[0] == 0xE8)
+@@ -1054,7 +1269,7 @@ bool HookModule(HMODULE module)
+     uintptr_t name = 0;
+     for (auto textureName : { L"Upscaled Velocity Texture", L"XeSS::FlattenedVelocity", L"XeSS::UpscaledVelocity" })
+     {
+-        name = scanner::FindWideString(module, textureName);
++        name = FindWideString(module, textureName);
+         if (name != 0)
+             break;
+     }
+@@ -1062,14 +1277,14 @@ bool HookModule(HMODULE module)
+     if (name == 0)
+         return false;
+ 
+-    auto reference = scanner::FindRipReference(module, name);
++    auto reference = FindRipReference(module, name);
+     if (reference == 0)
+     {
+         LOG_WARN("Found the XeSS plugin's velocity texture name but no code referencing it");
+         return false;
+     }
+ 
+-    auto function = scanner::GetFunctionStart(reference);
++    auto function = GetFunctionStart(module, reference);
+     if (function == 0)
+     {
+         LOG_WARN("No function entry for the XeSS plugin's velocity flattening at {:X}", reference);
+@@ -1097,9 +1312,8 @@ bool HookModule(HMODULE module)
+         DetourAttach(&(PVOID&) o_FlattenVelocity, hkFlattenVelocity);
+         DetourTransactionCommit();
+ 
+-        LOG_INFO("Hooked the UE XeSS plugin's velocity flattening at {:X}, called from {:X}, for scene depth and "
+-                 "render resolution motion vectors",
+-                 flattening, function);
++        LOG_INFO("Hooked the UE XeSS plugin's velocity flattening at {:X}, called from {:X}, for scene depth{}", flattening,
++                 function, VelaRenderMV() ? " and render resolution motion vectors" : "");
+ 
+         return true;
+     }
+@@ -1110,7 +1324,7 @@ bool HookModule(HMODULE module)
+ 
+     o_AddVelocityFlatteningXeSSPass = (PFN_AddVelocityFlatteningXeSSPass) function;
+ 
+-    if (getSecondaryViewRectSize != 0 && viewRectOffset > 0)
++    if (getSecondaryViewRectSize != 0 && viewRectOffset > 0 && VelaRenderMV())
+     {
+         o_GetSecondaryViewRectSize = (PFN_GetSecondaryViewRectSize) getSecondaryViewRectSize;
+         _viewRectOffset = viewRectOffset;
+@@ -1132,8 +1346,8 @@ bool HookModule(HMODULE module)
+             "Hooked GetSecondaryViewRectSize at {:X}, View.ViewRect at +{:X}, for render resolution motion vectors",
+             getSecondaryViewRectSize, viewRectOffset);
+     else
+-        LOG_WARN("GetSecondaryViewRectSize: {:X}, View.ViewRect: +{:X}, motion vectors stay at display resolution",
+-                 getSecondaryViewRectSize, viewRectOffset);
++        LOG_INFO("GetSecondaryViewRectSize: {:X}, View.ViewRect: +{:X}, motion vectors stay at display resolution{}",
++                 getSecondaryViewRectSize, viewRectOffset, VelaRenderMV() ? "" : " (VELA_UE_XESS_RENDER_MV off)");
+ 
+     return true;
+ }
+@@ -1141,8 +1355,26 @@ bool HookModule(HMODULE module)
+ 
+ // Monolithic builds have the plugin in the exe. Modular builds load it as separate modules
+ // (<Project>-XeSSPrePass-Win64-Shipping.dll), only present once the engine loads its plugins.
++bool XeSSUnreal::Enabled()
++{
++    static const bool on = []
++    {
++        const char* e = std::getenv("VELA_UE_XESS_DEPTH");
++        const bool enabled = e == nullptr || e[0] != '0';
++        LOG_INFO("Vela depth: UE XeSS depth capture {} (VELA_UE_XESS_DEPTH {}), render-size motion vectors {} "
++                 "(VELA_UE_XESS_RENDER_MV)",
++                 enabled ? "on" : "off", e == nullptr ? std::string("unset") : std::string(e),
++                 VelaRenderMV() ? "on" : "off");
++        return enabled;
++    }();
++    return on;
++}
++
+ void XeSSUnreal::Hook()
+ {
++    if (!Enabled())
++        return;
++
+     static std::mutex mutex;
+     static std::unordered_set<HMODULE> checkedModules;
+ 
+@@ -1159,8 +1391,11 @@ void XeSSUnreal::Hook()
+     std::vector<HMODULE> modules(1024);
+     DWORD needed = 0;
+ 
+-    if (!EnumProcessModules(GetCurrentProcess(), modules.data(), (DWORD) (modules.size() * sizeof(HMODULE)), &needed))
++    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), (DWORD) (modules.size() * sizeof(HMODULE)),
++                               &needed))
++    {
+         return;
++    }
+ 
+     modules.resize(std::min<size_t>(modules.size(), needed / sizeof(HMODULE)));
+ 
+@@ -1185,6 +1420,16 @@ void XeSSUnreal::Hook()
+         if (HookModule(module))
+             return;
+     }
++
++    static bool logged = false;
++
++    if (!logged)
++    {
++        logged = true;
++        LOG_INFO("Vela depth: UE XeSS: the plugin's velocity flattening was not found in the exe or an *xess* module "
++                 "({} modules): XeSS contexts without depth keep the no-depth path",
++                 modules.size());
++    }
+ }
+ 
+ bool XeSSUnreal::Hooked() { return o_AddVelocityFlatteningXeSSPass != nullptr || o_FlattenVelocity != nullptr; }
+diff --git a/OptiScaler/inputs/XeSS_UE_Dx12.h b/OptiScaler/inputs/XeSS_UE_Dx12.h
+index 27ff7c75..e920bbb8 100644
+--- a/OptiScaler/inputs/XeSS_UE_Dx12.h
++++ b/OptiScaler/inputs/XeSS_UE_Dx12.h
+@@ -12,6 +12,9 @@ namespace XeSSUnreal
+ // Finds and hooks the plugin's velocity flattening, called whenever the game sets up XeSS
+ void Hook();
+ 
++// Vela 0038: VELA_UE_XESS_DEPTH is not 0 (default on), logged once
++bool Enabled();
++
+ // The plugin was found, its depth is reversed Z
+ bool Hooked();
+ 
+diff --git a/OptiScaler/shaders/depth_scale/DS_Dx12.h b/OptiScaler/shaders/depth_scale/DS_Dx12.h
+index abc4659c..34f98b98 100644
+--- a/OptiScaler/shaders/depth_scale/DS_Dx12.h
++++ b/OptiScaler/shaders/depth_scale/DS_Dx12.h
+@@ -7,7 +7,7 @@
+ #include <shaders/Shader_Dx12Utils.h>
+ #include <shaders/Shader_Dx12.h>
+ 
+-#define DS_NUM_OF_HEAPS 8
++#define DS_NUM_OF_HEAPS 8 // 0038: the UE XeSS depth copy keeps up to 8 lists in flight
+ 
+ class DS_Dx12 : public Shader_Dx12
+ {
+@@ -26,7 +26,7 @@ class DS_Dx12 : public Shader_Dx12
+     void SetBufferState(ID3D12GraphicsCommandList* InCommandList, D3D12_RESOURCE_STATES InState);
+     bool Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InResource, ID3D12Resource* OutResource);
+ 
+-    // Divides InResource by InDepthScale into OutResource over InWidth x InHeight pixels
++    // Divides InResource by InDepthScale into OutResource over InWidth x InHeight pixels (0038)
+     bool Dispatch(ID3D12GraphicsCommandList* InCmdList, ID3D12Resource* InResource, ID3D12Resource* OutResource,
+                   float InDepthScale, UINT InWidth, UINT InHeight);
+ 
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp
+index 5250cd91..c09cbd97 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp
++++ b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp
+@@ -940,6 +940,12 @@ bool SGSR2FeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList
+     // records that per-resource so it can be restored afterwards.
+     auto colorState = Config::Instance()->ColorResourceBarrier.value_or(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+     auto depthState = Config::Instance()->DepthResourceBarrier.value_or(D3D12_RESOURCE_STATE_DEPTH_WRITE);
++    {
++        // 0038: an input that knows the depth's state says so (the UE XeSS scene depth copy: NON_PIXEL_SHADER_RESOURCE)
++        unsigned int inputDepthState = 0;
++        if (InParameters->Get(OptiKeys::DepthState, &inputDepthState) == NVSDK_NGX_Result_Success && inputDepthState != 0)
++            depthState = (decltype(depthState)) inputDepthState;
++    }
+     auto mvState = Config::Instance()->MVResourceBarrier.value_or(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+     auto outputState = Config::Instance()->OutputResourceBarrier.value_or(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+ 
+diff --git a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
+index 9006dbae..f70e6736 100644
+--- a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
++++ b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
+@@ -917,6 +917,12 @@ bool SGSR3FeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList
+ 
+     auto colorState = Config::Instance()->ColorResourceBarrier.value_or(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+     auto depthState = Config::Instance()->DepthResourceBarrier.value_or(D3D12_RESOURCE_STATE_DEPTH_WRITE);
++    {
++        // 0038: an input that knows the depth's state says so (the UE XeSS scene depth copy: NON_PIXEL_SHADER_RESOURCE)
++        unsigned int inputDepthState = 0;
++        if (InParameters->Get(OptiKeys::DepthState, &inputDepthState) == NVSDK_NGX_Result_Success && inputDepthState != 0)
++            depthState = (decltype(depthState)) inputDepthState;
++    }
+     auto mvState = Config::Instance()->MVResourceBarrier.value_or(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+     auto outputState = Config::Instance()->OutputResourceBarrier.value_or(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+     const auto SRV = (D3D12_RESOURCE_STATES) (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+-- 
+2.54.0.windows.1
+

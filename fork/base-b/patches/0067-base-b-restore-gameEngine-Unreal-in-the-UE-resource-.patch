@@ -1,0 +1,112 @@
+From 8fc4dcee1d0afbc6dc38a748cccbacba5728bbc6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 25 Nov 2026 00:48:45 +0100
+Subject: [PATCH 67/69] base-b: restore gameEngine==Unreal in the UE
+ resource-barrier conditions (old base had it; upstream ba62a6fa narrowed it
+ to NGX engine UNREAL, so UE games using FSR2/FFX/XeSS inputs lost the UE
+ barrier handling)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/upscalers/IFeature_Dx11wDx12.cpp            | 1 +
+ OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp           | 2 ++
+ OptiScaler/upscalers/fsr2/FSR2Feature_Dx12.cpp         | 2 ++
+ OptiScaler/upscalers/fsr2_212/FSR2Feature_Dx12_212.cpp | 2 ++
+ OptiScaler/upscalers/xess/XeSSFeature_Dx12.cpp         | 2 ++
+ 5 files changed, 9 insertions(+)
+
+diff --git a/OptiScaler/upscalers/IFeature_Dx11wDx12.cpp b/OptiScaler/upscalers/IFeature_Dx11wDx12.cpp
+index a2c1e9e3..cb3d668c 100644
+--- a/OptiScaler/upscalers/IFeature_Dx11wDx12.cpp
++++ b/OptiScaler/upscalers/IFeature_Dx11wDx12.cpp
+@@ -242,6 +242,7 @@ bool IFeature_Dx11wDx12::Init(ID3D11Device* InDevice, ID3D11DeviceContext* InCon
+         return true;
+ 
+     if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
++        State::Instance().gameEngine == GameEngineType::Unreal ||
+         State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+     {
+         LOG_INFO("Dx11 detected, disabling UE resource barrier overrides");
+diff --git a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
+index 4a380a2c..f2a796c0 100644
+--- a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
++++ b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
+@@ -121,6 +121,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         }
+         else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
++                 State::Instance().gameEngine == GameEngineType::Unreal ||
+                  State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+         {
+             Config::Instance()->ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_RENDER_TARGET);
+@@ -151,6 +152,7 @@ bool FFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         }
+         else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
++                 State::Instance().gameEngine == GameEngineType::Unreal ||
+                  State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+         {
+             Config::Instance()->MVResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+diff --git a/OptiScaler/upscalers/fsr2/FSR2Feature_Dx12.cpp b/OptiScaler/upscalers/fsr2/FSR2Feature_Dx12.cpp
+index ea53a7bc..d54027ba 100644
+--- a/OptiScaler/upscalers/fsr2/FSR2Feature_Dx12.cpp
++++ b/OptiScaler/upscalers/fsr2/FSR2Feature_Dx12.cpp
+@@ -53,6 +53,7 @@ bool FSR2FeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         }
+         else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
++                 State::Instance().gameEngine == GameEngineType::Unreal ||
+                  State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+         {
+             Config::Instance()->ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_RENDER_TARGET);
+@@ -84,6 +85,7 @@ bool FSR2FeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         }
+         else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
++                 State::Instance().gameEngine == GameEngineType::Unreal ||
+                  State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+         {
+             Config::Instance()->MVResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+diff --git a/OptiScaler/upscalers/fsr2_212/FSR2Feature_Dx12_212.cpp b/OptiScaler/upscalers/fsr2_212/FSR2Feature_Dx12_212.cpp
+index 5b3b83d3..2e9fb520 100644
+--- a/OptiScaler/upscalers/fsr2_212/FSR2Feature_Dx12_212.cpp
++++ b/OptiScaler/upscalers/fsr2_212/FSR2Feature_Dx12_212.cpp
+@@ -59,6 +59,7 @@ bool FSR2FeatureDx12_212::EvaluateInternal(ID3D12GraphicsCommandList* InCommandL
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         }
+         else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
++                 State::Instance().gameEngine == GameEngineType::Unreal ||
+                  State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+         {
+             Config::Instance()->ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_RENDER_TARGET);
+@@ -90,6 +91,7 @@ bool FSR2FeatureDx12_212::EvaluateInternal(ID3D12GraphicsCommandList* InCommandL
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         }
+         else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
++                 State::Instance().gameEngine == GameEngineType::Unreal ||
+                  State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+         {
+             Config::Instance()->MVResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+diff --git a/OptiScaler/upscalers/xess/XeSSFeature_Dx12.cpp b/OptiScaler/upscalers/xess/XeSSFeature_Dx12.cpp
+index 6423fccb..29a53fc2 100644
+--- a/OptiScaler/upscalers/xess/XeSSFeature_Dx12.cpp
++++ b/OptiScaler/upscalers/xess/XeSSFeature_Dx12.cpp
+@@ -76,6 +76,7 @@ bool XeSSFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         }
+         else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
++                 State::Instance().gameEngine == GameEngineType::Unreal ||
+                  State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+         {
+             Config::Instance()->ColorResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_RENDER_TARGET);
+@@ -105,6 +106,7 @@ bool XeSSFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+         }
+         else if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
++                 State::Instance().gameEngine == GameEngineType::Unreal ||
+                  State::Instance().gameQuirks & GameQuirk::ForceUnrealEngine)
+         {
+             Config::Instance()->MVResourceBarrier.set_volatile_value(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+-- 
+2.54.0.windows.1
+

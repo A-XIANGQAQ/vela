@@ -1,0 +1,525 @@
+From 6d6134efaf8e93f30eb37f8b3c124d766fa90375 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 23:22:47 +0100
+Subject: [PATCH 61/65] base-B build fixes round 3: FFXFeature_Dx12 version
+ lists via FfxVersionList, FSR2 DX11/DX12 device lists via
+ State::Is/Last*Device, ARM64EC (no SEH in PluginApi/CrashDumps, no SSE fence,
+ SetupAPI case, __FUNCTION__ concat), compat d3d12 agility (SAMPLER_DESC2,
+ ID3D12Device11 slot type, Desc_1_2 accessor, 16BIT flag), duplicate
+ cases/_lowResMVs, atomic shared_ptr, (void*) casts, legacy UpscalerTimeVk
+ calls dropped (upstream gpu_time)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../framegen/flipmeter/FlipMeterSwapChain.cpp |  2 +-
+ OptiScaler/framegen/xefg/XeFG_DynamicMFG.cpp  |  4 +--
+ OptiScaler/hooks/D3D12_Hooks.cpp              |  4 +--
+ OptiScaler/hooks/Streamline_Hooks.cpp         |  6 ++--
+ OptiScaler/inputs/FSR2_Dx11.cpp               | 30 +++++++---------
+ OptiScaler/inputs/FSR2_Dx12.cpp               | 10 ++----
+ OptiScaler/inputs/NVNGX_DLSS_Vk.cpp           |  3 --
+ OptiScaler/inputs/XeSS_Dx12.cpp               |  3 --
+ OptiScaler/low_latency/input/input_common.cpp |  2 +-
+ OptiScaler/misc/CrashDumps.cpp                | 10 ++----
+ OptiScaler/misc/CrashDumps.h                  | 10 +++---
+ OptiScaler/misc/IdentifyGpu.cpp               |  2 +-
+ OptiScaler/plugins/PluginApi.cpp              | 23 +++---------
+ .../resource_tracking/ResTrack_dx12.cpp       |  5 +--
+ OptiScaler/shaders/Shader_Dx12.cpp            |  8 -----
+ .../reproject/mouseInputs/InputCollection.cpp |  2 +-
+ OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp  |  9 +++--
+ compat/arm64ec/opti_d3d12_agility.h           | 36 +++++++++++++++++++
+ 18 files changed, 80 insertions(+), 89 deletions(-)
+
+diff --git a/OptiScaler/framegen/flipmeter/FlipMeterSwapChain.cpp b/OptiScaler/framegen/flipmeter/FlipMeterSwapChain.cpp
+index 29e150ef..6fd48dfe 100644
+--- a/OptiScaler/framegen/flipmeter/FlipMeterSwapChain.cpp
++++ b/OptiScaler/framegen/flipmeter/FlipMeterSwapChain.cpp
+@@ -6,7 +6,7 @@
+ #include <hooks/Amdxc64_Hooks.h>
+ #include <misc/IdentifyGpu.h>
+ 
+-#include <SetupAPI.h>
++#include <setupapi.h>
+ #include <devguid.h>
+ 
+ #include <fstream>
+diff --git a/OptiScaler/framegen/xefg/XeFG_DynamicMFG.cpp b/OptiScaler/framegen/xefg/XeFG_DynamicMFG.cpp
+index 56dd7d2b..e008d4a2 100644
+--- a/OptiScaler/framegen/xefg/XeFG_DynamicMFG.cpp
++++ b/OptiScaler/framegen/xefg/XeFG_DynamicMFG.cpp
+@@ -79,7 +79,7 @@ XeFG_DynamicMFG::Result XeFG_DynamicMFG::Update(int targetCount, int framesToInt
+ 
+                 // Changes at info level, the state every 5 s at debug level
+                 spdlog::log(count != current ? spdlog::level::info : spdlog::level::debug,
+-                            __FUNCTION__ " Dynamic MFG {}X{}{}: presented {:.1f} fps, target {:.1f} as cap, "
++                            "Dynamic MFG {}X{}{}: presented {:.1f} fps, target {:.1f} as cap, "
+                                          "reachable {:.1f} fps, back-off {:.0f} s",
+                             current + 1, change, why, _cap.PresentedFps(), target, _cap.ReachableFps(),
+                             _cap.BackoffMs() / 1000.0);
+@@ -111,7 +111,7 @@ XeFG_DynamicMFG::Result XeFG_DynamicMFG::Update(int targetCount, int framesToInt
+ 
+             // Changes at info level, the state every 5 s at debug level
+             spdlog::log(count != current ? spdlog::level::info : spdlog::level::debug,
+-                        __FUNCTION__ " Dynamic MFG {}X{}{}: presented {:.1f} fps, target {:.1f} (set {:.1f}, "
++                        "Dynamic MFG {}X{}{}: presented {:.1f} fps, target {:.1f} (set {:.1f}, "
+                                      "rounding {}, {}, refresh {:.0f}), one step less {:.1f}, waits {:.0f}%, "
+                                      "frame cost {:.2f} ms, back-off {:.0f} s",
+                         current + 1, change, why, _count.PresentedFps(), _count.TargetFps(), target,
+diff --git a/OptiScaler/hooks/D3D12_Hooks.cpp b/OptiScaler/hooks/D3D12_Hooks.cpp
+index 6d48a8ad..b89721bd 100644
+--- a/OptiScaler/hooks/D3D12_Hooks.cpp
++++ b/OptiScaler/hooks/D3D12_Hooks.cpp
+@@ -365,7 +365,7 @@ static std::shared_ptr<const RootSigLayout> BuildRootSigLayout(const D3D12_VERSI
+         fill(desc->Desc_1_1.pParameters, desc->Desc_1_1.NumParameters);
+         break;
+     case D3D_ROOT_SIGNATURE_VERSION_1_2:
+-        fill(desc->Desc_1_2.pParameters, desc->Desc_1_2.NumParameters);
++        fill(OptiDesc_1_2(*desc).pParameters, OptiDesc_1_2(*desc).NumParameters);
+         break;
+     default:
+         return nullptr;
+@@ -2218,7 +2218,7 @@ static HRESULT hkCreateRootSignature(ID3D12Device* device, UINT nodeMask, const
+     }
+     else if (descCopy.Version == D3D_ROOT_SIGNATURE_VERSION_1_2)
+     {
+-        if (descCopy.Desc_1_2.NumStaticSamplers > 0)
++        if (OptiDesc_1_2(descCopy).NumStaticSamplers > 0)
+         {
+             samplers1.assign(OptiDesc_1_2(descCopy).pStaticSamplers,
+                              OptiDesc_1_2(descCopy).pStaticSamplers + OptiDesc_1_2(descCopy).NumStaticSamplers);
+diff --git a/OptiScaler/hooks/Streamline_Hooks.cpp b/OptiScaler/hooks/Streamline_Hooks.cpp
+index 0ab53d32..73a37a71 100644
+--- a/OptiScaler/hooks/Streamline_Hooks.cpp
++++ b/OptiScaler/hooks/Streamline_Hooks.cpp
+@@ -1746,7 +1746,7 @@ void* StreamlineHooks::hkdlssg_slGetPluginFunction(PFN_slGetPluginFunction origi
+         if (steamOverlay != nullptr)
+         {
+             if (HMODULE callerModule = Util::GetCallerModule(caller); callerModule == steamOverlay)
+-                return o_slDLSSGSetOptions;
++                return (void*) o_slDLSSGSetOptions;
+         }
+ 
+         return (void*) &hkslDLSSGSetOptions;
+@@ -1762,7 +1762,7 @@ void* StreamlineHooks::hkdlssg_slGetPluginFunction(PFN_slGetPluginFunction origi
+         if (steamOverlay != nullptr)
+         {
+             if (HMODULE callerModule = Util::GetCallerModule(caller); callerModule == steamOverlay)
+-                return o_slDLSSGGetState;
++                return (void*) o_slDLSSGGetState;
+         }
+ 
+         return (void*) &hkslDLSSGGetState;
+@@ -2415,7 +2415,7 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
+ 
+     if (o_slInit != nullptr || o_slInit_sl1 != nullptr)
+     {
+-        hookedInterposerInit = KernelBaseProxy::GetProcAddress_()(slInterposer, "slInit");
++        hookedInterposerInit = (void*) KernelBaseProxy::GetProcAddress_()(slInterposer, "slInit");
+         hookedInterposerPath = GetModulePath(slInterposer);
+ 
+         if (hookedInterposerInit != nullptr)
+diff --git a/OptiScaler/inputs/FSR2_Dx11.cpp b/OptiScaler/inputs/FSR2_Dx11.cpp
+index 230d6af4..771b30ff 100644
+--- a/OptiScaler/inputs/FSR2_Dx11.cpp
++++ b/OptiScaler/inputs/FSR2_Dx11.cpp
+@@ -520,11 +520,8 @@ static bool IsGameD3D11Device(ID3D11Device* device)
+ {
+     auto& state = State::Instance();
+ 
+-    for (size_t i = 0; i < state.d3d11Devices.size(); i++)
+-    {
+-        if (state.d3d11Devices[i] == device)
+-            return true;
+-    }
++    if (device != nullptr && state.IsD3D11Device(device))
++        return true;
+ 
+     return device != nullptr && state.currentD3D11Device == device;
+ }
+@@ -549,7 +546,7 @@ static bool AdoptOnDevice(FfxFsr2Context* context, const FfxFsr2ContextDescripti
+             return false;
+         }
+ 
+-        _nvnxgInited = true;
++        _nvngxInited = true;
+     }
+ 
+     NVSDK_NGX_Parameter* params = nullptr;
+@@ -591,8 +588,8 @@ bool Fsr2Dx11AdoptContext(void* ctx, const void* desc)
+     // own object as FfxDevice, its resources are not ID3D11Resource; those go to the 0033 path or stay with the game
+     if (!IsGameD3D11Device(bDevice))
+     {
+-        LOG_INFO("FSR 2 context {:X}: device {:X} is not a D3D11 device of the game ({} known, current {:X})",
+-                 (size_t) context, (size_t) bDevice, state.d3d11Devices.size(), (size_t) state.currentD3D11Device);
++        LOG_INFO("FSR 2 context {:X}: device {:X} is not a D3D11 device of the game (current {:X})",
++                 (size_t) context, (size_t) bDevice, (size_t) state.currentD3D11Device);
+         return false;
+     }
+ 
+@@ -1654,8 +1651,8 @@ bool UeHookDispatch()
+     auto& state = State::Instance();
+     ID3D11Device* device = state.currentD3D11Device;
+ 
+-    if (device == nullptr && !state.d3d11Devices.empty())
+-        device = state.d3d11Devices.back();
++    if (device == nullptr)
++        device = state.LastD3D11Device();
+ 
+     if (device == nullptr)
+         return false;
+@@ -1783,11 +1780,8 @@ bool Fsr2UeDx11PrepareCreate(void* desc)
+     if (IsGameD3D11Device((ID3D11Device*) device) || device == (void*) state.currentD3D12Device)
+         return false;
+ 
+-    for (size_t i = 0; i < state.d3d12Devices.size(); i++)
+-    {
+-        if ((void*) state.d3d12Devices[i] == device)
+-            return false;
+-    }
++    if (state.IsD3D12Device((IUnknown*) device))
++        return false;
+ 
+     auto& cb = contextDescription->callbacks;
+ 
+@@ -1811,10 +1805,10 @@ bool Fsr2UeDx11PrepareCreate(void* desc)
+         _ueLastExecuteGpuJobs = cb.fpExecuteGpuJobs;
+     }
+ 
+-    LOG_INFO("FSR 2 context description: FfxDevice {:X} is no D3D11 / D3D12 device of the game ({} D3D11 known, "
+-             "current {:X}), backend callbacks in {} ({}): an engine FFX backend (UE FSR 2 plugin RHI backend), its "
++    LOG_INFO("FSR 2 context description: FfxDevice {:X} is no D3D11 / D3D12 device of the game (current "
++             "{:X}), backend callbacks in {} ({}): an engine FFX backend (UE FSR 2 plugin RHI backend), its "
+              "FSR 2 jobs are followed to the D3D11 dispatches (Vela 0033)",
+-             (size_t) device, state.d3d11Devices.size(), (size_t) state.currentD3D11Device,
++             (size_t) device, (size_t) state.currentD3D11Device,
+              UeModuleName((const void*) cb.fpExecuteGpuJobs),
+              backendObject ? "FfxDevice is an object of that module" : "FfxDevice from another module");
+ 
+diff --git a/OptiScaler/inputs/FSR2_Dx12.cpp b/OptiScaler/inputs/FSR2_Dx12.cpp
+index d453dda1..ea81e3d4 100644
+--- a/OptiScaler/inputs/FSR2_Dx12.cpp
++++ b/OptiScaler/inputs/FSR2_Dx12.cpp
+@@ -438,10 +438,7 @@ static Fsr212::FfxErrorCode ffxFsr2ContextCreate_Dx12(Fsr212::FfxFsr2Context* co
+         return ccResult;
+     }
+ 
+-    // if still no device use latest created one
+-    // Might fixed TLOU but FMF2 still crashes
+-    if (_d3d12Device == nullptr && state.d3d12Devices.size() > 0)
+-        _d3d12Device = state.d3d12Devices[state.d3d12Devices.size() - 1];
++    // Vela base B: upstream dropped the "latest created device" fallback (State::LastD3D12Device)
+ 
+     if (_d3d12Device == nullptr)
+         _d3d12Device = state.currentD3D12Device;
+@@ -561,10 +558,7 @@ static Fsr212::FfxErrorCode ffxFsr2ContextCreate_Pattern_Dx12(Fsr212::FfxFsr2Con
+         return ccResult;
+     }
+ 
+-    // if still no device use latest created one
+-    // Might fixed TLOU but FMF2 still crashes
+-    if (_d3d12Device == nullptr && state.d3d12Devices.size() > 0)
+-        _d3d12Device = state.d3d12Devices[state.d3d12Devices.size() - 1];
++    // Vela base B: upstream dropped the "latest created device" fallback (State::LastD3D12Device)
+ 
+     if (_d3d12Device == nullptr)
+         _d3d12Device = state.currentD3D12Device;
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+index bc0771d1..728d6198 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+@@ -166,7 +166,6 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_Init_Ext2(
+ 
+     State::Instance().currentVkDevice = InDevice;
+ 
+-    UpscalerTimeVk::Init(InDevice, InPD);
+ 
+     VelaUnityVk::CheckLoaded("NVSDK_NGX_VULKAN_Init"); // Vela 0044
+     VelaUnityVk::AtNgxInit(); // Vela 0045: the interface of Unity itself, ConfigureEvent
+@@ -1178,7 +1177,6 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer
+ 
+     deviceContext = VkContexts[handleId].feature.get();
+ 
+-    UpscalerTimeVk::UpscaleStart(recCmd);
+ 
+     velaDefer.BeforeFeature(InParameters);
+     auto upscaleResult = deviceContext->Evaluate(recCmd, InParameters);
+@@ -1195,7 +1193,6 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer
+         return NVSDK_NGX_Result_Success;
+     }
+ 
+-    UpscalerTimeVk::UpscaleEnd(recCmd);
+ 
+     if (upscaleResult)
+         velaDefer.Commit();
+diff --git a/OptiScaler/inputs/XeSS_Dx12.cpp b/OptiScaler/inputs/XeSS_Dx12.cpp
+index 31a84de7..2bd800e5 100644
+--- a/OptiScaler/inputs/XeSS_Dx12.cpp
++++ b/OptiScaler/inputs/XeSS_Dx12.cpp
+@@ -20,9 +20,6 @@ static bool _nvngxInited = false;
+ // Motion vector resolution the feature was created with
+ static std::unordered_map<xess_context_handle_t, bool> _lowResMVs;
+ 
+-// 0038 (upstream 7e94156): motion vector resolution the feature was created with
+-static std::unordered_map<xess_context_handle_t, bool> _lowResMVs;
+-
+ // 0038: per context, what the UE scene depth capture gave (logged once each)
+ struct VelaUeDepth
+ {
+diff --git a/OptiScaler/low_latency/input/input_common.cpp b/OptiScaler/low_latency/input/input_common.cpp
+index e27b3dc4..bc37a1a1 100644
+--- a/OptiScaler/low_latency/input/input_common.cpp
++++ b/OptiScaler/low_latency/input/input_common.cpp
+@@ -19,7 +19,7 @@
+ 
+ #include <deque>
+ 
+-std::atomic<std::shared_ptr<LowLatencyTech>> InputCommon::currently_active_tech;
++OptiAtomicSharedPtr<LowLatencyTech> InputCommon::currently_active_tech;
+ std::atomic<std::shared_ptr<LowLatencyTech>> InputCommon::xefg_xell;
+ 
+ static bool marker_supported(InputMarkerMode mode, MarkerType type)
+diff --git a/OptiScaler/misc/CrashDumps.cpp b/OptiScaler/misc/CrashDumps.cpp
+index ce316c65..c2d3ce1a 100644
+--- a/OptiScaler/misc/CrashDumps.cpp
++++ b/OptiScaler/misc/CrashDumps.cpp
+@@ -77,14 +77,8 @@ DWORD WINAPI CrashDumps::DumpThread(LPVOID param)
+ // A fault in dbghelp ends the dump, not the state it holds
+ DWORD WINAPI CrashDumps::GuardedDumpThread(LPVOID param)
+ {
+-    __try
+-    {
+-        return DumpThread(param);
+-    }
+-    __except (EXCEPTION_EXECUTE_HANDLER)
+-    {
+-        return 1;
+-    }
++    // Vela ARM64EC: no SEH in this build
++    return DumpThread(param);
+ }
+ 
+ // Waits for a dump another thread is writing, false when it never finished
+diff --git a/OptiScaler/misc/CrashDumps.h b/OptiScaler/misc/CrashDumps.h
+index f2462576..25c48b80 100644
+--- a/OptiScaler/misc/CrashDumps.h
++++ b/OptiScaler/misc/CrashDumps.h
+@@ -20,11 +20,11 @@ class CrashDumps
+     // Static, the dumper can outlive the wait of the thread that asked for it
+     struct DumpRequest
+     {
+-        const wchar_t* kind = nullptr;
+-        DWORD code = 0;
+-        DWORD threadId = 0;
+-        EXCEPTION_POINTERS* exception = nullptr;
+-        BOOL written = FALSE;
++        const wchar_t* kind;
++        DWORD code;
++        DWORD threadId;
++        EXCEPTION_POINTERS* exception;
++        BOOL written;
+     };
+ 
+     // First chance exceptions can be handled by the game, a few dumps are enough
+diff --git a/OptiScaler/misc/IdentifyGpu.cpp b/OptiScaler/misc/IdentifyGpu.cpp
+index 1deda2b6..0d0671a6 100644
+--- a/OptiScaler/misc/IdentifyGpu.cpp
++++ b/OptiScaler/misc/IdentifyGpu.cpp
+@@ -695,7 +695,7 @@ void IdentifyGpu::updateD3d12Capabilities(D3d12Proxy::PFN_D3D12CreateDevice o_D3
+ 
+         // Vela: a forced FSR 4 model holds even when the test D3D12 device above was not made (Adreno
+         // under vkd3d-proton logged "fsr4: false" with Fsr4ForceModel=2), so FSR 4 INT8 can be tried on the Adreno
+-        if (const auto forced = Config::Instance()->Fsr4ForceModel.value_or_default(); forced != FSR4Support::None)
++        if (const auto forced = Config::Instance()->Fsr4GpuSupport.value_or_default(); forced != FSR4Support::None)
+         {
+             for (auto& gpuInfo : cache)
+             {
+diff --git a/OptiScaler/plugins/PluginApi.cpp b/OptiScaler/plugins/PluginApi.cpp
+index 5e4e4f17..5027bf5a 100644
+--- a/OptiScaler/plugins/PluginApi.cpp
++++ b/OptiScaler/plugins/PluginApi.cpp
+@@ -57,28 +57,15 @@ thread_local TabDrawState* _draw = nullptr;
+ // Plugin code is called through these, a crash in it disables the plugin instead of the game
+ bool CallDraw(OptiDrawTabFn draw, void* userData)
+ {
+-    __try
+-    {
+-        draw(userData);
+-        return true;
+-    }
+-    __except (EXCEPTION_EXECUTE_HANDLER)
+-    {
+-        return false;
+-    }
++    // Vela ARM64EC: no SEH in this build
++    draw(userData);
++    return true;
+ }
+ 
+ bool CallInit(PFN_OptiPluginInit init, const OptiPluginApi* api, OptiPlugin* plugin, bool* result)
+ {
+-    __try
+-    {
+-        *result = init(api, plugin);
+-        return true;
+-    }
+-    __except (EXCEPTION_EXECUTE_HANDLER)
+-    {
+-        return false;
+-    }
++    *result = init(api, plugin);
++    return true;
+ }
+ 
+ void ShowItemTooltip(const char* text)
+diff --git a/OptiScaler/resource_tracking/ResTrack_dx12.cpp b/OptiScaler/resource_tracking/ResTrack_dx12.cpp
+index 211d98a3..3c297064 100644
+--- a/OptiScaler/resource_tracking/ResTrack_dx12.cpp
++++ b/OptiScaler/resource_tracking/ResTrack_dx12.cpp
+@@ -1,4 +1,5 @@
+ #include "pch.h"
++#include "opti_d3d12_agility.h"
+ #include "ResTrack_dx12.h"
+ 
+ #include <Config.h>
+@@ -1260,9 +1261,9 @@ void ResTrack_Dx12::RegisterRootSignature(ID3D12RootSignature* rootSignature,
+         break;
+ 
+     case D3D_ROOT_SIGNATURE_VERSION_1_2:
+-        BuildRootSignatureInfo(*info, desc->Desc_1_2.NumParameters, desc->Desc_1_2.pParameters);
++        BuildRootSignatureInfo(*info, OptiDesc_1_2(*desc).NumParameters, OptiDesc_1_2(*desc).pParameters);
+         info->pixelShaderRootAccess =
+-            (desc->Desc_1_2.Flags & D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS) == 0;
++            (OptiDesc_1_2(*desc).Flags & D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS) == 0;
+         break;
+ 
+     default:
+diff --git a/OptiScaler/shaders/Shader_Dx12.cpp b/OptiScaler/shaders/Shader_Dx12.cpp
+index 8c60cdbb..34791474 100644
+--- a/OptiScaler/shaders/Shader_Dx12.cpp
++++ b/OptiScaler/shaders/Shader_Dx12.cpp
+@@ -58,22 +58,14 @@ DXGI_FORMAT Shader_Dx12::TranslateTypelessFormats(DXGI_FORMAT format)
+     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+         return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+ 
+-    // Vela 0025: depth resources made with a depth format (not typeless) read as their colour twin (D24S8 / D16 / D32)
+-    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+-        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+-
+     case DXGI_FORMAT_R16_TYPELESS:
+     case DXGI_FORMAT_D16_UNORM:
+         return DXGI_FORMAT_R16_UNORM;
+ 
+     case DXGI_FORMAT_D32_FLOAT:
+     case DXGI_FORMAT_R32_TYPELESS:
+-    case DXGI_FORMAT_D32_FLOAT:
+         return DXGI_FORMAT_R32_FLOAT;
+ 
+-    case DXGI_FORMAT_D16_UNORM:
+-        return DXGI_FORMAT_R16_UNORM;
+-
+     default:
+         return format;
+     }
+diff --git a/OptiScaler/shaders/reproject/mouseInputs/InputCollection.cpp b/OptiScaler/shaders/reproject/mouseInputs/InputCollection.cpp
+index fa03b362..4a3a50be 100644
+--- a/OptiScaler/shaders/reproject/mouseInputs/InputCollection.cpp
++++ b/OptiScaler/shaders/reproject/mouseInputs/InputCollection.cpp
+@@ -15,7 +15,7 @@ void InputCollection::writeLiveSinks()
+         *sink = packed;
+ 
+     // Flush the write-combining buffers so the value reaches memory right away
+-    _mm_sfence();
++    std::atomic_thread_fence(std::memory_order_seq_cst); // Vela ARM64EC: no SSE
+ }
+ 
+ void InputCollection::addNewDelta(InputDelta delta)
+diff --git a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
+index 61043c43..4a380a2c 100644
+--- a/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
++++ b/OptiScaler/upscalers/ffx/FFXFeature_Dx12.cpp
+@@ -582,7 +582,7 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+         // Vela: the versions the FSR SDK offers, and with FSR 4 INT8 forced the newest of them (index 0 is not
+         // always the newest: the 4.1.2 upscaler DLL next to the 1.1.4 one)
+         {
+-            auto& names = State::Instance().ffxUpscalerVersionNames;
++            auto& names = versions.names;
+             int best = -1;
+             std::string all;
+             for (size_t i = 0; i < names.size(); i++)
+@@ -603,7 +603,7 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+         // Vela 0036: dittosr takes DittoSR's upscaler (the version named DittoSR, else its first)
+         if (ditto)
+         {
+-            auto& names = State::Instance().ffxUpscalerVersionNames;
++            auto& names = versions.names;
+             int pick = names.empty() ? -1 : 0;
+             for (size_t i = 0; i < names.size(); i++)
+                 if (names[i] != nullptr && std::string(names[i]).find("DittoSR") != std::string::npos)
+@@ -628,7 +628,7 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+         // INT8 forced the block above would take 4.x); 0036: also dittosr that could not run
+         else if (VelaLive::IsFfx(velaModel))
+         {
+-            auto& names = State::Instance().ffxUpscalerVersionNames;
++            auto& names = versions.names;
+             int best3 = -1;
+             for (size_t i = 0; i < names.size(); i++)
+             {
+@@ -715,8 +715,7 @@ bool FFXFeatureDx12::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+             }
+         }
+ 
+-        auto version =
+-            State::Instance().ffxUpscalerVersionNames[Config::Instance()->FfxUpscalerIndex.value_or_default()];
++        auto version = versions.names[upscalerIndex.value_or_default()];
+         _name = ditto ? "DittoSR" : "FSR";
+         parse_version(version);
+         if (ditto)
+diff --git a/compat/arm64ec/opti_d3d12_agility.h b/compat/arm64ec/opti_d3d12_agility.h
+index 8d54d901..65259b21 100644
+--- a/compat/arm64ec/opti_d3d12_agility.h
++++ b/compat/arm64ec/opti_d3d12_agility.h
+@@ -86,4 +86,40 @@ inline const D3D12_ROOT_SIGNATURE_DESC2& OptiDesc_1_2(const D3D12_VERSIONED_ROOT
+ 
+ #endif /* __cplusplus */
+ 
++
++/* Vela base B: Agility SDK 1.616+ sampler overrides (upstream D3D12_Hooks.cpp hooks CreateSampler2 by vtable slot 79) and
++ * the shader-flag bit it clears; mingw-w64 has neither. */
++#ifndef D3D_SHADER_REQUIRES_NATIVE_16BIT_OPS
++#define D3D_SHADER_REQUIRES_NATIVE_16BIT_OPS 0x00040000
++#endif
++
++#ifndef OPTI_HAVE_SAMPLER_DESC2
++#define OPTI_HAVE_SAMPLER_DESC2
++typedef struct D3D12_SAMPLER_DESC2
++{
++    D3D12_FILTER Filter;
++    D3D12_TEXTURE_ADDRESS_MODE AddressU;
++    D3D12_TEXTURE_ADDRESS_MODE AddressV;
++    D3D12_TEXTURE_ADDRESS_MODE AddressW;
++    FLOAT MipLODBias;
++    UINT MaxAnisotropy;
++    D3D12_COMPARISON_FUNC ComparisonFunc;
++    union
++    {
++        FLOAT FloatBorderColor[4];
++        UINT UintBorderColor[4];
++    };
++    FLOAT MinLOD;
++    FLOAT MaxLOD;
++    D3D12_SAMPLER_FLAGS Flags;
++} D3D12_SAMPLER_DESC2;
++
++// Only the type and the CreateSampler2 signature are used (the slot is read from the vtable by index)
++MIDL_INTERFACE("5405c344-d457-444e-b4dd-2366e9a4f9a2")
++ID3D12Device11 : public ID3D12Device
++{
++    virtual void STDMETHODCALLTYPE CreateSampler2(const D3D12_SAMPLER_DESC2* pDesc,
++                                                  D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) = 0;
++};
++#endif
+ #endif /* OPTISCALER_COMPAT_D3D12_AGILITY_H */
+-- 
+2.54.0.windows.1
+

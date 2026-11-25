@@ -1,5 +1,22 @@
 # Vela's OptiScaler fork (GPL-3.0)
 
+## Vela 0.10.0: new base (`base-b/`)
+
+Since Vela 0.10.0 the fork is built on current upstream [optiscaler/OptiScaler](https://github.com/optiscaler/OptiScaler) commit
+`6de775c5abab6909f543dc4b621fe68e89597ab7` (file `base-b/BASE`) instead of Sloptiscaler `f80e4da3`. The series in `base-b/patches/`
+is: `0000` (Sloptiscaler `f80e4da3`'s additions re-applied on that upstream commit: the ARM64EC build and the SGSR 2 backend),
+`0001`-`0059` (our patches of the list below, rebased onto the new code; the file names repeat the old numbers), `0060`-`0065`
+(build fixes of the rebase) and `0066`-`0069` (OptiScaler.ini back to upstream; Unreal resource-barrier conditions restored; a stack
+clear in the nvngx probe hooks, which a Wine bug on Proton 11 ARM64 needs). Apply them in file-name order with
+`git am --3way --ignore-whitespace` on the base commit; the result is the tree the shipped DLL was built from (checked: the tree after
+all 70 patches equals our `base-b` branch head `0e9b5b0c`). Checksums: `base-b/patches.md5`. `base-b/check_apply.sh` is our daily check that
+the series still applies on upstream master (its paths are our working directories; edit `R`/`F` to use it).
+
+Vela 0.10.0 ships `OptiScaler.dll` md5 `d1010f862b5617bb3a9b406840044168`. The pinned build container, compiler and tool versions of
+the Build section below are unchanged; its clone-and-`git apply` step is replaced by checking out the base commit and applying the
+`base-b` series as above. We did not re-run the container build from this public copy. The `patches/` folder and the text below
+describe the 0.9.0 and earlier builds (base Sloptiscaler `f80e4da3`).
+
 Base: [justradical/Sloptiscaler](https://github.com/justradical/Sloptiscaler) commit `f80e4da339cd4624212fd0546922571fe01205c1`
 = ARM64EC build of [OptiScaler](https://github.com/optiscaler/OptiScaler) 10.0.0.1 with an SGSR 2 backend.
 Our changes are the patches in `patches/`, applied in number order. License: GPL-3.0 (`LICENSE`, OptiScaler's).

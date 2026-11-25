@@ -1,0 +1,95 @@
+From 45aaec71f1c59c0e21f1caef9bf8d11c4741fde8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 25 Nov 2026 01:13:13 +0100
+Subject: [PATCH 68/69] base-b: scrub the stack below the nvngx probe hooks
+ (Crypt32/Kernel32). Manor Lords crash: Wine wintrust.dll+0x3458c writes
+ through an uninitialised stack slot that held the logger's __FILE__ pointer
+
+---
+ OptiScaler/hooks/Crypt32_Hooks.h  | 11 +++++++----
+ OptiScaler/hooks/Hook_Utils.h     | 19 +++++++++++++++++++
+ OptiScaler/hooks/Kernel_Hooks.cpp |  9 +++++++--
+ 3 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/OptiScaler/hooks/Crypt32_Hooks.h b/OptiScaler/hooks/Crypt32_Hooks.h
+index 11e93236..c2f88151 100644
+--- a/OptiScaler/hooks/Crypt32_Hooks.h
++++ b/OptiScaler/hooks/Crypt32_Hooks.h
+@@ -43,10 +43,13 @@ static BOOL hkCryptQueryObject(DWORD dwObjectType, const void* pvObject, DWORD d
+              Config::Instance()->StreamlineSpoofing.value_or_default()))
+         {
+             LOG_DEBUG("Replacing nvngx with a signed dll");
+-            return o_CryptQueryObject(dwObjectType, State::Instance().nvngxReplacement.value().c_str(),
+-                                      dwExpectedContentTypeFlags, dwExpectedFormatTypeFlags, dwFlags,
+-                                      pdwMsgAndCertEncodingType, pdwContentType, pdwFormatType, phCertStore, phMsg,
+-                                      ppvContext);
++            HookScrubStack();
++            auto result = o_CryptQueryObject(dwObjectType, State::Instance().nvngxReplacement.value().c_str(),
++                                             dwExpectedContentTypeFlags, dwExpectedFormatTypeFlags, dwFlags,
++                                             pdwMsgAndCertEncodingType, pdwContentType, pdwFormatType, phCertStore,
++                                             phMsg, ppvContext);
++            HookScrubStack();
++            return result;
+         }
+     }
+ 
+diff --git a/OptiScaler/hooks/Hook_Utils.h b/OptiScaler/hooks/Hook_Utils.h
+index af33a4a1..0bee8379 100644
+--- a/OptiScaler/hooks/Hook_Utils.h
++++ b/OptiScaler/hooks/Hook_Utils.h
+@@ -1,6 +1,25 @@
+ #pragma once
+ 
+ #include <type_traits>
++#include <cstdint>
++#include <cstddef>
++
++// Zeroes the stack below the caller. Wine's wintrust.dll (Proton 11 ARM64, WinVerifyTrust path) reads an
++// uninitialised 8-byte stack slot of its own frame and, when it is not NULL, writes through it
++// (str w9,[x8,#0xc], wintrust+0x3458c). The slot is the one our hook's logger frames used last, so after
++// a LOG_* call inside a hook the slot held a pointer to the __FILE__ literal (Manor Lords crash, base B).
++// Calling this after the logging and after the original function returns leaves zeros there (cbz skips it).
++#if defined(__clang__) || defined(__GNUC__)
++__attribute__((noinline))
++#else
++__declspec(noinline)
++#endif
++static inline void HookScrubStack()
++{
++    volatile uint64_t buf[1536]; // 12 KB
++    for (size_t i = 0; i < 1536; i++)
++        buf[i] = 0;
++}
+ 
+ // For getting function signature of methods, example of usage:
+ // using PFN_CheckFeatureSupport = rewrite_signature<decltype(&ID3D12Device::CheckFeatureSupport)>::type;
+diff --git a/OptiScaler/hooks/Kernel_Hooks.cpp b/OptiScaler/hooks/Kernel_Hooks.cpp
+index 038f8050..7fbb096d 100644
+--- a/OptiScaler/hooks/Kernel_Hooks.cpp
++++ b/OptiScaler/hooks/Kernel_Hooks.cpp
+@@ -289,6 +289,7 @@ DWORD WINAPI KernelHooks::hk_K32_GetFileAttributesW(LPCWSTR lpFileName)
+             !IsInsideWindowsDirectory(path)) // apply the override to just one path
+         {
+             LOG_DEBUG("Overriding GetFileAttributesW for nvngx");
++            HookScrubStack();
+             return FILE_ATTRIBUTE_ARCHIVE;
+         }
+     }
+@@ -316,8 +317,12 @@ HANDLE WINAPI KernelHooks::hk_K32_CreateFileW(LPCWSTR lpFileName, DWORD dwDesire
+             if (signedDll.has_value())
+             {
+                 LOG_DEBUG("Overriding CreateFileW for nvngx with a signed dll, original path: {}", path);
+-                return o_K32_CreateFileW(signedDll.value().c_str(), dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+-                                         dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
++                HookScrubStack();
++                auto result = o_K32_CreateFileW(signedDll.value().c_str(), dwDesiredAccess, dwShareMode,
++                                                lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes,
++                                                hTemplateFile);
++                HookScrubStack();
++                return result;
+             }
+         }
+     }
+-- 
+2.54.0.windows.1
+

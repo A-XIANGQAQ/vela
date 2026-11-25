@@ -1,0 +1,40 @@
+From 638272b43e96d0dcd0d5f1f685ab8b9564c14293 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 23:11:36 +0100
+Subject: [PATCH 60/65] base-B build recipe: per-unit compile logs (parallel
+ clang output interleaved), failed-unit list
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arm64ec/build.sh | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/arm64ec/build.sh b/arm64ec/build.sh
+index 518b0f22..abf20288 100755
+--- a/arm64ec/build.sh
++++ b/arm64ec/build.sh
+@@ -127,8 +127,19 @@ if [ -d "$OUT/obj" ]; then
+     [ -n "$stale" ] && { echo "   pruning stale object: $stale"; rm -f "$OUT/obj/$stale"; }
+   done
+ fi
+-xargs -P "$(nproc)" -I{} sh -c \
+-  "\"$CXX\" $FLAGS -c '{}' -o \"$OUT/obj/\$(echo '{}' | tr / _ | sed 's/\.cpp\$/.o/')\"" < "$OUT/srcs.txt"
++# One log per unit (parallel compiles otherwise interleave their diagnostics); failures are listed after the run.
++mkdir -p "$OUT/logs"
++export CXX FLAGS OUT
++compile_one() {
++  o="$OUT/obj/$(echo "$1" | tr / _ | sed 's/\.cpp$/.o/')"
++  "$CXX" $FLAGS -c "$1" -o "$o" > "$OUT/logs/$(echo "$1" | tr / _).log" 2>&1 || { echo "FAILED $1" >> "$OUT/failed.txt"; return 1; }
++}
++export -f compile_one
++: > "$OUT/failed.txt"
++xargs -P "$(nproc)" -I{} bash -c 'compile_one {}' < "$OUT/srcs.txt" || {
++  echo "compile failures:"; cat "$OUT/failed.txt"
++  for f in $(sed 's/^FAILED //' "$OUT/failed.txt" | tr / _); do echo "=== $f"; grep -A4 'error' "$OUT/logs/$f.log" | head -40; done
++  exit 1; }
+ 
+ # Version resource: the .rc is UTF-16LE, which llvm-rc cannot read.
+ iconv -f UTF-16LE -t UTF-8 OptiScaler/OptiScaler.rc -o "$OUT/OptiScaler_utf8.rc"
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,27 @@
+From 4806aa1e6287ca4ec7cccb4ae43786a614b46163 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 23:01:58 +0100
+Subject: [PATCH 59/65] base-B build fix round 2: dbghelp.h lower case (mingw,
+ case-sensitive container)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/misc/CrashDumps.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/OptiScaler/misc/CrashDumps.h b/OptiScaler/misc/CrashDumps.h
+index 20f5d6b0..f2462576 100644
+--- a/OptiScaler/misc/CrashDumps.h
++++ b/OptiScaler/misc/CrashDumps.h
+@@ -2,7 +2,7 @@
+ 
+ #include "SysUtils.h"
+ 
+-#include <DbgHelp.h>
++#include <dbghelp.h>
+ 
+ #include <atomic>
+ #include <string>
+-- 
+2.54.0.windows.1
+

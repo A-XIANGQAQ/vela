@@ -1,0 +1,629 @@
+From e243a019c13f8889b009dec83e434d2c8fd81d30 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 15:14:20 +0100
+Subject: [PATCH 41/65] 0040-vela-vk-live: Vela live models in native Vulkan
+ games, as in DX12/DX11: NVNGX_DLSS_Vk.cpp polls VelaLive (the same
+ Z:\tmp\vela-live\<appid>.ini) per handle and re-creates the upscaler on a
+ model change -- sgsr2 = SGSR 2 (Vulkan), fsr3 = FSR 3.1 on the FFX backend
+ (AMD's amd_fidelityfx_vk.dll, the newest 3.x upscaler it offers), dittosr =
+ DittoSR on the FFX backend through a module of its own
+ (FfxApiProxy::InitDittoSRVk: VELA_DITTOSR_DIR or <OptiScaler's DLL
+ folder>\dittosr\amd_fidelityfx_upscaler_vk.dll, else the DX12-named
+ amd_fidelityfx_upscaler_dx12.dll, the same DittoSR 0.5.4 binary; loaded once,
+ never hooked; FSR 3 with a "cannot run" line when it cannot load or make its
+ context), fsr4 / fsr4fast / fsr4lite = SGSR 2 with one line "cannot run in
+ this Vulkan game yet", no live file = the ini's VulkanUpscaler; a backend
+ that does not take is tried twice per model; SGSR 2 is re-created at the
+ game's subrect (live change, or a subrect held 30 frames) and takes it in
+ Init; each handle logs once the colour / depth / MV / output VkFormats the
+ game hands
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit b4b4768278cfdac9da3a4ee7d27bf2e29d3c9bc3)
+---
+ OptiScaler/inputs/NVNGX_DLSS_Vk.cpp           | 119 +++++++++++++
+ OptiScaler/proxies/FfxApi_Proxy.h             | 104 +++++++++++
+ OptiScaler/upscalers/ffx/FFXFeature_Vk.cpp    | 166 ++++++++++++++++--
+ OptiScaler/upscalers/ffx/FFXFeature_Vk.h      |  30 ++--
+ .../upscalers/sgsr2/SGSR2Feature_Vk.cpp       |   4 +
+ 5 files changed, 392 insertions(+), 31 deletions(-)
+
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+index 73e8111f..8824dd32 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Vk.cpp
+@@ -16,6 +16,7 @@
+ #include <ankerl/unordered_dense.h>
+ #include <imgui/ImGuiNotify.hpp>
+ #include <misc/IdentifyGpu.h>
++#include <upscalers/sgsr3/VelaLive.h>
+ 
+ VkInstance vkInstance;
+ VkPhysicalDevice vkPD;
+@@ -1015,6 +1016,124 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer
+     IFeature_Vk* deviceContext = nullptr;
+     auto contextData = &VkContexts[handleId];
+ 
++    // Vela 0040: live models in a native Vulkan game (as NVNGX_DLSS_Dx12.cpp, upscalers/sgsr3/VelaLive.h): the panel's
++    // model re-creates each handle's upscaler -- sgsr2 = SGSR 2 (Vulkan), fsr3 = FSR 3.1 on the FFX backend (AMD's
++    // amd_fidelityfx_vk.dll), dittosr = DittoSR on the same backend through its own module (FFXFeature_Vk.cpp, FSR 3
++    // when it cannot run), fsr4 / fsr4fast / fsr4lite = SGSR 2 with one line (no FSR 4 on Vulkan yet), no live file =
++    // the ini's VulkanUpscaler. A new handle of the wrong backend switches on its first frame, a model change re-creates
++    // every handle once, and a backend that keeps failing is tried at most twice per model.
++    if (contextData->feature != nullptr && !state.changeBackend[handleId])
++    {
++        auto* feature = contextData->feature.get();
++        struct VelaHandleVk
++        {
++            VelaLive::Model model = VelaLive::Model::Unset;
++            int tries = 0;
++            bool formatsLogged = false;
++        };
++        static ankerl::unordered_dense::map<unsigned int, VelaHandleVk> velaHandles;
++        const VelaLive::Model m = VelaLive::Poll().model;
++        static VelaLive::Model lastModel = VelaLive::Model::Unset;
++        static bool fsr4Logged = false;
++        if (m != lastModel)
++        {
++            fsr4Logged = false;
++            lastModel = m;
++        }
++        const bool isFsr4 = VelaLive::IsFsr4Full(m) || m == VelaLive::Model::Fsr4Lite;
++        if (isFsr4 && !fsr4Logged)
++        {
++            fsr4Logged = true;
++            LOG_WARN("Vela live: {0} cannot run in this Vulkan game yet; SGSR 2 instead", VelaLive::ModelName(m));
++        }
++        const Upscaler iniUp = Config::Instance()->VulkanUpscaler.value_or_default();
++        const Upscaler want = m == VelaLive::Model::Sgsr2 || isFsr4 ? Upscaler::SGSR2
++                              : VelaLive::IsFfx(m)                  ? Upscaler::FFX // fsr3 and dittosr
++                              : iniUp == Upscaler::SGSR3            ? Upscaler::SGSR2
++                                                                    : iniUp;
++        const bool seen = velaHandles.contains(handleId);
++        auto& h = velaHandles[handleId];
++        if (!h.formatsLogged)
++        {
++            // which formats the game hands (FSR 4 on Vulkan will take RGBA16F / R11G11B10F / E5B9G9R9 colour only)
++            h.formatsLogged = true;
++            auto fmt = [&](const char* key) -> int
++            {
++                NVSDK_NGX_Resource_VK* r = nullptr;
++                InParameters->Get(key, (void**) &r);
++                return r != nullptr ? (int) r->Resource.ImageViewInfo.Format : -1;
++            };
++            LOG_INFO("Vela VK: handle {0} ({1} {2}x{3} -> {4}x{5}): colour VkFormat {6}, depth {7}, motion vectors {8}, "
++                     "output {9} (-1 = not given)",
++                     handleId, feature->Name(), feature->RenderWidth(), feature->RenderHeight(),
++                     feature->DisplayWidth(), feature->DisplayHeight(), fmt(NVSDK_NGX_Parameter_Color),
++                     fmt(NVSDK_NGX_Parameter_Depth), fmt(NVSDK_NGX_Parameter_MotionVectors),
++                     fmt(NVSDK_NGX_Parameter_Output));
++        }
++        bool change = false;
++        if (seen && h.model != m)
++        {
++            h.tries = 0;
++            // the panel changed the model: fsr3 <-> dittosr need a re-create on the same backend
++            change = true;
++        }
++        else if (feature->GetUpscalerType() != want && h.tries < 2 && (m != VelaLive::Model::Unset || seen))
++            change = true; // a new handle, or a backend change that did not take yet
++        h.model = m;
++        if (change && m == VelaLive::Model::Unset && feature->GetUpscalerType() == want)
++            change = false; // the live file went away and the handle already runs the ini's upscaler
++        if (change)
++        {
++            h.tries++;
++            // SGSR 2 is made for one render size: the new one takes the size the game draws now (its subrect)
++            unsigned int sw = 0, sh = 0;
++            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &sw);
++            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &sh);
++            VelaLive::SubW = sw;
++            VelaLive::SubH = sh;
++            LOG_INFO("Vela live: handle {0} model {1} -> {2} (the game draws {3}x{4}, Vulkan)", handleId,
++                     VelaLive::ModelName(m), UpscalerDisplayName(want), sw, sh);
++            state.newBackend = want;
++            state.changeBackend[handleId] = true;
++        }
++    }
++
++    // Vela 0040: the game keeps its DLSS feature and draws another subrect (dynamic resolution, the panel's ratio). SGSR 2
++    // is made for one render size: re-created at the subrect once that size held for 30 frames (as in DX12)
++    if (contextData->feature != nullptr && !state.changeBackend[handleId] &&
++        contextData->feature->GetUpscalerType() == Upscaler::SGSR2)
++    {
++        auto* feature = contextData->feature.get();
++        struct VelaSubVk
++        {
++            unsigned int w = 0, h = 0, held = 0;
++        };
++        static ankerl::unordered_dense::map<unsigned int, VelaSubVk> velaSubs;
++        auto& vs = velaSubs[handleId];
++        unsigned int sw = 0, sh = 0;
++        if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &sw) ==
++                NVSDK_NGX_Result_Success &&
++            InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &sh) ==
++                NVSDK_NGX_Result_Success &&
++            sw > 0 && sh > 0 && (sw != feature->RenderWidth() || sh != feature->RenderHeight()))
++        {
++            vs.held = (sw == vs.w && sh == vs.h) ? vs.held + 1 : 0;
++            vs.w = sw;
++            vs.h = sh;
++            if (vs.held == 30)
++            {
++                LOG_INFO("Vela live: the game draws {0}x{1}, {2} made for {3}x{4}: re-created", sw, sh, feature->Name(),
++                         feature->RenderWidth(), feature->RenderHeight());
++                VelaLive::SubW = sw;
++                VelaLive::SubH = sh;
++                state.newBackend = feature->GetUpscalerType();
++                state.changeBackend[handleId] = true;
++            }
++        }
++        else
++            vs.held = 0;
++    }
++
+     if (state.changeBackend[handleId])
+     {
+         auto successfulPhase =
+diff --git a/OptiScaler/proxies/FfxApi_Proxy.h b/OptiScaler/proxies/FfxApi_Proxy.h
+index cd096db2..8ca18617 100644
+--- a/OptiScaler/proxies/FfxApi_Proxy.h
++++ b/OptiScaler/proxies/FfxApi_Proxy.h
+@@ -150,6 +150,10 @@ class FfxApiProxy
+     inline static bool dittosrRoute = false;
+     inline static std::string dittosrWhy;
+     inline static ankerl::unordered_dense::set<ffxContext> dittosrContexts;
++    // Vela 0040: DittoSR on Vulkan (InitDittoSRVk below; FFXFeature_Vk.cpp calls its exports itself)
++    inline static FfxModule dittosr_vk;
++    inline static bool dittosrVkTried = false;
++    inline static std::string dittosrVkWhy;
+ 
+     static bool IsLoader(const std::wstring& filePath)
+     {
+@@ -1956,6 +1960,106 @@ class FfxApiProxy
+         return dittosr_dx12.CreateContext != nullptr;
+     }
+ 
++    // Vela 0040: DittoSR in a native Vulkan game. DittoSR 0.5.4 is one binary for D3D12 and Vulkan (its release zip's
++    // amd_fidelityfx_dx12.dll and amd_fidelityfx_vk.dll have the same md5; the Vulkan path needs only Vulkan 1.1 core),
++    // so the file Vela ships for DX12 is also the Vulkan provider. Looked for in the same folders as InitDittoSRDx12, first
++    // as amd_fidelityfx_upscaler_vk.dll, then as amd_fidelityfx_upscaler_dx12.dll (neither name is one OptiScaler's load
++    // hooks or AMD's Vulkan module answer to: AMD's is amd_fidelityfx_vk.dll). Loaded once, lazily, never hooked; the
++    // Vulkan feature calls its exports directly (FFXFeature_Vk.cpp), so fsr3 keeps AMD's FSR 3.1 module.
++    static std::wstring DittoSRVk_Path() { return dittosr_vk.filePath; }
++    static const std::string& DittoSRVk_Why() { return dittosrVkWhy; }
++    static PfnFfxCreateContext DittoSRVk_CreateContext() { return dittosr_vk.CreateContext; }
++    static PfnFfxDestroyContext DittoSRVk_DestroyContext() { return dittosr_vk.DestroyContext; }
++    static PfnFfxConfigure DittoSRVk_Configure() { return dittosr_vk.Configure; }
++    static PfnFfxQuery DittoSRVk_Query() { return dittosr_vk.Query; }
++    static PfnFfxDispatch DittoSRVk_Dispatch() { return dittosr_vk.Dispatch; }
++
++    static bool InitDittoSRVk()
++    {
++        if (dittosrVkTried)
++            return dittosr_vk.CreateContext != nullptr;
++        dittosrVkTried = true;
++
++        const std::wstring names[] = { L"amd_fidelityfx_upscaler_vk.dll", L"amd_fidelityfx_upscaler_dx12.dll" };
++        std::vector<std::filesystem::path> dirs;
++        if (const char* e = std::getenv("VELA_DITTOSR_DIR"); e != nullptr && e[0] != 0)
++            dirs.push_back(std::filesystem::path(string_to_wstring(e)));
++        else
++        {
++            wchar_t own[MAX_PATH] {};
++            const DWORD n = GetModuleFileNameW(dllModule, own, MAX_PATH);
++            if (n > 0 && n < MAX_PATH)
++                dirs.push_back(std::filesystem::path(own).parent_path() / L"dittosr");
++            if (Config::Instance()->MainDllPath.has_value())
++            {
++                const auto d = std::filesystem::path(Config::Instance()->MainDllPath.value()) / L"dittosr";
++                if (dirs.empty() || d.lexically_normal() != dirs[0].lexically_normal())
++                    dirs.push_back(d);
++            }
++        }
++
++        std::filesystem::path file;
++        bool found = false;
++        std::error_code ec;
++        for (const auto& d : dirs)
++        {
++            for (const auto& nm : names)
++            {
++                file = (d / nm).make_preferred();
++                if (std::filesystem::exists(file, ec))
++                {
++                    found = true;
++                    break;
++                }
++            }
++            if (found)
++                break;
++        }
++        if (dirs.empty())
++            dittosrVkWhy = "no folder (VELA_DITTOSR_DIR unset and OptiScaler's DLL folder unknown)";
++        else if (!found)
++        {
++            dittosrVkWhy = "no file";
++            file = (dirs[0] / names[0]).make_preferred();
++        }
++        else
++        {
++            dittosr_vk.dll = NtdllProxy::LoadLibraryExW_Ldr(file.c_str(), NULL, 0);
++            if (dittosr_vk.dll == nullptr)
++                dittosrVkWhy = "load failed (error " + std::to_string(GetLastError()) + ")";
++            else if (dittosr_vk.dll == main_vk.dll || dittosr_vk.dll == main_vk_hooked.dll)
++            {
++                dittosrVkWhy = "the loader answered with AMD's Vulkan module already loaded";
++                dittosr_vk.dll = nullptr;
++            }
++            else
++            {
++                auto gpa = KernelBaseProxy::GetProcAddress_();
++                dittosr_vk.Configure = (PfnFfxConfigure) gpa(dittosr_vk.dll, "ffxConfigure");
++                dittosr_vk.CreateContext = (PfnFfxCreateContext) gpa(dittosr_vk.dll, "ffxCreateContext");
++                dittosr_vk.DestroyContext = (PfnFfxDestroyContext) gpa(dittosr_vk.dll, "ffxDestroyContext");
++                dittosr_vk.Dispatch = (PfnFfxDispatch) gpa(dittosr_vk.dll, "ffxDispatch");
++                dittosr_vk.Query = (PfnFfxQuery) gpa(dittosr_vk.dll, "ffxQuery");
++                if (dittosr_vk.Configure == nullptr || dittosr_vk.CreateContext == nullptr ||
++                    dittosr_vk.DestroyContext == nullptr || dittosr_vk.Dispatch == nullptr ||
++                    dittosr_vk.Query == nullptr)
++                {
++                    dittosrVkWhy = "not an FFX API provider (an ffx* export is missing)";
++                    dittosr_vk.CreateContext = nullptr;
++                    dittosr_vk.Query = nullptr;
++                }
++            }
++        }
++
++        dittosr_vk.filePath = file.wstring();
++        if (dittosr_vk.CreateContext != nullptr)
++            LOG_INFO("Vela: DittoSR (Vulkan) loaded from {}", wstring_to_string(dittosr_vk.filePath));
++        else
++            LOG_WARN("Vela: DittoSR (Vulkan) not loaded from {}: {}",
++                     file.empty() ? std::string("-") : wstring_to_string(dittosr_vk.filePath), dittosrVkWhy);
++        return dittosr_vk.CreateContext != nullptr;
++    }
++
+     static HMODULE VkModule() { return main_vk.dll; }
+     static HMODULE VkModule_SR() { return upscaling_vk.dll; }
+     static HMODULE VkModule_FG() { return fg_vk.dll; }
+diff --git a/OptiScaler/upscalers/ffx/FFXFeature_Vk.cpp b/OptiScaler/upscalers/ffx/FFXFeature_Vk.cpp
+index b3c9afe9..bb5b1c9d 100644
+--- a/OptiScaler/upscalers/ffx/FFXFeature_Vk.cpp
++++ b/OptiScaler/upscalers/ffx/FFXFeature_Vk.cpp
+@@ -2,6 +2,7 @@
+ #include <Config.h>
+ #include <Util.h>
+ #include <proxies/FfxApi_Proxy.h>
++#include <upscalers/sgsr3/VelaLive.h>
+ #include "FFXFeature_Vk.h"
+ #include "nvsdk_ngx_vk.h"
+ #include "MathUtils.h"
+@@ -149,8 +150,14 @@ FFXFeatureVk::FFXFeatureVk(unsigned int InHandleId, NVSDK_NGX_Parameter* InParam
+ 
+     _moduleLoaded = FfxApiProxy::IsSRReadyVk();
+ 
+-    if (_moduleLoaded)
+-        LOG_INFO("FFX Vulkan upscaler methods loaded!");
++    // Vela 0040: the live model dittosr needs only DittoSR's own module
++    if (!_moduleLoaded && VelaLive::Poll().model == VelaLive::Model::DittoSR && FfxApiProxy::InitDittoSRVk())
++    {
++        LOG_INFO("Vela: no amd_fidelityfx_vk.dll, DittoSR's module alone");
++        _moduleLoaded = true;
++    }
++    else if (_moduleLoaded)
++        LOG_INFO("amd_fidelityfx_vk.dll methods loaded!");
+     else
+         LOG_ERROR("Can't load FFX Vulkan upscaler methods!");
+ 
+@@ -159,6 +166,22 @@ FFXFeatureVk::FFXFeatureVk(unsigned int InHandleId, NVSDK_NGX_Parameter* InParam
+         _moduleLoaded = true;
+ }
+ 
++// Vela 0040: the upscaler versions a provider module offers (ffxQuery GET_VERSIONS), into State as QueryVersionsVulkan
++static void VelaQueryVersionsVk(PfnFfxQuery query)
++{
++    ffxQueryDescGetVersions versionQuery {};
++    versionQuery.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
++    versionQuery.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
++    uint64_t versionCount = 0;
++    versionQuery.outputCount = &versionCount;
++    query(nullptr, &versionQuery.header);
++    State::Instance().ffxUpscalerVersionIds.resize(versionCount);
++    State::Instance().ffxUpscalerVersionNames.resize(versionCount);
++    versionQuery.versionIds = State::Instance().ffxUpscalerVersionIds.data();
++    versionQuery.versionNames = State::Instance().ffxUpscalerVersionNames.data();
++    query(nullptr, &versionQuery.header);
++}
++
+ bool FFXFeatureVk::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+ {
+     LOG_DEBUG("FFXFeatureVk::InitFFX");
+@@ -175,8 +198,86 @@ bool FFXFeatureVk::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+         return false;
+     }
+ 
++    // Vela 0040 (as 0036 in DX12): live model dittosr -- the context comes from DittoSR's own module
++    // (FfxApiProxy::InitDittoSRVk); when it cannot load or make the context, FSR 3 (AMD's amd_fidelityfx_vk.dll) as for
++    // fsr3, with one "cannot run" line
++    const VelaLive::Model velaModel = VelaLive::Poll().model;
++    bool ditto = velaModel == VelaLive::Model::DittoSR;
++    if (ditto && !FfxApiProxy::InitDittoSRVk())
++    {
++        LOG_WARN("Vela live: dittosr cannot run in this game ({}: {}); FSR 3 instead",
++                 wstring_to_string(FfxApiProxy::DittoSRVk_Path()), FfxApiProxy::DittoSRVk_Why());
++        ditto = false;
++    }
++    const bool amdReady = FfxApiProxy::VULKAN_CreateContext() != nullptr && FfxApiProxy::VULKAN_Query() != nullptr;
++    if (!ditto && !amdReady)
++    {
++        LOG_ERROR("Vela: no amd_fidelityfx_vk.dll for FSR 3 on Vulkan");
++        return false;
++    }
++
++    for (;;)
+     {
+         ScopedSkipSpoofingGlobal skipSpoofingGlobal {};
++        _ditto = ditto;
++
++        if (ditto)
++            VelaQueryVersionsVk(FfxApiProxy::DittoSRVk_Query());
++        else
++            QueryVersionsVulkan();
++
++        auto& names = State::Instance().ffxUpscalerVersionNames;
++        {
++            std::string all;
++            for (size_t i = 0; i < names.size(); i++)
++                all += (i ? ", " : "") + std::to_string(i) + "=" + std::string(names[i] != nullptr ? names[i] : "");
++            LOG_INFO("Vela: FFX upscaler versions (Vulkan{}): {}", ditto ? ", DittoSR" : "", all);
++        }
++
++        if (ditto)
++        {
++            // DittoSR's upscaler (the version named DittoSR, else its first)
++            int pick = names.empty() ? -1 : 0;
++            for (size_t i = 0; i < names.size(); i++)
++                if (names[i] != nullptr && std::string(names[i]).find("DittoSR") != std::string::npos)
++                {
++                    pick = (int) i;
++                    break;
++                }
++            if (pick < 0)
++            {
++                LOG_WARN("Vela live: dittosr cannot run in this game ({}: no upscaler version); FSR 3 instead",
++                         wstring_to_string(FfxApiProxy::DittoSRVk_Path()));
++                ditto = false;
++                if (!amdReady)
++                    return false;
++                continue;
++            }
++            Config::Instance()->FfxUpscalerIndex.set_volatile_value(pick);
++            LOG_INFO("Vela: FFX upscaler index {} ({}) for DittoSR", pick, names[pick] != nullptr ? names[pick] : "");
++        }
++        // Vela live model fsr3: FSR 3.1 -- the newest 3.x upscaler the FidelityFX DLL offers; also dittosr that could
++        // not run
++        else if (VelaLive::IsFfx(velaModel))
++        {
++            int best3 = -1;
++            for (size_t i = 0; i < names.size(); i++)
++            {
++                const std::string n = names[i] != nullptr ? names[i] : "";
++                if (n.rfind("3.", 0) == 0 &&
++                    (best3 < 0 || n > std::string(names[best3] != nullptr ? names[best3] : "")))
++                    best3 = (int) i;
++            }
++            if (best3 >= 0)
++            {
++                Config::Instance()->FfxUpscalerIndex.set_volatile_value(best3);
++                LOG_INFO("Vela: FFX upscaler index {} ({}) for FSR 3", best3, names[best3]);
++            }
++            else
++                LOG_WARN("Vela: FSR 3 asked, the FidelityFX DLL offers no 3.x upscaler");
++        }
++
++        InitFlags();
+ 
+         ffxCreateBackendVKDesc backendDesc = { 0 };
+         backendDesc.vkDevice = Device;
+@@ -202,11 +303,15 @@ bool FFXFeatureVk::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+ 
+         _contextDesc.header.pNext = &backendDesc.header;
+ 
+-        auto& upscalerIndex =
+-            Config::Instance()->FfxUpscalerIndexFor(_customUpscaler != nullptr ? _customUpscaler->name : "");
++        if (State::Instance().ffxUpscalerVersionIds.empty())
++        {
++            LOG_ERROR("Vela: the FidelityFX module offers no upscaler version");
++            return false;
++        }
+ 
+-        if (upscalerIndex.value_or_default() < 0 || upscalerIndex.value_or_default() >= versions.ids.size())
+-            upscalerIndex.set_volatile_value(0);
++        if (Config::Instance()->FfxUpscalerIndex.value_or_default() < 0 ||
++            Config::Instance()->FfxUpscalerIndex.value_or_default() >= State::Instance().ffxUpscalerVersionIds.size())
++            Config::Instance()->FfxUpscalerIndex.set_volatile_value(0);
+ 
+         ffxOverrideVersion ov = { 0 };
+         ov.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+@@ -250,20 +355,43 @@ bool FFXFeatureVk::InitFFX(const NVSDK_NGX_Parameter* InParameters)
+         }
+ 
+         LOG_DEBUG("_createContext!");
+-        auto ret = _ffx->CreateContext(&_context, &_contextDesc.header, NULL);
++        auto create = ditto ? FfxApiProxy::DittoSRVk_CreateContext() : FfxApiProxy::VULKAN_CreateContext();
++        auto ret = create(&_context, &_contextDesc.header, NULL);
+ 
+         if (ret != FFX_API_RETURN_OK)
+         {
++            if (ditto)
++            {
++                LOG_WARN("Vela live: dittosr cannot run in this game ({}: _createContext error {}); FSR 3 instead",
++                         wstring_to_string(FfxApiProxy::DittoSRVk_Path()), FfxApiProxy::ReturnCodeToString(ret));
++                _context = nullptr;
++                ditto = false;
++                _ditto = false;
++                if (!amdReady)
++                    return false;
++                continue;
++            }
+             LOG_ERROR("_createContext error: {0}", FfxApiProxy::ReturnCodeToString(ret));
+             return false;
+         }
+-    }
+ 
+-    auto& versions = _customUpscaler != nullptr ? _customUpscaler->versions : State::Instance().ffxUpscalerVersionsVk;
+-    auto& upscalerIndex =
+-        Config::Instance()->FfxUpscalerIndexFor(_customUpscaler != nullptr ? _customUpscaler->name : "");
+-    _name = "FSR";
+-    parse_version(versions.names[upscalerIndex.value_or_default()]);
++        auto version = names[Config::Instance()->FfxUpscalerIndex.value_or_default()];
++        _name = ditto ? "DittoSR" : "FSR";
++        parse_version(version);
++        if (ditto)
++        {
++            // "DittoSR (FSR 3.1.5 API) 0.5.4" -> "0.5.4"
++            std::string v = version != nullptr ? version : "";
++            if (const size_t sp = v.find_last_of(' '); v.rfind("DittoSR", 0) == 0 && sp != std::string::npos)
++                v = v.substr(sp + 1);
++            LOG_INFO("Vela live: handle {} model dittosr -> DittoSR {} (FFX provider {}, Vulkan)",
++                     Handle() != nullptr ? Handle()->Id : 0u, v, wstring_to_string(FfxApiProxy::DittoSRVk_Path()));
++        }
++        else
++            LOG_INFO("Vela: FSR {} context on Vulkan {}x{} -> {}x{}", version != nullptr ? version : "?",
++                     RenderWidth(), RenderHeight(), DisplayWidth(), DisplayHeight());
++        break;
++    }
+ 
+     SetInit(true);
+ 
+@@ -550,7 +678,7 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
+         m_upscalerKeyValueConfig.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+         m_upscalerKeyValueConfig.key = FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR;
+         m_upscalerKeyValueConfig.ptr = &_velocity;
+-        auto result = _ffx->Configure(&_context, &m_upscalerKeyValueConfig.header);
++        auto result = FfxConfigure()(&_context, &m_upscalerKeyValueConfig.header);
+ 
+         if (result != FFX_API_RETURN_OK)
+             LOG_WARN("Velocity configure result: {}", (UINT) result);
+@@ -565,7 +693,7 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
+             m_upscalerKeyValueConfig.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+             m_upscalerKeyValueConfig.key = FFX_API_CONFIGURE_UPSCALE_KEY_FREACTIVENESSSCALE;
+             m_upscalerKeyValueConfig.ptr = &_reactiveScale;
+-            auto result = _ffx->Configure(&_context, &m_upscalerKeyValueConfig.header);
++            auto result = FfxConfigure()(&_context, &m_upscalerKeyValueConfig.header);
+ 
+             if (result != FFX_API_RETURN_OK)
+                 LOG_WARN("Reactive Scale configure result: {}", (UINT) result);
+@@ -578,7 +706,7 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
+             m_upscalerKeyValueConfig.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+             m_upscalerKeyValueConfig.key = FFX_API_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE;
+             m_upscalerKeyValueConfig.ptr = &_shadingScale;
+-            auto result = _ffx->Configure(&_context, &m_upscalerKeyValueConfig.header);
++            auto result = FfxConfigure()(&_context, &m_upscalerKeyValueConfig.header);
+ 
+             if (result != FFX_API_RETURN_OK)
+                 LOG_WARN("Shading Scale configure result: {}", (UINT) result);
+@@ -591,7 +719,7 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
+             m_upscalerKeyValueConfig.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+             m_upscalerKeyValueConfig.key = FFX_API_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME;
+             m_upscalerKeyValueConfig.ptr = &_accAddPerFrame;
+-            auto result = _ffx->Configure(&_context, &m_upscalerKeyValueConfig.header);
++            auto result = FfxConfigure()(&_context, &m_upscalerKeyValueConfig.header);
+ 
+             if (result != FFX_API_RETURN_OK)
+                 LOG_WARN("Acc. Add Per Frame configure result: {}", (UINT) result);
+@@ -604,7 +732,7 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
+             m_upscalerKeyValueConfig.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+             m_upscalerKeyValueConfig.key = FFX_API_CONFIGURE_UPSCALE_KEY_FMINDISOCCLUSIONACCUMULATION;
+             m_upscalerKeyValueConfig.ptr = &_minDisOccAcc;
+-            auto result = _ffx->Configure(&_context, &m_upscalerKeyValueConfig.header);
++            auto result = FfxConfigure()(&_context, &m_upscalerKeyValueConfig.header);
+ 
+             if (result != FFX_API_RETURN_OK)
+                 LOG_WARN("Minimum Disocclusion Acc. configure result: {}", (UINT) result);
+@@ -666,7 +794,7 @@ bool FFXFeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Param
+     }
+ 
+     LOG_DEBUG("Dispatch!!");
+-    auto result = _ffx->Dispatch(&_context, &params.header);
++    auto result = FfxDispatch()(&_context, &params.header);
+ 
+     if (result != FFX_API_RETURN_OK)
+     {
+diff --git a/OptiScaler/upscalers/ffx/FFXFeature_Vk.h b/OptiScaler/upscalers/ffx/FFXFeature_Vk.h
+index 2859066d..eae159c0 100644
+--- a/OptiScaler/upscalers/ffx/FFXFeature_Vk.h
++++ b/OptiScaler/upscalers/ffx/FFXFeature_Vk.h
+@@ -9,20 +9,26 @@
+ class FFXFeatureVk : public FFXFeature, public IFeature_Vk
+ {
+   private:
+-    // FFX SDK dll, the driver provided upscaler or the custom upscaler's dll
+-    FfxModule* _ffx = nullptr;
+-
+-    // Custom upscaler dll, nullptr for the regular FFX ones
+-    CustomFfxModule* _customUpscaler = nullptr;
+-
+-    std::unique_ptr<VelocityConvert_Vk> _velocityConvert = nullptr;
+-
+-    // Last logged inputs of the driver provided FSR 4
+-    std::string _lastFsr4Inputs;
++    // Vela 0040: this context was made by DittoSR's module (FfxApiProxy::InitDittoSRVk): configure, dispatch and
++    // destroy go back to it, not to AMD's amd_fidelityfx_vk.dll
++    bool _ditto = false;
+ 
+   protected:
+     bool InitFFX(const NVSDK_NGX_Parameter* InParameters);
+ 
++    PfnFfxConfigure FfxConfigure() const
++    {
++        return _ditto ? FfxApiProxy::DittoSRVk_Configure() : FfxApiProxy::VULKAN_Configure();
++    }
++    PfnFfxDispatch FfxDispatch() const
++    {
++        return _ditto ? FfxApiProxy::DittoSRVk_Dispatch() : FfxApiProxy::VULKAN_Dispatch();
++    }
++    PfnFfxDestroyContext FfxDestroy() const
++    {
++        return _ditto ? FfxApiProxy::DittoSRVk_DestroyContext() : FfxApiProxy::VULKAN_DestroyContext();
++    }
++
+     // From IFeature_Vk
+     bool InitInternal(VkCommandBuffer InCmdList, NVSDK_NGX_Parameter* InParameters) override;
+     bool EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter* InParameters) override;
+@@ -46,7 +52,7 @@ class FFXFeatureVk : public FFXFeature, public IFeature_Vk
+         if (State::Instance().isShuttingDown)
+             return;
+ 
+-        if (_context != nullptr && _ffx != nullptr)
+-            _ffx->DestroyContext(&_context, NULL);
++        if (_context != nullptr && FfxDestroy() != nullptr)
++            FfxDestroy()(&_context, NULL);
+     }
+ };
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp
+index fec30cc3..28c507c5 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp
++++ b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp
+@@ -4,6 +4,7 @@
+ #include "precompile/SGSR2_upscale_Vk.h"
+ 
+ #include <Config.h>
++#include <upscalers/sgsr3/VelaLive.h>
+ #include <Util.h>
+ #include <MathUtils.h>
+ 
+@@ -354,6 +355,9 @@ bool SGSR2FeatureVk::InitInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Paramet
+     if (IsInited())
+         return true;
+ 
++    // Vela 0040 (VelaLive.h): re-created by a live model or ratio change, SGSR 2 takes the size the game draws now
++    VelaLive::TakeSubrect("SGSR2 (Vulkan)", _renderWidth, _renderHeight, DisplayWidth(), DisplayHeight());
++
+     LOG_INFO("Initializing SGSR2 (Vulkan) {}x{} -> {}x{}", RenderWidth(), RenderHeight(), DisplayWidth(),
+              DisplayHeight());
+ 
+-- 
+2.54.0.windows.1
+

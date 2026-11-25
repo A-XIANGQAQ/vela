@@ -1,0 +1,293 @@
+From 0fc3f01cb75222bf74eac4e3fe75f547d8f8ecfe Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 20:25:17 +0100
+Subject: [PATCH 30/65] 0029-vela-fsr2-dx11-adopt: FSR 2 contexts a DX11 game
+ creates through its exported ffxFsr2* functions run on OptiScaler's DX11 path
+ (Dx11Upscaler / Vela live: sgsr3_12, ffx_12, sgsr2_12)
+
+The DX12 FSR 2 exe hooks see these contexts first (HookFSR2ExeInputs runs unless UseFsr2Dx11Inputs). In a game with
+a D3D11 swapchain, ffxFsr2ContextCreate_Dx12 / _Pattern_Dx12 now hand a context whose FfxDevice is a D3D11 device
+the game created (hkD3D11CreateDevice list or currentD3D11Device) to the DX11 FSR 2 input (FSR2_Dx11.cpp:
+Fsr2Dx11AdoptContext): NGX DX11 capability parameters, init params (flags -> HDR / depth inverted / auto exposure /
+MV jittered / low-res MV), "context created" log line. The DX12 dispatch hooks (export + pattern) send an adopted
+context to Fsr2Dx11Dispatch: the command list must be that device's immediate context, the first dispatch makes an
+NVSDK_NGX_D3D11_CreateFeature (FeatureProvider_Dx11 -> the ini's Dx11Upscaler / Vela live model, "Vela live: handle
+N model ..." lines of 0027), then the DX11 input's evaluate (colour, depth, MV, reactive, exposure, output, jitter,
+MV scale, render size, preExposure, reset, camera near/far/fov, transparency). Destroy releases the feature.
+A device that is not a game D3D11 device (UE RHI backend), a deferred context or a failed feature create: the
+context stays with the game's FSR 2 (0028 pass-through), with a log line saying why.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 7dfa93f3a4e34ad3bad4bc929b6c8bcdd3e79be8)
+---
+ OptiScaler/inputs/FSR2_Dx11.cpp | 147 ++++++++++++++++++++++++++++++++
+ OptiScaler/inputs/FSR2_Dx11.h   |   9 ++
+ OptiScaler/inputs/FSR2_Dx12.cpp |  24 ++++++
+ 3 files changed, 180 insertions(+)
+
+diff --git a/OptiScaler/inputs/FSR2_Dx11.cpp b/OptiScaler/inputs/FSR2_Dx11.cpp
+index 40b33e09..d0e4bec4 100644
+--- a/OptiScaler/inputs/FSR2_Dx11.cpp
++++ b/OptiScaler/inputs/FSR2_Dx11.cpp
+@@ -253,6 +253,8 @@ static FfxErrorCode ffxFsr2ContextCreate_Dx11(FfxFsr2Context* context, FfxFsr2Co
+     return FFX_OK;
+ }
+ 
++static FfxErrorCode EvaluateAdopted(FfxFsr2Context* context, const FfxFsr2DispatchDescription* dispatchDescription);
++
+ // FSR2.1
+ static FfxErrorCode ffxFsr2ContextDispatch_Dx11(FfxFsr2Context* context,
+                                                 const FfxFsr2DispatchDescription* dispatchDescription)
+@@ -269,6 +271,12 @@ static FfxErrorCode ffxFsr2ContextDispatch_Dx11(FfxFsr2Context* context,
+         return result;
+     }
+ 
++    return EvaluateAdopted(context, dispatchDescription);
++}
++
++// The context is ours (_nvParams has it): NGX DX11 feature create on the first dispatch, then evaluate
++static FfxErrorCode EvaluateAdopted(FfxFsr2Context* context, const FfxFsr2DispatchDescription* dispatchDescription)
++{
+     if (dispatchDescription == nullptr || context == nullptr || dispatchDescription->commandList == nullptr)
+         return FFX_ERROR_INVALID_ARGUMENT;
+ 
+@@ -506,3 +514,142 @@ void HookFSR2Dx11ExeInputs()
+             State::Instance().fsrHooks = true;
+     }
+ }
++
++// ---------------------------------------------------------------- Vela 0029: DX11 FSR 2 input from the DX12 hooks
++static bool IsGameD3D11Device(ID3D11Device* device)
++{
++    auto& state = State::Instance();
++
++    for (size_t i = 0; i < state.d3d11Devices.size(); i++)
++    {
++        if (state.d3d11Devices[i] == device)
++            return true;
++    }
++
++    return device != nullptr && state.currentD3D11Device == device;
++}
++
++bool Fsr2Dx11AdoptContext(void* ctx, const void* desc)
++{
++    auto context = (FfxFsr2Context*) ctx;
++    auto contextDescription = (const FfxFsr2ContextDescription*) desc;
++
++    if (context == nullptr || contextDescription == nullptr || contextDescription->device == nullptr)
++        return false;
++
++    if (!Config::Instance()->UseFsr2Inputs.value_or_default())
++        return false;
++
++    auto& state = State::Instance();
++    auto bDevice = (ID3D11Device*) contextDescription->device;
++
++    // Only a D3D11 device the game created (seen by hkD3D11CreateDevice): an engine backend (UE RHI) passes its
++    // own object as FfxDevice, its resources are not ID3D11Resource; those stay with the game's FSR 2
++    if (!IsGameD3D11Device(bDevice))
++    {
++        LOG_INFO("FSR 2 context {:X}: device {:X} is not a D3D11 device of the game ({} known, current {:X})",
++                 (size_t) context, (size_t) bDevice, state.d3d11Devices.size(), (size_t) state.currentD3D11Device);
++        return false;
++    }
++
++    if (!state.nvngxDx11Inited)
++    {
++        NVSDK_NGX_FeatureCommonInfo fcInfo {};
++        auto exePath = Util::ExePath().remove_filename();
++
++        auto nvResult = NVSDK_NGX_D3D11_Init_with_ProjectID(
++            OPTI_GUID, state.NVNGX_Engine, OPTI_VERSION, exePath.c_str(), bDevice, &fcInfo,
++            state.NVNGX_Version == 0 ? NVSDK_NGX_Version_API : state.NVNGX_Version);
++
++        if (nvResult != NVSDK_NGX_Result_Success)
++        {
++            LOG_ERROR("FSR 2 context {:X}: NGX D3D11 init failed {:X}", (size_t) context, (UINT) nvResult);
++            return false;
++        }
++
++        _nvnxgInited = true;
++    }
++
++    NVSDK_NGX_Parameter* params = nullptr;
++
++    if (NVSDK_NGX_D3D11_GetCapabilityParameters(&params) != NVSDK_NGX_Result_Success || params == nullptr)
++        return false;
++
++    _d3d11Device = bDevice;
++    _nvParams[context] = params;
++
++    FfxFsr2ContextDescription ccd {};
++    ccd.flags = contextDescription->flags;
++    ccd.maxRenderSize = contextDescription->maxRenderSize;
++    ccd.displaySize = contextDescription->displaySize;
++    _initParams[context] = ccd;
++
++    LOG_INFO("context created: {:X} (FSR 2 DX11 input, max render {}x{}, display {}x{}, flags {:X})", (size_t) context,
++             ccd.maxRenderSize.width, ccd.maxRenderSize.height, ccd.displaySize.width, ccd.displaySize.height,
++             (UINT) ccd.flags);
++
++    return true;
++}
++
++void Fsr2Dx11ForgetContext(void* ctx)
++{
++    auto context = (FfxFsr2Context*) ctx;
++
++    if (context == nullptr || !_nvParams.contains(context))
++        return;
++
++    if (_contexts.contains(context) && _contexts[context] != nullptr)
++        NVSDK_NGX_D3D11_ReleaseFeature(_contexts[context]);
++
++    _contexts.erase(context);
++    _nvParams.erase(context);
++    _initParams.erase(context);
++
++    LOG_INFO("FSR 2 DX11 context {:X} released", (size_t) context);
++}
++
++std::optional<int32_t> Fsr2Dx11Dispatch(void* ctx, const void* desc)
++{
++    auto context = (FfxFsr2Context*) ctx;
++    auto dispatchDescription = (const FfxFsr2DispatchDescription*) desc;
++
++    if (context == nullptr || !_nvParams.contains(context))
++        return std::nullopt;
++
++    if (dispatchDescription == nullptr || dispatchDescription->commandList == nullptr)
++        return (int32_t) FFX_ERROR_INVALID_ARGUMENT;
++
++    // The command list must be the immediate context of the adopted device; a deferred context or an engine
++    // object goes back to the game's FSR 2 for good
++    ID3D11DeviceContext* immediate = nullptr;
++
++    if (_d3d11Device != nullptr)
++        _d3d11Device->GetImmediateContext(&immediate);
++
++    if (immediate != nullptr)
++        immediate->Release();
++
++    if (immediate == nullptr || (ID3D11DeviceContext*) dispatchDescription->commandList != immediate)
++    {
++        LOG_WARN("FSR 2 context {:X}: command list {:X} is not the immediate context {:X}, left to the game",
++                 (size_t) context, (size_t) dispatchDescription->commandList, (size_t) immediate);
++        Fsr2Dx11ForgetContext(context);
++        return std::nullopt;
++    }
++
++    if (!_contexts.contains(context))
++    {
++        if (!CreateDLSSContext(context, dispatchDescription))
++        {
++            LOG_ERROR("FSR 2 context {:X}: OptiScaler DX11 feature not created, left to the game", (size_t) context);
++            Fsr2Dx11ForgetContext(context);
++            return std::nullopt;
++        }
++
++        LOG_INFO("FSR 2 DX11 context {:X}: feature handle {} ({}x{} -> {}x{})", (size_t) context,
++                 _contexts[context]->Id, dispatchDescription->renderSize.width, dispatchDescription->renderSize.height,
++                 _initParams[context].displaySize.width, _initParams[context].displaySize.height);
++    }
++
++    return (int32_t) EvaluateAdopted(context, dispatchDescription);
++}
+diff --git a/OptiScaler/inputs/FSR2_Dx11.h b/OptiScaler/inputs/FSR2_Dx11.h
+index ccedbf42..362b91ef 100644
+--- a/OptiScaler/inputs/FSR2_Dx11.h
++++ b/OptiScaler/inputs/FSR2_Dx11.h
+@@ -3,3 +3,12 @@
+ 
+ void HookFSR2Dx11ExeInputs();
+ void FSR2Dx11DeviceDestroyed(IUnknown* device);
++
++// Vela 0029: FSR 2 contexts that a DX11 game creates through its exe-exported ffxFsr2* functions are hooked by the
++// DX12 FSR 2 input (FSR2_Dx12.cpp); it hands them here, and they run through OptiScaler's NGX DX11 path
++// (FeatureProvider_Dx11: Dx11Upscaler / the Vela live model). void* = FfxFsr2Context* / descriptions (FSR 2.x).
++#include <optional>
++#include <cstdint>
++bool Fsr2Dx11AdoptContext(void* context, const void* contextDescription);
++std::optional<int32_t> Fsr2Dx11Dispatch(void* context, const void* dispatchDescription);
++void Fsr2Dx11ForgetContext(void* context);
+diff --git a/OptiScaler/inputs/FSR2_Dx12.cpp b/OptiScaler/inputs/FSR2_Dx12.cpp
+index 872a8aee..1cf2368a 100644
+--- a/OptiScaler/inputs/FSR2_Dx12.cpp
++++ b/OptiScaler/inputs/FSR2_Dx12.cpp
+@@ -1,6 +1,7 @@
+ #include "pch.h"
+ #include "FSR2_Dx12.h"
+ #include "NVNGX_DLSS.h"
++#include "FSR2_Dx11.h"
+ 
+ #include "Util.h"
+ #include "Config.h"
+@@ -406,6 +407,10 @@ static Fsr212::FfxErrorCode ffxFsr2ContextCreate_Dx12(Fsr212::FfxFsr2Context* co
+     // and its dispatch would then treat the D3D11 command list as ID3D12GraphicsCommandList
+     if (_d3d12Device == nullptr && state.swapchainApi == API::DX11)
+     {
++        // Vela 0029: a D3D11 device of the game -> OptiScaler's DX11 FSR 2 input (FeatureProvider_Dx11)
++        if (Fsr2Dx11AdoptContext(context, contextDescription))
++            return ccResult;
++
+         LOG_INFO("FSR 2 context {:X} in a DX11 game, device is not D3D12: left to the game", (size_t) context);
+         return ccResult;
+     }
+@@ -500,6 +505,10 @@ static Fsr212::FfxErrorCode ffxFsr2ContextCreate_Pattern_Dx12(Fsr212::FfxFsr2Con
+     // and its dispatch would then treat the D3D11 command list as ID3D12GraphicsCommandList
+     if (_d3d12Device == nullptr && state.swapchainApi == API::DX11)
+     {
++        // Vela 0029: a D3D11 device of the game -> OptiScaler's DX11 FSR 2 input (FeatureProvider_Dx11)
++        if (Fsr2Dx11AdoptContext(context, contextDescription))
++            return ccResult;
++
+         LOG_INFO("FSR 2 context {:X} in a DX11 game, device is not D3D12: left to the game", (size_t) context);
+         return ccResult;
+     }
+@@ -570,6 +579,10 @@ static Fsr212::FfxErrorCode ffxFsr2ContextDispatch_Dx12(Fsr212::FfxFsr2Context*
+         return ffxFsr20ContextDispatch_Dx12(context, (FfxFsr20DispatchDescription*) dispatchDescription);
+     }
+ 
++    // Vela 0029: a context adopted by the DX11 FSR 2 input
++    if (auto dx11Result = Fsr2Dx11Dispatch(context, dispatchDescription); dx11Result.has_value())
++        return (Fsr212::FfxErrorCode) dx11Result.value();
++
+     // Skip OptiScaler stuff
+     // A context OptiScaler did not adopt (its create hook found no D3D12 device, e.g. a DX11 game's
+     // own FSR 2 on its RHI backend) runs the game's FSR 2: _nvParams[context] would be a null pointer
+@@ -639,6 +652,13 @@ ffxFsr2ContextDispatch_Pattern_Dx12(Fsr212::FfxFsr2Context* context,
+ {
+     LOG_DEBUG("");
+ 
++    // Vela 0029: a context adopted by the DX11 FSR 2 input
++    if (!_skipDispatch)
++    {
++        if (auto dx11Result = Fsr2Dx11Dispatch(context, dispatchDescription); dx11Result.has_value())
++            return (Fsr212::FfxErrorCode) dx11Result.value();
++    }
++
+     // Skip OptiScaler stuff
+     if (!Config::Instance()->UseFsr2Inputs.value_or_default() || _skipDispatch || !_nvParams.contains(context))
+     {
+@@ -913,6 +933,8 @@ static Fsr212::FfxErrorCode ffxFsr2ContextDestroy_Dx12(Fsr212::FfxFsr2Context* c
+     if (context == nullptr)
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
++    Fsr2Dx11ForgetContext(context);
++
+     if (_contexts.contains(context))
+         NVSDK_NGX_D3D12_ReleaseFeature(_contexts[context]);
+ 
+@@ -938,6 +960,8 @@ static Fsr212::FfxErrorCode ffxFsr2ContextDestroy_Pattern_Dx12(Fsr212::FfxFsr2Co
+     if (context == nullptr)
+         return Fsr212::FFX_ERROR_INVALID_ARGUMENT;
+ 
++    Fsr2Dx11ForgetContext(context);
++
+     if (_contexts.contains(context))
+         NVSDK_NGX_D3D12_ReleaseFeature(_contexts[context]);
+ 
+-- 
+2.54.0.windows.1
+

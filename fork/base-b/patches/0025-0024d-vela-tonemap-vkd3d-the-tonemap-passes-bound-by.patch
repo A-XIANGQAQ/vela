@@ -1,0 +1,37 @@
+From a5ae008189da2e5b5fbfe0a5bcf7c0c4dbf1a982 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 16:10:57 +0100
+Subject: [PATCH 25/65] 0024d-vela-tonemap-vkd3d: the tonemap passes bound by
+ SGSR2Params renderSize / displaySize instead of RWTexture2D::GetDimensions,
+ which Proton's vkd3d-shader HLSL compiler lacks (fk7: E5005, both passes
+ failed to compile)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 21f595df9688d9be391cbc73109fa92175cf1fb3)
+---
+ OptiScaler/upscalers/sgsr2/SGSR2_Shaders.h | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2_Shaders.h b/OptiScaler/upscalers/sgsr2/SGSR2_Shaders.h
+index c667fc92..1da1250a 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2_Shaders.h
++++ b/OptiScaler/upscalers/sgsr2/SGSR2_Shaders.h
+@@ -330,9 +330,12 @@ RWTexture2D<float4> VtOut : register(u0);
+ [numthreads(8, 8, 1)]
+ void CSMain(uint3 tid : SV_DispatchThreadID)
+ {
+-    uint w, h;
+-    VtOut.GetDimensions(w, h);
+-    if (tid.x >= w || tid.y >= h)
++#ifdef VELA_TM_IN
++    uint2 sz = renderSize;   // 0024d: no RWTexture2D::GetDimensions in vkd3d-shader (Proton's D3DCompile): the size from SGSR2Params
++#else
++    uint2 sz = displaySize;
++#endif
++    if (tid.x >= sz.x || tid.y >= sz.y)
+         return;
+     float4 c = VtIn.Load(int3(tid.xy, 0));
+     float pe = preExposure > 0.0f ? preExposure : 1.0f;
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,226 @@
+From 8ade3a97abc865a2165030e7778d336a5affa25f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 14:49:21 +0100
+Subject: [PATCH 24/65] 0024c-vela-nodepth-tonemap: the no-depth EASU inside a
+ reversible max-channel tonemap with preExposure (white speckles on HDR edges
+ in 0024b); stray SGSR 2 no-depth log line out. NOT console-tested (owner stop
+ 14:5x)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 449f36d21b5bb05fecfa70d1e8d64d891ad367be)
+---
+ OptiScaler/upscalers/sgsr2/SGSR2Feature.cpp   |  6 +-
+ .../upscalers/sgsr2/SGSR2Feature_Dx12.cpp     | 68 +++++++++++++++++--
+ .../upscalers/sgsr2/SGSR2Feature_Dx12.h       |  5 ++
+ .../upscalers/sgsr2/SGSR2Feature_Vk.cpp       |  4 +-
+ OptiScaler/upscalers/sgsr2/SGSR2_Shaders.h    | 26 +++++++
+ 5 files changed, 97 insertions(+), 12 deletions(-)
+
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2Feature.cpp b/OptiScaler/upscalers/sgsr2/SGSR2Feature.cpp
+index 7e38e361..73dbb3ec 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2Feature.cpp
++++ b/OptiScaler/upscalers/sgsr2/SGSR2Feature.cpp
+@@ -152,11 +152,7 @@ bool SGSR2Feature::UpdateSharedConstants(NVSDK_NGX_Parameter* InParameters)
+     // softer picture with no ghosting. OPTI_VELA_NODEPTH_HISTORY=1 keeps the history (the old behaviour).
+     static const bool keepHistoryNoDepth = std::getenv("OPTI_VELA_NODEPTH_HISTORY") != nullptr;
+     const bool noDepthNoHistory = _constants.hasDepth == 0 && !keepHistoryNoDepth;
+-    if (noDepthNoHistory && !_loggedNoHistory)
+-    {
+-        _loggedNoHistory = true;
+-        LOG_INFO("Vela: SGSR 2 without depth: history off every frame (no ghosting, a softer picture)");
+-    }
++    // 0024c: no log line here (D3D12 never runs SGSR 2 without depth now; the Vulkan path's own no-depth warning says history off)
+     _constants.reset = (reset != 0 || !_historyValid || noDepthNoHistory) ? 1u : 0u;
+ 
+ 
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp
+index d7eab9b2..5250cd91 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp
++++ b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.cpp
+@@ -170,6 +170,7 @@ bool SGSR2FeatureDx12::CreatePipelines(ID3D12Device* device)
+     // EvaluateInternal, sidesteps whatever in that toolchain miscompiles the
+     // branch instead of relying on it being fixed upstream.
+     const D3D_SHADER_MACRO hasDepthMacro[] = { { "HAS_DEPTH", "1" }, { nullptr, nullptr } };
++    static const D3D_SHADER_MACRO velaTmIn[] = { { "VELA_TM_IN", "1" }, { nullptr, nullptr } };  // 0024c
+ 
+     struct
+     {
+@@ -181,6 +182,8 @@ bool SGSR2FeatureDx12::CreatePipelines(ID3D12Device* device)
+         { SGSR2_ConvertShader, "SGSR2_Convert (depth)", hasDepthMacro, &_convertPipeline },
+         { SGSR2_ConvertShader, "SGSR2_Convert (no depth)", nullptr, &_convertPipelineNoDepth },
+         { SGSR2_UpscaleShader, "SGSR2_Upscale", nullptr, &_upscalePipeline },
++        { SGSR2_VelaTonemapShader, "Vela tonemap in (0024c)", velaTmIn, &_vtInPipeline },
++        { SGSR2_VelaTonemapShader, "Vela tonemap out (0024c)", nullptr, &_vtOutPipeline },
+     };
+ 
+     for (auto& pass : passes)
+@@ -188,9 +191,12 @@ bool SGSR2FeatureDx12::CreatePipelines(ID3D12Device* device)
+         // cs_5_0 keeps this compatible with Wine's d3dcompiler and vkd3d-proton,
+         // which is what actually runs under Proton on ARM64.
+         ID3DBlob* blob = CompileShader(pass.source, "CSMain", "cs_5_0", pass.defines);
++        const bool velaOptional = pass.target == &_vtInPipeline || pass.target == &_vtOutPipeline;  // 0024c: never in SGSR 2's way
+         if (blob == nullptr)
+         {
+             LOG_ERROR("Failed to compile {0}", pass.name);
++            if (velaOptional)
++                continue;
+             return false;
+         }
+ 
+@@ -205,6 +211,11 @@ bool SGSR2FeatureDx12::CreatePipelines(ID3D12Device* device)
+         if (FAILED(hr))
+         {
+             LOG_ERROR("CreateComputePipelineState failed for {0}: {1:X}", pass.name, (UINT) hr);
++            if (velaOptional)
++            {
++                *pass.target = nullptr;
++                continue;
++            }
+             return false;
+         }
+     }
+@@ -958,14 +969,57 @@ bool SGSR2FeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList
+         ID3D12Resource* target = direct ? paramOutput : _outputBuffer;
+         if (direct && outputState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+             ResourceBarrier(InCommandList, paramOutput, (D3D12_RESOURCE_STATES) outputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+-        const auto cd = paramColor->GetDesc();
+-        const bool ok = _spatial->DispatchSized(InCommandList, paramColor, target, RenderWidth(), RenderHeight(), (uint32_t) cd.Width,
+-                                                cd.Height, TargetWidth(), TargetHeight());
++        // 0024c: EASU inside a reversible max-channel tonemap (EASU is made for LDR: HDR colour gave white speckles on bright edges)
++        if (_vtIn == nullptr)
++            _vtIn = CreateTexture(Device, RenderWidth(), RenderHeight(), DXGI_FORMAT_R16G16B16A16_FLOAT, L"Vela_TM_In");
++        if (_vtOut == nullptr)
++            _vtOut = CreateTexture(Device, TargetWidth(), TargetHeight(), DXGI_FORMAT_R16G16B16A16_FLOAT, L"Vela_TM_Out");
++        bool ok = _vtIn != nullptr && _vtOut != nullptr && _vtInPipeline != nullptr && _vtOutPipeline != nullptr;
++        if (ok)
++        {
++            ID3D12DescriptorHeap* heaps[] = { _descriptorHeap };
++            const uint32_t cbStride = (sizeof(SGSR2Constants) + 255) & ~255u;
++            auto bindTm = [&](uint32_t pass, ID3D12Resource* src, DXGI_FORMAT srcFmt, ID3D12Resource* dst, DXGI_FORMAT dstFmt,
++                              ID3D12PipelineState* pso, uint32_t w, uint32_t h)
++            {
++                InCommandList->SetDescriptorHeaps(1, heaps);
++                InCommandList->SetComputeRootSignature(_rootSignature);
++                InCommandList->SetComputeRootConstantBufferView(0, _constantBuffer->GetGPUVirtualAddress() +
++                                                                       (UINT64) _ringIndex * cbStride);
++                ID3D12Resource* srvs[SRV_Count] = { src, nullptr, nullptr, nullptr };
++                DXGI_FORMAT srvFormats[SRV_Count] = { srcFmt, srcFmt, srcFmt, srcFmt };
++                ID3D12Resource* uavs[UAV_Count] = { dst, nullptr, nullptr };
++                DXGI_FORMAT uavFormats[UAV_Count] = { dstFmt, dstFmt, dstFmt };
++                auto table = BindPass(Device, pass, srvs, srvFormats, uavs, uavFormats);
++                InCommandList->SetPipelineState(pso);
++                InCommandList->SetComputeRootDescriptorTable(1, table);
++                auto uavTable = table;
++                uavTable.ptr += (UINT64) SRV_Count * _descriptorSize;
++                InCommandList->SetComputeRootDescriptorTable(2, uavTable);
++                InCommandList->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
++            };
++            // in: the game's colour -> _vtIn (render size)
++            bindTm(0, paramColor, ResolveFormat(paramColor->GetDesc().Format), _vtIn, DXGI_FORMAT_R16G16B16A16_FLOAT, _vtInPipeline,
++                   RenderWidth(), RenderHeight());
++            ResourceBarrier(InCommandList, _vtIn, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++            // EASU: _vtIn -> _vtOut (output size)
++            ok = _spatial->DispatchSized(InCommandList, _vtIn, _vtOut, RenderWidth(), RenderHeight(), RenderWidth(), RenderHeight(),
++                                         TargetWidth(), TargetHeight());
++            ResourceBarrier(InCommandList, _vtIn, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++            ResourceBarrier(InCommandList, _vtOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++            // out: _vtOut -> the target, back to the game's range
++            bindTm(1, _vtOut, DXGI_FORMAT_R16G16B16A16_FLOAT, target,
++                   direct ? ResolveFormat(paramOutput->GetDesc().Format) : DXGI_FORMAT_R16G16B16A16_FLOAT, _vtOutPipeline, TargetWidth(),
++                   TargetHeight());
++            ResourceBarrier(InCommandList, _vtOut, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++        }
+         if (!_loggedSpatial)
+         {
+             _loggedSpatial = true;
+-            LOG_INFO("Vela: no depth buffer: FSR 1 EASU of the colour {0}x{1} -> {2}x{3} instead of SGSR 2 (no history, no ghosting){4}",
+-                     RenderWidth(), RenderHeight(), TargetWidth(), TargetHeight(), ok ? "" : " -- FAILED to dispatch");
++            LOG_INFO("Vela: no depth buffer: FSR 1 EASU of the colour {0}x{1} -> {2}x{3} inside a reversible tonemap (preExposure {4}) "
++                     "instead of SGSR 2 (no history, no ghosting){5}",
++                     RenderWidth(), RenderHeight(), TargetWidth(), TargetHeight(), _constants.preExposure,
++                     ok ? "" : " -- FAILED (textures / pipelines / dispatch)");
+         }
+         if (direct)
+         {
+@@ -1291,6 +1345,10 @@ void SGSR2FeatureDx12::ReleaseResources()
+     release(_convertPipeline);
+     release(_convertPipelineNoDepth);
+     release(_upscalePipeline);
++    release(_vtInPipeline);
++    release(_vtOutPipeline);
++    release(_vtIn);
++    release(_vtOut);
+     release(_rootSignature);
+ }
+ 
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.h b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.h
+index 55b83020..32af3926 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.h
++++ b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Dx12.h
+@@ -84,6 +84,11 @@ class SGSR2FeatureDx12 : public SGSR2Feature, public IFeature_Dx12
+     bool _loggedNoDepth = false;
+     // 0024b: a context without depth: FSR 1 EASU of the colour instead of SGSR 2 (whose no-depth path drew Manor Lords' scene dark)
+     std::unique_ptr<OS_Dx12> _spatial;
++    // 0024c: the reversible tonemap around it (two passes, SGSR 2's root signature) and its two textures
++    ID3D12PipelineState* _vtInPipeline = nullptr;
++    ID3D12PipelineState* _vtOutPipeline = nullptr;
++    ID3D12Resource* _vtIn = nullptr;  // render size, RGBA16F: the tonemapped colour EASU reads
++    ID3D12Resource* _vtOut = nullptr; // output size, RGBA16F: EASU's result before the inverse
+     bool _loggedSpatial = false;
+ 
+     // GPU timing, opt-in via OPTI_SGSR2_TIMING=1.
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp
+index 78834f65..fec30cc3 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp
++++ b/OptiScaler/upscalers/sgsr2/SGSR2Feature_Vk.cpp
+@@ -413,8 +413,8 @@ bool SGSR2FeatureVk::EvaluateInternal(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Par
+     if (paramDepth == nullptr && !_loggedNoDepth)
+     {
+         _loggedNoDepth = true;
+-        LOG_WARN("No depth buffer supplied; running without disocclusion detection. "
+-                 "Expect ghosting where geometry is revealed from behind an edge.");
++        LOG_WARN("No depth buffer supplied; running without disocclusion detection: "
++                 "Vela turns the history off every frame (0024: no ghosting, a softer picture).");
+     }
+ 
+     _constants.hasDepth = (paramDepth != nullptr) ? 1u : 0u;
+diff --git a/OptiScaler/upscalers/sgsr2/SGSR2_Shaders.h b/OptiScaler/upscalers/sgsr2/SGSR2_Shaders.h
+index 85edc282..c667fc92 100644
+--- a/OptiScaler/upscalers/sgsr2/SGSR2_Shaders.h
++++ b/OptiScaler/upscalers/sgsr2/SGSR2_Shaders.h
+@@ -322,6 +322,32 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
+ // Inputs : PrevHistoryOutput (display res), MotionDepthClipAlphaBuffer, YCoCgColor
+ // Outputs: SceneColorOutput (display res), HistoryOutput (display res)
+ // ----------------------------------------------------------------------------
++// Vela 0.8.22 (0024c): the reversible max-channel tonemap around the no-depth FSR 1 EASU (D3D12). VELA_TM_IN: colour -> [0,1);
++// otherwise back. preExposure comes from SGSR2Params like everywhere else here.
++inline const char* SGSR2_VelaTonemapShader = SGSR2_COMMON_HLSL R"(
++Texture2D<float4>   VtIn  : register(t0);
++RWTexture2D<float4> VtOut : register(u0);
++[numthreads(8, 8, 1)]
++void CSMain(uint3 tid : SV_DispatchThreadID)
++{
++    uint w, h;
++    VtOut.GetDimensions(w, h);
++    if (tid.x >= w || tid.y >= h)
++        return;
++    float4 c = VtIn.Load(int3(tid.xy, 0));
++    float pe = preExposure > 0.0f ? preExposure : 1.0f;
++#ifdef VELA_TM_IN
++    float3 x = max(c.rgb / pe, 0.0f);
++    float m = max(max(x.r, x.g), x.b);
++    VtOut[tid.xy] = float4(x / (1.0f + m), c.a);
++#else
++    float3 t = saturate(c.rgb);
++    float m = max(max(t.r, t.g), t.b);
++    VtOut[tid.xy] = float4(t / max(1.0f - m, 1.0f / 1024.0f) * pe, c.a);
++#endif
++}
++)";
++
+ inline const char* SGSR2_UpscaleShader = SGSR2_COMMON_HLSL R"(
+ #ifdef VK_MODE
+ [[vk::binding(3, 0)]]
+-- 
+2.54.0.windows.1
+

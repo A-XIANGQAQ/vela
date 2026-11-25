@@ -1,0 +1,370 @@
+From f5d1c2a400af9441db4c7b226e9ec377b504d0d0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 23:00:30 +0100
+Subject: [PATCH 35/65] 0034-vela-ue-fsr2-slots: the UE FSR 2 passes are found
+ from the first job (luminance pyramid), not the reconstruct pass (k2ue1:
+ every 80x45 engine dispatch restarted the match); inputs and output taken at
+ the slots the FFX pipeline gave them (fpCreatePipeline
+ srv/uavResourceBindings) when the D3D11 texture passes a size / depth /
+ 1x1-exposure check, else by description (depth by any depth format); slot
+ table and the method logged once per context
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 4428e306e56ae7b78cccca1fc302ed1a8cdb25e8)
+---
+ OptiScaler/inputs/FSR2_Dx11.cpp | 247 ++++++++++++++++++++++++++++++--
+ 1 file changed, 235 insertions(+), 12 deletions(-)
+
+diff --git a/OptiScaler/inputs/FSR2_Dx11.cpp b/OptiScaler/inputs/FSR2_Dx11.cpp
+index 18210c49..e139c6eb 100644
+--- a/OptiScaler/inputs/FSR2_Dx11.cpp
++++ b/OptiScaler/inputs/FSR2_Dx11.cpp
+@@ -700,12 +700,16 @@ struct UeJob
+     UINT x = 0, y = 0, z = 0;
+ };
+ 
++using UeSlots = std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>;
++
+ struct UeBackend // per FfxFsr2Interface scratch buffer of the engine backend; never erased
+ {
+     FfxFsr2CreatePipelineFunc oCreatePipeline = nullptr;
+     FfxFsr2ScheduleGpuJobFunc oScheduleGpuJob = nullptr;
+     FfxFsr2ExecuteGpuJobsFunc oExecuteGpuJobs = nullptr;
+     std::unordered_map<void*, uint32_t> passByPipeline;
++    UeSlots srvSlots; // Vela 0034: pass -> (FFX resource identifier, slotIndex) from fpCreatePipeline
++    UeSlots uavSlots;
+     std::vector<UeJob> jobs;
+     FfxFsr2Context* context = nullptr;
+ };
+@@ -723,13 +727,18 @@ struct UeContext
+     uint64_t replaced = 0;
+     std::unordered_set<ID3D11Resource*> seenNow;  // bound as SRV in an FSR 2 pass of this frame
+     std::unordered_set<ID3D11Resource*> seenPrev; // ... of the frame before (ping-pong history textures)
++    UeSlots srvSlots;
++    UeSlots uavSlots;
++    bool loggedInputs = false;
++    bool loggedOutput = false;
+ };
+ 
+ struct UeFrame
+ {
+     FfxFsr2Context* context = nullptr;
+     FfxFsr2DispatchDescription params {};
+-    std::vector<UeJob> jobs; // from the reconstruct pass to the last pass
++    std::vector<UeJob> jobs; // all compute jobs of the dispatch (0034: the first one anchors the sequence)
++    size_t recon = 0;        // index of the reconstruct pass
+     size_t cursor = 0;
+     uint32_t foreign = 0;
+     Microsoft::WRL::ComPtr<ID3D11Resource> color, depth, mv, exposure, reactive;
+@@ -1039,6 +1048,93 @@ std::vector<UeTex> UeBoundUavs(ID3D11DeviceContext* ctx, std::vector<Microsoft::
+     return out;
+ }
+ 
++// Vela 0034: the texture behind each CS SRV / UAV slot (res nullptr = empty slot)
++std::vector<UeTex> UeSrvSlots(ID3D11DeviceContext* ctx, std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>>& keep)
++{
++    std::vector<UeTex> out(UE_SRV_SLOTS);
++    ID3D11ShaderResourceView* srvs[UE_SRV_SLOTS] {};
++    ctx->CSGetShaderResources(0, UE_SRV_SLOTS, srvs);
++
++    for (UINT i = 0; i < UE_SRV_SLOTS; i++)
++    {
++        if (srvs[i] == nullptr)
++            continue;
++
++        Microsoft::WRL::ComPtr<ID3D11Resource> res;
++        srvs[i]->GetResource(res.GetAddressOf());
++        srvs[i]->Release();
++
++        if (UeTexOf(res.Get(), out[i]))
++            keep.push_back(res);
++    }
++
++    return out;
++}
++
++std::vector<UeTex> UeUavSlots(ID3D11DeviceContext* ctx, std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>>& keep)
++{
++    std::vector<UeTex> out(UE_UAV_SLOTS);
++    ID3D11UnorderedAccessView* uavs[UE_UAV_SLOTS] {};
++    ctx->CSGetUnorderedAccessViews(0, UE_UAV_SLOTS, uavs);
++
++    for (UINT i = 0; i < UE_UAV_SLOTS; i++)
++    {
++        if (uavs[i] == nullptr)
++            continue;
++
++        Microsoft::WRL::ComPtr<ID3D11Resource> res;
++        uavs[i]->GetResource(res.GetAddressOf());
++        uavs[i]->Release();
++
++        if (UeTexOf(res.Get(), out[i]))
++            keep.push_back(res);
++    }
++
++    return out;
++}
++
++// The texture at the slot the FFX pipeline gave the identifier (nullptr: no such binding / empty slot)
++const UeTex* UeAtSlot(const UeSlots& table, uint32_t pass, uint32_t id, const std::vector<UeTex>& slots)
++{
++    auto it = table.find(pass);
++
++    if (it == table.end())
++        return nullptr;
++
++    for (auto& [rid, slot] : it->second)
++    {
++        if (rid == id && slot < slots.size() && slots[slot].res != nullptr)
++            return &slots[slot];
++    }
++
++    return nullptr;
++}
++
++bool UeIsDepthFamily(DXGI_FORMAT f)
++{
++    auto d = UeDxgiFamily(f);
++    return d == 7 || d == 8 || d == 9 || d == 11;
++}
++
++bool UeSameSize(const FfxResource& r, const UeTex* t)
++{
++    return t != nullptr && t->w == r.description.width && t->h == r.description.height;
++}
++
++std::string UeDescribeSlots(const std::vector<UeTex>& slots, const char* prefix)
++{
++    std::string s;
++
++    for (size_t i = 0; i < slots.size(); i++)
++    {
++        if (slots[i].res != nullptr)
++            s += std::format(" {}{} {:X} {}x{} fmt {};", prefix, i, (size_t) slots[i].res, slots[i].w, slots[i].h,
++                             (UINT) slots[i].fmt);
++    }
++
++    return s.empty() ? " none" : s;
++}
++
+ std::string UeDescribe(const std::vector<UeTex>& list)
+ {
+     std::string s;
+@@ -1110,6 +1206,29 @@ FfxFsr2Context* UePushFrame(UeBackend& b)
+ 
+         LOG_INFO("UE FSR 2 context {:X}: {} FSR 2 compute jobs per dispatch (pass:groups){}", (size_t) b.context,
+                  b.jobs.size(), s);
++
++        std::string t;
++
++        for (auto& j : b.jobs)
++        {
++            t += std::format(" pass {}: srv", (int) j.pass);
++
++            if (auto sv = b.srvSlots.find(j.pass); sv != b.srvSlots.end())
++                for (auto& [id, slot] : sv->second)
++                    t += std::format(" {}@{}", id, slot);
++
++            t += " uav";
++
++            if (auto uv = b.uavSlots.find(j.pass); uv != b.uavSlots.end())
++                for (auto& [id, slot] : uv->second)
++                    t += std::format(" {}@{}", id, slot);
++
++            t += ";";
++        }
++
++        LOG_INFO("UE FSR 2 context {:X}: FFX slot table (resource id@slotIndex; colour 2, MV 3, depth 4, exposure 5, "
++                 "reactive 6, output 19):{}",
++                 (size_t) b.context, t);
+     }
+ 
+     if (recon >= b.jobs.size() || recon + 1 >= b.jobs.size())
+@@ -1153,7 +1272,10 @@ FfxFsr2Context* UePushFrame(UeBackend& b)
+     UeFrame frame {};
+     frame.context = b.context;
+     frame.params = uc.lastDispatch;
+-    frame.jobs.assign(b.jobs.begin() + recon, b.jobs.end());
++    frame.jobs.assign(b.jobs.begin(), b.jobs.end());
++    frame.recon = recon;
++    uc.srvSlots = b.srvSlots;
++    uc.uavSlots = b.uavSlots;
+     _ueFrames.push_back(std::move(frame));
+ 
+     while (_ueFrames.size() > 8)
+@@ -1194,7 +1316,19 @@ FfxErrorCode UeCreatePipeline(FfxFsr2Interface* bi, FfxFsr2Pass pass, const FfxP
+         std::lock_guard<std::recursive_mutex> lock(_ueMutex);
+ 
+         if (auto b = UeFind(bi); b != nullptr)
++        {
+             b->passByPipeline[out->pipeline] = (uint32_t) pass;
++            auto& sv = b->srvSlots[(uint32_t) pass];
++            auto& uv = b->uavSlots[(uint32_t) pass];
++            sv.clear();
++            uv.clear();
++
++            for (uint32_t i = 0; i < out->srvCount && i < FFX_MAX_NUM_SRVS; i++)
++                sv.push_back({ out->srvResourceBindings[i].resourceIdentifier, out->srvResourceBindings[i].slotIndex });
++
++            for (uint32_t i = 0; i < out->uavCount && i < FFX_MAX_NUM_UAVS; i++)
++                uv.push_back({ out->uavResourceBindings[i].resourceIdentifier, out->uavResourceBindings[i].slotIndex });
++        }
+     }
+ 
+     return result;
+@@ -1301,9 +1435,12 @@ void STDMETHODCALLTYPE hkUeDispatch(ID3D11DeviceContext* This, UINT x, UINT y, U
+             }
+             else if (f.jobs[0].x == x && f.jobs[0].y == y && f.jobs[0].z == z)
+             {
++                // Vela 0034: the sequence restarts only on the first job (luminance pyramid); in 0033 the reconstruct
++                // pass was the anchor and every 80x45 engine dispatch (e.g. the plugin's reactive-mask pass) restarted it
+                 idx = 0;
+                 f.cursor = 1;
+                 f.foreign = 0;
++                f.inputsOk = false;
+             }
+             else if (f.cursor > 0 && ++f.foreign > 8)
+             {
+@@ -1324,13 +1461,56 @@ void STDMETHODCALLTYPE hkUeDispatch(ID3D11DeviceContext* This, UINT x, UINT y, U
+                 for (auto& t : srvs)
+                     uc.seenNow.insert(t.res);
+ 
+-                if (idx == 0) // reconstruct pass: colour, depth, MV, exposure
++                if (idx == f.recon) // reconstruct pass: colour, depth, MV, exposure
+                 {
+-                    std::vector<ID3D11Resource*> taken;
+-                    auto depth = UePick(f.params.depth, srvs, taken);
+-                    auto exposure = UePick(f.params.exposure, srvs, taken);
+-                    auto mv = UePick(f.params.motionVectors, srvs, taken);
+-                    auto color = UePick(f.params.color, srvs, taken);
++                    // Vela 0034: by the slot the FFX pipeline gave each input; the D3D11 texture must pass a sanity
++                    // check (size of the FFX description, depth format for depth, 1x1 exposure), else by description
++                    auto slots = UeSrvSlots(This, keep);
++                    const uint32_t rp = FFX_FSR2_PASS_RECONSTRUCT_PREVIOUS_DEPTH;
++                    auto sColor = UeAtSlot(uc.srvSlots, rp, FFX_FSR2_RESOURCE_IDENTIFIER_INPUT_COLOR, slots);
++                    auto sMv = UeAtSlot(uc.srvSlots, rp, FFX_FSR2_RESOURCE_IDENTIFIER_INPUT_MOTION_VECTORS, slots);
++                    auto sDepth = UeAtSlot(uc.srvSlots, rp, FFX_FSR2_RESOURCE_IDENTIFIER_INPUT_DEPTH, slots);
++                    auto sExposure = UeAtSlot(uc.srvSlots, rp, FFX_FSR2_RESOURCE_IDENTIFIER_INPUT_EXPOSURE, slots);
++                    const bool wantExposure = f.params.exposure.resource != nullptr;
++                    bool bySlot = sColor != nullptr && sMv != nullptr && sDepth != nullptr &&
++                                  UeSameSize(f.params.color, sColor) && !UeIsDepthFamily(sColor->fmt) &&
++                                  UeSameSize(f.params.motionVectors, sMv) && !UeIsDepthFamily(sMv->fmt) &&
++                                  UeIsDepthFamily(sDepth->fmt) && sColor->res != sMv->res &&
++                                  (!wantExposure || (sExposure != nullptr && sExposure->w == 1 && sExposure->h == 1));
++
++                    ID3D11Resource* depth = nullptr;
++                    ID3D11Resource* exposure = nullptr;
++                    ID3D11Resource* mv = nullptr;
++                    ID3D11Resource* color = nullptr;
++
++                    if (bySlot)
++                    {
++                        color = sColor->res;
++                        mv = sMv->res;
++                        depth = sDepth->res;
++                        exposure = wantExposure ? sExposure->res : nullptr;
++                    }
++                    else
++                    {
++                        std::vector<ID3D11Resource*> taken;
++                        auto depthDesc = f.params.depth;
++                        depthDesc.isDepth = true; // the plugin's flag is only set for PF_DepthStencil
++                        depth = UePick(depthDesc, srvs, taken);
++                        exposure = UePick(f.params.exposure, srvs, taken);
++                        mv = UePick(f.params.motionVectors, srvs, taken);
++                        color = UePick(f.params.color, srvs, taken);
++                    }
++
++                    if (!uc.loggedInputs && color != nullptr && depth != nullptr && mv != nullptr)
++                    {
++                        uc.loggedInputs = true;
++                        LOG_INFO("UE FSR 2 context {:X}: reconstruct pass inputs taken {}: colour {:X}, MV {:X}, depth "
++                                 "{:X}, exposure {:X}; slots:{}",
++                                 (size_t) f.context, bySlot ? "by FFX slot" : "by description (slot check failed)",
++                                 (size_t) color, (size_t) mv, (size_t) depth, (size_t) exposure,
++                                 UeDescribeSlots(slots, "t"));
++                    }
++
+                     f.depth = depth;
+                     f.exposure = exposure;
+                     f.mv = mv;
+@@ -1346,12 +1526,24 @@ void STDMETHODCALLTYPE hkUeDispatch(ID3D11DeviceContext* This, UINT x, UINT y, U
+                                  (size_t) depth, (size_t) mv, f.params.motionVectors.description.width,
+                                  f.params.motionVectors.description.height,
+                                  (UINT) f.params.motionVectors.description.format, (size_t) exposure,
+-                                 UeDescribe(srvs));
++                                 UeDescribeSlots(slots, "t"));
+                 }
+                 else if (pass == FFX_FSR2_PASS_DEPTH_CLIP && f.params.reactive.resource != nullptr)
+                 {
+-                    std::vector<ID3D11Resource*> taken { f.color.Get(), f.depth.Get(), f.mv.Get(), f.exposure.Get() };
+-                    f.reactive = UePick(f.params.reactive, srvs, taken);
++                    auto slots = UeSrvSlots(This, keep);
++                    auto sReactive = UeAtSlot(uc.srvSlots, FFX_FSR2_PASS_DEPTH_CLIP,
++                                              FFX_FSR2_RESOURCE_IDENTIFIER_INPUT_REACTIVE_MASK, slots);
++
++                    if (UeSameSize(f.params.reactive, sReactive))
++                    {
++                        f.reactive = sReactive->res;
++                    }
++                    else
++                    {
++                        std::vector<ID3D11Resource*> taken { f.color.Get(), f.depth.Get(), f.mv.Get(),
++                                                             f.exposure.Get() };
++                        f.reactive = UePick(f.params.reactive, srvs, taken);
++                    }
+                 }
+ 
+                 if (last)
+@@ -1359,16 +1551,47 @@ void STDMETHODCALLTYPE hkUeDispatch(ID3D11DeviceContext* This, UINT x, UINT y, U
+                     ID3D11Resource* output = nullptr;
+                     int candidates = 0;
+                     auto uavs = UeBoundUavs(This, keep);
++                    auto uslots = UeUavSlots(This, keep);
++                    auto sOutput = UeAtSlot(uc.uavSlots, pass, FFX_FSR2_RESOURCE_IDENTIFIER_UPSCALED_OUTPUT, uslots);
++
++                    // Vela 0034: the UAV at the FFX output slot first (size of the output description, not an SRV of an
++                    // FSR 2 pass this or the last frame); else by description as in 0033
++                    if (UeSameSize(f.params.output, sOutput) && !uc.seenNow.contains(sOutput->res) &&
++                        !uc.seenPrev.contains(sOutput->res))
++                    {
++                        output = sOutput->res;
++                        candidates = 1;
++                    }
++
++                    if (!uc.loggedOutput && f.inputsOk)
++                    {
++                        uc.loggedOutput = true;
++                        LOG_INFO("UE FSR 2 context {:X}: last pass {} output {} {:X}; slots:{}", (size_t) f.context,
++                                 (int) pass, output != nullptr ? "by FFX slot" : "by description",
++                                 (size_t) (sOutput != nullptr ? sOutput->res : nullptr), UeDescribeSlots(uslots, "u"));
++                    }
+ 
+                     for (auto& t : uavs)
+                     {
++                        if (output != nullptr)
++                            break;
++
+                         if (uc.seenNow.contains(t.res) || uc.seenPrev.contains(t.res) || !UeMatches(f.params.output, t))
+                             continue;
+ 
+-                        output = t.res;
+                         candidates++;
+                     }
+ 
++                    if (output == nullptr && candidates == 1)
++                    {
++                        for (auto& t : uavs)
++                        {
++                            if (!uc.seenNow.contains(t.res) && !uc.seenPrev.contains(t.res) &&
++                                UeMatches(f.params.output, t))
++                                output = t.res;
++                        }
++                    }
++
+                     if (f.inputsOk && candidates == 1)
+                     {
+                         evaluate = true;
+-- 
+2.54.0.windows.1
+

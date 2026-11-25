@@ -1,0 +1,139 @@
+From 9f14d8ff8120c4bd4910b7eda77209ad74b94d45 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 22:53:08 +0100
+Subject: [PATCH 58/65] base-B build fixes round 1: Hook_Utils.h back to the
+ static variant, XeFG_Inputs target initializer, drop
+ Dx11WithDx12::UpscalerResourceCache inline def (upstream: per-feature
+ caches), (void*) casts in NvApiHooks QueryInterface,
+ D3DKMT_OPENADAPTERFROMLUID in compat header
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/hooks/Hook_Utils.h           | 10 +++++++++
+ OptiScaler/inputs/FG/XeFG_Inputs_Dx12.h |  2 +-
+ OptiScaler/nvapi/NvApiHooks.cpp         | 28 ++++++++++++-------------
+ OptiScaler/with_dx12/dx11_with_dx12.h   |  1 -
+ compat/arm64ec/d3dkmthk.h               |  8 +++++++
+ 5 files changed, 33 insertions(+), 16 deletions(-)
+
+diff --git a/OptiScaler/hooks/Hook_Utils.h b/OptiScaler/hooks/Hook_Utils.h
+index 7eb34e28..af33a4a1 100644
+--- a/OptiScaler/hooks/Hook_Utils.h
++++ b/OptiScaler/hooks/Hook_Utils.h
+@@ -18,6 +18,16 @@ template <typename Ret, typename Class, typename... Args> struct rewrite_signatu
+ // For checking that the hooked function's signature matches the original
+ // Place just above function definition, example of usage:
+ // VALIDATE_HOOK(hkCheckFeatureSupport, PFN_CheckFeatureSupport)
++// MSVC accepts an "extern" forward declaration followed by a "static"
++// definition; Clang correctly rejects it ("static declaration follows
++// non-static declaration"). Most hooks validated here are defined static, so
++// the non-MSVC build forward-declares them with internal linkage to match.
++#ifdef _MSC_VER
+ #define VALIDATE_HOOK(HookName, PfnType)                                                                               \
+     extern std::remove_pointer_t<PfnType> HookName;                                                                    \
+     VALIDATE_MEMBER_HOOK(HookName, PfnType)
++#else
++#define VALIDATE_HOOK(HookName, PfnType)                                                                               \
++    static std::remove_pointer_t<PfnType> HookName;                                                                    \
++    VALIDATE_MEMBER_HOOK(HookName, PfnType)
++#endif
+\ No newline at end of file
+diff --git a/OptiScaler/inputs/FG/XeFG_Inputs_Dx12.h b/OptiScaler/inputs/FG/XeFG_Inputs_Dx12.h
+index 92ccbfb6..305f7b10 100644
+--- a/OptiScaler/inputs/FG/XeFG_Inputs_Dx12.h
++++ b/OptiScaler/inputs/FG/XeFG_Inputs_Dx12.h
+@@ -14,7 +14,7 @@ class XeFGInputs
+     {
+         const char* name;
+         PVOID function;
+-        PVOID target = nullptr;
++        PVOID target;
+     };
+ 
+     // XeFG output: the game's own XeFG and XeLL run on OptiScaler's libraries, as they would without OptiScaler.
+diff --git a/OptiScaler/nvapi/NvApiHooks.cpp b/OptiScaler/nvapi/NvApiHooks.cpp
+index 74ee078f..087dbde6 100644
+--- a/OptiScaler/nvapi/NvApiHooks.cpp
++++ b/OptiScaler/nvapi/NvApiHooks.cpp
+@@ -236,33 +236,33 @@ void* __stdcall NvApiHooks::hkNvAPI_QueryInterface(unsigned int InterfaceId)
+         ReflexHooks::hookReflex(o_NvAPI_QueryInterface);
+ 
+         if (InterfaceId == GET_ID(NvAPI_D3D_SetSleepMode))
+-            return InputReflex::D3D_SetSleepMode;
++            return (void*) InputReflex::D3D_SetSleepMode;
+         if (InterfaceId == GET_ID(NvAPI_D3D_GetSleepStatus))
+-            return InputReflex::D3D_GetSleepStatus;
++            return (void*) InputReflex::D3D_GetSleepStatus;
+         else if (InterfaceId == GET_ID(NvAPI_D3D_Sleep))
+-            return InputReflex::D3D_Sleep;
++            return (void*) InputReflex::D3D_Sleep;
+         else if (InterfaceId == GET_ID(NvAPI_D3D_GetLatency))
+-            return InputReflex::D3D_GetLatency;
++            return (void*) InputReflex::D3D_GetLatency;
+         else if (InterfaceId == GET_ID(NvAPI_D3D_SetLatencyMarker))
+-            return InputReflex::D3D_SetLatencyMarker;
++            return (void*) InputReflex::D3D_SetLatencyMarker;
+         else if (InterfaceId == GET_ID(NvAPI_D3D12_SetAsyncFrameMarker))
+-            return InputReflex::D3D12_SetAsyncFrameMarker;
++            return (void*) InputReflex::D3D12_SetAsyncFrameMarker;
+         else if (InterfaceId == GET_ID(NvAPI_Vulkan_InitLowLatencyDevice))
+-            return InputReflex::Vulkan_InitLowLatencyDevice;
++            return (void*) InputReflex::Vulkan_InitLowLatencyDevice;
+         else if (InterfaceId == GET_ID(NvAPI_Vulkan_DestroyLowLatencyDevice))
+-            return InputReflex::Vulkan_DestroyLowLatencyDevice;
++            return (void*) InputReflex::Vulkan_DestroyLowLatencyDevice;
+         else if (InterfaceId == GET_ID(NvAPI_Vulkan_GetSleepStatus))
+-            return InputReflex::Vulkan_GetSleepStatus;
++            return (void*) InputReflex::Vulkan_GetSleepStatus;
+         else if (InterfaceId == GET_ID(NvAPI_Vulkan_SetSleepMode))
+-            return InputReflex::Vulkan_SetSleepMode;
++            return (void*) InputReflex::Vulkan_SetSleepMode;
+         else if (InterfaceId == GET_ID(NvAPI_Vulkan_Sleep))
+-            return InputReflex::Vulkan_Sleep;
++            return (void*) InputReflex::Vulkan_Sleep;
+         else if (InterfaceId == GET_ID(NvAPI_Vulkan_GetLatency))
+-            return InputReflex::Vulkan_GetLatency;
++            return (void*) InputReflex::Vulkan_GetLatency;
+         else if (InterfaceId == GET_ID(NvAPI_Vulkan_SetLatencyMarker))
+-            return InputReflex::Vulkan_SetLatencyMarker;
++            return (void*) InputReflex::Vulkan_SetLatencyMarker;
+         else if (InterfaceId == GET_ID(NvAPI_Vulkan_NotifyOutOfBandVkQueue))
+-            return InputReflex::Vulkan_NotifyOutOfBandVkQueue;
++            return (void*) InputReflex::Vulkan_NotifyOutOfBandVkQueue;
+     }
+ 
+     ReflexHooks::hookReflex(o_NvAPI_QueryInterface);
+diff --git a/OptiScaler/with_dx12/dx11_with_dx12.h b/OptiScaler/with_dx12/dx11_with_dx12.h
+index 23b953b9..ca667a3b 100644
+--- a/OptiScaler/with_dx12/dx11_with_dx12.h
++++ b/OptiScaler/with_dx12/dx11_with_dx12.h
+@@ -184,7 +184,6 @@ class Dx11WithDx12
+                      ID3D12CommandQueue* dx12CommandQueue);
+ };
+ 
+-inline Dx11WithDx12::D3D11_UPSCALER_RESOURCE_CACHE_C Dx11WithDx12::UpscalerResourceCache = {};
+ 
+ inline Dx11WithDx12::ResourceMask operator|(Dx11WithDx12::ResourceMask a, Dx11WithDx12::ResourceMask b)
+ {
+diff --git a/compat/arm64ec/d3dkmthk.h b/compat/arm64ec/d3dkmthk.h
+index c0fccda9..d850d2f0 100644
+--- a/compat/arm64ec/d3dkmthk.h
++++ b/compat/arm64ec/d3dkmthk.h
+@@ -205,6 +205,14 @@ NTSTATUS WINAPI D3DKMTEnumAdapters2(D3DKMT_ENUMADAPTERS2 *pData);
+ NTSTATUS WINAPI D3DKMTQueryAdapterInfo(const D3DKMT_QUERYADAPTERINFO *pData);
+ NTSTATUS WINAPI D3DKMTCloseAdapter(const D3DKMT_CLOSEADAPTER *pData);
+ 
++/* base-B: upstream IdentifyGpu now opens the adapter by LUID (mingw headers lack the type) */
++typedef struct _D3DKMT_OPENADAPTERFROMLUID
++{
++    LUID AdapterLuid;
++    D3DKMT_HANDLE hAdapter;
++} D3DKMT_OPENADAPTERFROMLUID;
++NTSTATUS WINAPI D3DKMTOpenAdapterFromLuid(D3DKMT_OPENADAPTERFROMLUID *pData);
++
+ #ifdef __cplusplus
+ }
+ #endif
+-- 
+2.54.0.windows.1
+

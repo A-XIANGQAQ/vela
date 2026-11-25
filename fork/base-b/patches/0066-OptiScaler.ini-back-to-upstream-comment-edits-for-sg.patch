@@ -1,0 +1,40 @@
+From db417a89ea277b9225ab5a8f0d5d119357b58693 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 25 Nov 2026 00:04:10 +0100
+Subject: [PATCH 66/69] OptiScaler.ini back to upstream (comment edits for
+ sgsr2/sgsr3 moved out of the series: leeford rule)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler.ini | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/OptiScaler.ini b/OptiScaler.ini
+index dd15e5c5..47b83f39 100644
+--- a/OptiScaler.ini
++++ b/OptiScaler.ini
+@@ -2,18 +2,18 @@
+ [Upscalers]
+ ; -------------------------------------------------------
+ ; Select Upscaler for Dx11 games
+-; fsr22 (native DX11), fsr31 (native DX11), xess (native DX11, Arc only), xess_12 (dx11on12), fsr21_12 (dx11on12), fsr22_12 (dx11on12), ffx_12 (FSR 2.3; 3.1; 4.x), sgsr2_12 (dx11on12), dlss - Default (auto) is fsr22
++; fsr22 (native DX11), fsr31 (native DX11), xess (native DX11, Arc only), xess_12 (dx11on12), fsr21_12 (dx11on12), fsr22_12 (dx11on12), ffx_12 (FSR 2.3; 3.1; 4.x), dlss - Default (auto) is fsr22
+ ; or the name of a custom upscaler with 'ffx' or 'dlss', run through dx11on12
+ Dx11Upscaler=auto
+ 
+ ; Select Upscaler for Dx12 games
+-; xess, fsr21, fsr22, ffx (FSR 2.3; 3.1; 4.x), sgsr2, sgsr3, dlss
++; xess, fsr21, fsr22, ffx (FSR 2.3; 3.1; 4.x), dlss
+ ; or the name of a custom upscaler: a folder in the 'custom' folder or one registered by an ASI plugin
+ ; Default (auto) is DLSS when capable gpu, FSR4 when capable gpu, XeSS otherwise
+ Dx12Upscaler=auto
+ 
+ ; Select Upscaler for Vulkan games
+-; fsr21 (native VK), fsr22 (native VK), ffx (native FSR 2.3; 3.1), xess (native VK), fsr21_12 (VKon12), ffx_12 (FSR 2.3; 3.1; 4.x), sgsr2 (native VK), dlss - Default (auto) is fsr22
++; fsr21 (native VK), fsr22 (native VK), ffx (native FSR 2.3; 3.1), xess (native VK), fsr21_12 (VKon12), ffx_12 (FSR 2.3; 3.1; 4.x), dlss - Default (auto) is fsr22
+ ; or the name of a custom upscaler with 'ffx_vk', 'ffx' (VKon12) or 'dlss', the first one it has is used
+ VulkanUpscaler=auto
+ 
+-- 
+2.54.0.windows.1
+

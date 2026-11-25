@@ -1,0 +1,64 @@
+From 8d1fd8ada1a37de293e9536978111cebe828d41c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 21:04:02 +0100
+Subject: [PATCH 31/65] 0030-vela-dx11-flush: the D3D11 copies into the shared
+ textures are flushed when the D3D11 fence is signalled for the D3D12 upscale,
+ and the copy back into the game's output is flushed at once (Ghostrunner
+ DX11: scene black on FSR 4, white on SGSR 2 / FSR 3; candidate cause:
+ vkd3d-proton read the shared images before DXVK submitted the copies);
+ VELA_DX11_NOFLUSH=1 = upstream for A/B
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 220a7f30fbdc3b3fc103674e3f6d2acfcff1174f)
+---
+ OptiScaler/with_dx12/dx11_with_dx12.cpp | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/OptiScaler/with_dx12/dx11_with_dx12.cpp b/OptiScaler/with_dx12/dx11_with_dx12.cpp
+index a0e1d344..e81d12b2 100644
+--- a/OptiScaler/with_dx12/dx11_with_dx12.cpp
++++ b/OptiScaler/with_dx12/dx11_with_dx12.cpp
+@@ -211,6 +211,22 @@ bool Dx11WithDx12::EnsureSyncResourcesLocked()
+     return true;
+ }
+ 
++// Vela 0030: the D3D11 work (the copies into the shared textures) is submitted before the D3D12 side waits on the fence,
++// and the copy back into the game's output is submitted at once: DXVK may keep both in its command list until the game
++// flushes, and vkd3d-proton then reads shared images the copies have not reached yet (Ghostrunner DX11: the scene black
++// on FSR 4, white on SGSR 2 / FSR 3). VELA_DX11_NOFLUSH=1: the upstream behaviour, for an A/B test
++static bool VelaDx11Flush()
++{
++    static const bool on = []
++    {
++        const char* e = std::getenv("VELA_DX11_NOFLUSH");
++        const bool flush = !(e != nullptr && e[0] == '1');
++        LOG_INFO("Vela DX11: {0}", flush ? "D3D11 flush before the D3D12 upscale and after the copy back" : "no D3D11 flush (VELA_DX11_NOFLUSH=1)");
++        return flush;
++    }();
++    return on;
++}
++
+ bool Dx11WithDx12::SyncDx11ToDx12()
+ {
+     std::lock_guard<std::mutex> lock(SyncMutex);
+@@ -221,6 +237,8 @@ bool Dx11WithDx12::SyncDx11ToDx12()
+     const auto fenceValue = TextureCopyFenceValue++;
+ 
+     auto result = Dx11DeviceContext->Signal(Dx11FenceTextureCopy, fenceValue);
++    if (VelaDx11Flush())
++        Dx11DeviceContext->Flush();
+     if (result != S_OK)
+     {
+         LOG_ERROR("Dx11WithDx12 Dx11 signal failed for fence {}: {:X}", fenceValue, (UINT) result);
+@@ -267,7 +285,7 @@ bool Dx11WithDx12::SyncDx12ToDx11()
+         return false;
+     }
+ 
+-    if (UseCpuWaitForDx12())
++    if (UseCpuWaitForDx12() || VelaDx11Flush())
+     {
+         // Upscaler work is short, polling avoids the event wake up latency under Wine
+         const auto spinStart = Util::MillisecondsNow();
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,51 @@
+From 95b2a7e38420c49f3bf9481874470f3657978c5a Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 2 Nov 2026 18:54:59 +0000
+Subject: [PATCH 14/65] 0015-vela-fsr4-full-npu.patch
+
+(cherry picked from commit 1b19e515037e7d54a83a92ee49fc1d8057ef9774)
+---
+ OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp     | 3 ++-
+ OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h | 5 +++--
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 1a09d29a..1cb2d7f7 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -1064,7 +1064,8 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
+         const VelaLive::Values& lv = VelaLive::Poll();
+         const VelaLive::Model m = lv.model;
+         const int lossy = m == VelaLive::Model::Fsr4Lite ? lv.lossy : 1;
+-        const int npu = m == VelaLive::Model::Fsr4Lite ? lv.npu : 0;
++        // Vela 0.8.3: the NPU also for the full FSR 4.1.1 model (graph nf4_exact)
++        const int npu = m == VelaLive::Model::Fsr4Lite || m == VelaLive::Model::Fsr4 ? lv.npu : 0;
+         const Upscaler want = m == VelaLive::Model::Sgsr2   ? Upscaler::SGSR2
+                               : m == VelaLive::Model::Fsr3  ? Upscaler::FFX
+                               : m == VelaLive::Model::Unset ? cfg.Dx12Upscaler.value_or_default()
+diff --git a/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h b/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h
+index 9567983a..ed44ec4b 100644
+--- a/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h
++++ b/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h
+@@ -152,7 +152,8 @@ class Fsr4VkBridge
+         Release();
+         _lite = lite;
+         _every = lite ? std::max(1u, networkEvery) : 1u;
+-        _npu = lite && _every == 1 ? std::min(npuMode, 2u) : 0u;
++        // Vela 0.8.3: also the full 4.1.1 model (the provider ignores it for 4.0.2)
++        _npu = !lite || _every == 1 ? std::min(npuMode, 2u) : 0u;
+         _rw = rw;
+         _rh = rh;
+         _dw = dw;
+@@ -270,7 +271,7 @@ class Fsr4VkBridge
+         LOG_INFO("Vela FSR 4 VK: FSR {} VK INT8 context {}x{} -> {}x{} (hdr {}, network every {} frames)",
+                  _lite ? "4.1.2 Lite" : _v402 ? "4.0.2" : "4.1.1", rw, rh, dw, dh, hdr, _every);
+         // apps_npu/docs/11-npu-log-lines.md F3: the provider prints F1/F2/F4 itself (Message below, verbatim)
+-        if (_lite && _npu == 0 && NpuShown())
++        if (_npu == 0 && NpuShown())
+         {
+             LOG_INFO("Vela NPU: off");
+             NpuShown() = false;
+-- 
+2.54.0.windows.1
+

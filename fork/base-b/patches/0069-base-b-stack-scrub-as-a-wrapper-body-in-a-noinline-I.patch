@@ -1,0 +1,138 @@
+From 0e9b5b0cdc8b175daac905f2d37b1030b2747247 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 25 Nov 2026 01:22:40 +0100
+Subject: [PATCH 69/69] base-b: stack scrub as a wrapper (body in a noinline
+ Impl/lambda, HookScrubStack in the caller) so the zeroed region covers the
+ hook's own frame (first try scrubbed only below it: the __FILE__ pointer of
+ the source_loc stayed, dump F1_sl.dmp)
+
+---
+ OptiScaler/hooks/Crypt32_Hooks.h  | 35 +++++++++++++++++++++----------
+ OptiScaler/hooks/Kernel_Hooks.cpp | 19 ++++++++++-------
+ 2 files changed, 36 insertions(+), 18 deletions(-)
+
+diff --git a/OptiScaler/hooks/Crypt32_Hooks.h b/OptiScaler/hooks/Crypt32_Hooks.h
+index c2f88151..6307fafa 100644
+--- a/OptiScaler/hooks/Crypt32_Hooks.h
++++ b/OptiScaler/hooks/Crypt32_Hooks.h
+@@ -12,10 +12,13 @@ typedef decltype(&CryptQueryObject) PFN_CryptQueryObject;
+ inline static PFN_CryptQueryObject o_CryptQueryObject = nullptr;
+ 
+ VALIDATE_HOOK(hkCryptQueryObject, PFN_CryptQueryObject)
+-static BOOL hkCryptQueryObject(DWORD dwObjectType, const void* pvObject, DWORD dwExpectedContentTypeFlags,
+-                               DWORD dwExpectedFormatTypeFlags, DWORD dwFlags, DWORD* pdwMsgAndCertEncodingType,
+-                               DWORD* pdwContentType, DWORD* pdwFormatType, HCERTSTORE* phCertStore, HCRYPTMSG* phMsg,
+-                               const void** ppvContext)
++#if defined(__clang__) || defined(__GNUC__)
++__attribute__((noinline))
++#endif
++static BOOL hkCryptQueryObjectImpl(DWORD dwObjectType, const void* pvObject, DWORD dwExpectedContentTypeFlags,
++                                   DWORD dwExpectedFormatTypeFlags, DWORD dwFlags, DWORD* pdwMsgAndCertEncodingType,
++                                   DWORD* pdwContentType, DWORD* pdwFormatType, HCERTSTORE* phCertStore,
++                                   HCRYPTMSG* phMsg, const void** ppvContext)
+ {
+     if (dwObjectType == CERT_QUERY_OBJECT_FILE && pvObject)
+     {
+@@ -43,13 +46,10 @@ static BOOL hkCryptQueryObject(DWORD dwObjectType, const void* pvObject, DWORD d
+              Config::Instance()->StreamlineSpoofing.value_or_default()))
+         {
+             LOG_DEBUG("Replacing nvngx with a signed dll");
+-            HookScrubStack();
+-            auto result = o_CryptQueryObject(dwObjectType, State::Instance().nvngxReplacement.value().c_str(),
+-                                             dwExpectedContentTypeFlags, dwExpectedFormatTypeFlags, dwFlags,
+-                                             pdwMsgAndCertEncodingType, pdwContentType, pdwFormatType, phCertStore,
+-                                             phMsg, ppvContext);
+-            HookScrubStack();
+-            return result;
++            return o_CryptQueryObject(dwObjectType, State::Instance().nvngxReplacement.value().c_str(),
++                                      dwExpectedContentTypeFlags, dwExpectedFormatTypeFlags, dwFlags,
++                                      pdwMsgAndCertEncodingType, pdwContentType, pdwFormatType, phCertStore, phMsg,
++                                      ppvContext);
+         }
+     }
+ 
+@@ -57,6 +57,19 @@ static BOOL hkCryptQueryObject(DWORD dwObjectType, const void* pvObject, DWORD d
+                               pdwMsgAndCertEncodingType, pdwContentType, pdwFormatType, phCertStore, phMsg, ppvContext);
+ }
+ 
++// The real hook: runs the body, then zeroes the stack the body used (Hook_Utils.h HookScrubStack)
++static BOOL hkCryptQueryObject(DWORD dwObjectType, const void* pvObject, DWORD dwExpectedContentTypeFlags,
++                               DWORD dwExpectedFormatTypeFlags, DWORD dwFlags, DWORD* pdwMsgAndCertEncodingType,
++                               DWORD* pdwContentType, DWORD* pdwFormatType, HCERTSTORE* phCertStore, HCRYPTMSG* phMsg,
++                               const void** ppvContext)
++{
++    BOOL r = hkCryptQueryObjectImpl(dwObjectType, pvObject, dwExpectedContentTypeFlags, dwExpectedFormatTypeFlags,
++                                    dwFlags, pdwMsgAndCertEncodingType, pdwContentType, pdwFormatType, phCertStore,
++                                    phMsg, ppvContext);
++    HookScrubStack();
++    return r;
++}
++
+ static void hookCrypt32()
+ {
+     LOG_FUNC();
+diff --git a/OptiScaler/hooks/Kernel_Hooks.cpp b/OptiScaler/hooks/Kernel_Hooks.cpp
+index 7fbb096d..4ee972cc 100644
+--- a/OptiScaler/hooks/Kernel_Hooks.cpp
++++ b/OptiScaler/hooks/Kernel_Hooks.cpp
+@@ -278,6 +278,9 @@ FARPROC WINAPI KernelHooks::hk_KB_GetProcAddress(HMODULE hModule, LPCSTR lpProcN
+ VALIDATE_HOOK(hk_K32_GetFileAttributesW, Kernel32Proxy::PFN_GetFileAttributesW)
+ DWORD WINAPI KernelHooks::hk_K32_GetFileAttributesW(LPCWSTR lpFileName)
+ {
++    // the body runs in a noinline lambda so that HookScrubStack() below zeroes the stack the body (and its LOG_*
++    // source_loc temporaries) used; see Hook_Utils.h
++    DWORD r = [&]() __attribute__((noinline)) -> DWORD {
+     if (!State::Instance().nvngxExists && State::Instance().nvngxReplacement.has_value() &&
+         (Config::Instance()->DxgiSpoofing.value_or_default() ||
+          Config::Instance()->StreamlineSpoofing.value_or_default()))
+@@ -289,12 +292,14 @@ DWORD WINAPI KernelHooks::hk_K32_GetFileAttributesW(LPCWSTR lpFileName)
+             !IsInsideWindowsDirectory(path)) // apply the override to just one path
+         {
+             LOG_DEBUG("Overriding GetFileAttributesW for nvngx");
+-            HookScrubStack();
+             return FILE_ATTRIBUTE_ARCHIVE;
+         }
+     }
+ 
+     return o_K32_GetFileAttributesW(lpFileName);
++    }();
++    HookScrubStack();
++    return r;
+ }
+ 
+ VALIDATE_HOOK(hk_K32_CreateFileW, Kernel32Proxy::PFN_CreateFileW)
+@@ -302,6 +307,7 @@ HANDLE WINAPI KernelHooks::hk_K32_CreateFileW(LPCWSTR lpFileName, DWORD dwDesire
+                                               LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
+                                               DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
+ {
++    HANDLE r = [&]() __attribute__((noinline)) -> HANDLE {
+     if (!State::Instance().nvngxExists && State::Instance().nvngxReplacement.has_value() &&
+         (Config::Instance()->DxgiSpoofing.value_or_default() ||
+          Config::Instance()->StreamlineSpoofing.value_or_default()))
+@@ -317,18 +323,17 @@ HANDLE WINAPI KernelHooks::hk_K32_CreateFileW(LPCWSTR lpFileName, DWORD dwDesire
+             if (signedDll.has_value())
+             {
+                 LOG_DEBUG("Overriding CreateFileW for nvngx with a signed dll, original path: {}", path);
+-                HookScrubStack();
+-                auto result = o_K32_CreateFileW(signedDll.value().c_str(), dwDesiredAccess, dwShareMode,
+-                                                lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes,
+-                                                hTemplateFile);
+-                HookScrubStack();
+-                return result;
++                return o_K32_CreateFileW(signedDll.value().c_str(), dwDesiredAccess, dwShareMode, lpSecurityAttributes,
++                                         dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+             }
+         }
+     }
+ 
+     return o_K32_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition,
+                              dwFlagsAndAttributes, hTemplateFile);
++    }();
++    HookScrubStack();
++    return r;
+ }
+ 
+ VALIDATE_HOOK(hk_K32_OutputDebugStringW, Kernel32Proxy::PFN_OutputDebugStringW)
+-- 
+2.54.0.windows.1
+

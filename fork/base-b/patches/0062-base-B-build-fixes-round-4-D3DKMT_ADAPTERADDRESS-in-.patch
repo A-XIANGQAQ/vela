@@ -1,0 +1,47 @@
+From a6ea141867d29f60c2fc52454cdccf61d0ce34b5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 23:30:47 +0100
+Subject: [PATCH 62/65] base-B build fixes round 4: D3DKMT_ADAPTERADDRESS in
+ compat header, input_common.cpp duplicate static definition dropped
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/low_latency/input/input_common.cpp | 2 +-
+ compat/arm64ec/d3dkmthk.h                     | 8 ++++++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/OptiScaler/low_latency/input/input_common.cpp b/OptiScaler/low_latency/input/input_common.cpp
+index bc37a1a1..62a7e8a6 100644
+--- a/OptiScaler/low_latency/input/input_common.cpp
++++ b/OptiScaler/low_latency/input/input_common.cpp
+@@ -19,7 +19,7 @@
+ 
+ #include <deque>
+ 
+-OptiAtomicSharedPtr<LowLatencyTech> InputCommon::currently_active_tech;
++// Vela base B: currently_active_tech is an inline static of InputCommon (input_common.h)
+ std::atomic<std::shared_ptr<LowLatencyTech>> InputCommon::xefg_xell;
+ 
+ static bool marker_supported(InputMarkerMode mode, MarkerType type)
+diff --git a/compat/arm64ec/d3dkmthk.h b/compat/arm64ec/d3dkmthk.h
+index d850d2f0..b4ae4053 100644
+--- a/compat/arm64ec/d3dkmthk.h
++++ b/compat/arm64ec/d3dkmthk.h
+@@ -123,6 +123,14 @@ typedef struct _D3DKMT_ADAPTERINFO
+     BOOL          bPrecisePresentRegionsPreferred;
+ } D3DKMT_ADAPTERINFO;
+ 
++// Vela base B: FlipMeterSwapChain.cpp matches the adapter's PCI location (KMTQAITYPE_ADAPTERADDRESS)
++typedef struct _D3DKMT_ADAPTERADDRESS
++{
++    UINT BusNumber;
++    UINT DeviceNumber;
++    UINT FunctionNumber;
++} D3DKMT_ADAPTERADDRESS;
++
+ #define MAX_ENUM_ADAPTERS 16
+ 
+ typedef struct _D3DKMT_ENUMADAPTERS
+-- 
+2.54.0.windows.1
+

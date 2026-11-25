@@ -1,0 +1,331 @@
+From 778afbf989754e7f64b337f870430a436dd13d3c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 19:00:08 +0100
+Subject: [PATCH 28/65] 0027-vela-dx11-sgsr3: DX11 games get Vela's models over
+ the DX11 -> DX12 bridge: sgsr3_12 (SGSR3FeatureDx11on12: SGSR 3 with the FSR
+ 4 VK bridge, FSR 4 Fast, the NPU path), FSR 3.1 by ffx_12, SGSR 2 by
+ sgsr2_12; the Vela live file switches them per handle like DX12 (same log
+ lines); a DX11 backend that fails goes to SGSR 2 on Adreno
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 2f929c71021f9acfe0e85733ddca1aff234c3bbc)
+---
+ OptiScaler/OptiTypes.cpp                      |   7 +
+ OptiScaler/OptiTypes.h                        |   5 +-
+ OptiScaler/inputs/NVNGX_DLSS_Dx11.cpp         | 133 +++++++++++++++++-
+ OptiScaler/upscalers/FeatureProvider_Dx11.cpp |  16 ++-
+ .../upscalers/sgsr3/SGSR3Feature_Dx11on12.cpp |  11 ++
+ .../upscalers/sgsr3/SGSR3Feature_Dx11on12.h   |  13 ++
+ 6 files changed, 178 insertions(+), 7 deletions(-)
+ create mode 100644 OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx11on12.cpp
+ create mode 100644 OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx11on12.h
+
+diff --git a/OptiScaler/OptiTypes.cpp b/OptiScaler/OptiTypes.cpp
+index c47d3756..351d1a2f 100644
+--- a/OptiScaler/OptiTypes.cpp
++++ b/OptiScaler/OptiTypes.cpp
+@@ -57,6 +57,12 @@ std::string UpscalerDisplayName(Upscaler upscaler, API api)
+     case Upscaler::SGSR3:
+         return "SGSR 3";
+ 
++    case Upscaler::SGSR2_on12:
++        return "SGSR 2 w/Dx12";
++
++    case Upscaler::SGSR3_on12:
++        return "SGSR 3 w/Dx12";
++
+     case Upscaler::FFX:
+         // Native Vulkan gets FSR 4 from the driver
+         if (fsr4Capable && (api == API::DX12 || api == API::Vulkan))
+@@ -133,6 +139,7 @@ std::string UpscalerShortName(Upscaler upscaler)
+     case Upscaler::SGSR2:
+     case Upscaler::SGSR2_on12:
+     case Upscaler::SGSR3:
++    case Upscaler::SGSR3_on12:
+         return "SGSR";
+     }
+ 
+diff --git a/OptiScaler/OptiTypes.h b/OptiScaler/OptiTypes.h
+index 189d313f..a7f96018 100644
+--- a/OptiScaler/OptiTypes.h
++++ b/OptiScaler/OptiTypes.h
+@@ -74,7 +74,8 @@ enum class Upscaler
+     SGSR2, // "sgsr2", Snapdragon Game Super Resolution 2; shader-only, no vendor runtime to link
+     SGSR2_on12, // "sgsr2_12", the same backend driven from DX11 through the DX12 bridge
+ 
+-    SGSR3, // "sgsr3", SGSR 3 v0: SGSR 2 + input contract, masks, Catmull-Rom history; DX12 only
++    SGSR3, // "sgsr3", SGSR 3 v0: SGSR 2 + input contract, masks, Catmull-Rom history (with Vela's FSR 4 VK bridge)
++    SGSR3_on12, // "sgsr3_12", the same backend driven from DX11 through the DX12 bridge (Vela patch 0027)
+ 
+     Reset
+ };
+@@ -96,7 +97,7 @@ template <> struct EnumConfig<Upscaler>
+         { Upscaler::FFX_on12, "fsr31_12" }, // From before FSR 3.1 got renamed to FFX
+         { Upscaler::DLSSD, "dlssd" },
+         { Upscaler::SGSR2, "sgsr2" },       { Upscaler::SGSR2_on12, "sgsr2_12" },
+-        { Upscaler::SGSR3, "sgsr3" },
++        { Upscaler::SGSR3, "sgsr3" },       { Upscaler::SGSR3_on12, "sgsr3_12" },
+     };
+ };
+ 
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx11.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx11.cpp
+index a9d8bbab..6936fa7d 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx11.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx11.cpp
+@@ -18,6 +18,7 @@
+ #include <ankerl/unordered_dense.h>
+ #include <imgui/ImGuiNotify.hpp>
+ #include <misc/IdentifyGpu.h>
++#include <upscalers/sgsr3/VelaLive.h>
+ 
+ static ID3D11Device* D3D11Device = nullptr;
+ static std::atomic<bool> _d3d11DeviceDestroyed { false };
+@@ -505,6 +506,14 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_GetScratchBufferSize(NVSDK_NGX_Fe
+ 
+ #pragma region NVSDK_NGX_D3D11 Feature
+ 
++// Vela 0027: a DX11 feature that fails goes to SGSR 2 over the bridge on Adreno (FSR 2.2 elsewhere, or when SGSR 2
++// itself failed)
++static Upscaler VelaDx11Fallback(Upscaler failed)
++{
++    return IsAdrenoGpu(IdentifyGpu::getPrimaryGpu()) && failed != Upscaler::SGSR2_on12 ? Upscaler::SGSR2_on12
++                                                                                       : Upscaler::FSR22;
++}
++
+ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext* InDevCtx,
+                                                              NVSDK_NGX_Feature InFeatureID,
+                                                              NVSDK_NGX_Parameter* InParameters,
+@@ -600,7 +609,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext
+ 
+     LOG_ERROR("CreateFeature failed");
+ 
+-    State::Instance().newBackend = Upscaler::FSR22;
++    State::Instance().newBackend = VelaDx11Fallback(deviceContext->GetUpscalerType());
+     State::Instance().changeBackend[handleId] = true;
+ 
+     return NVSDK_NGX_Result_Success;
+@@ -702,6 +711,121 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_GetFeatureRequirements(
+     return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+ }
+ 
++// Vela 0027 (Vela 0.8.23): Vela live in DX11, the same rules as NVNGX_DLSS_Dx12.cpp. The panel's model re-creates the
++// upscaler over the DX11 -> DX12 bridge: fsr4 / fsr4fast -> SGSR 3 (its FSR 4 VK bridge, the NPU path, FSR 4 Fast),
++// fsr3 -> FFX (FSR 3.1 from amd_fidelityfx_dx12.dll, FFXFeature_Dx12.cpp), sgsr2 -> SGSR 2, no file -> the ini's (an
++// ini asking for SGSR 3 alone gets SGSR 2). FSR 4 that cannot run here, or a context without depth: SGSR 2. Per handle,
++// at most two tries of a backend per model (three when going down to SGSR 2).
++static void VelaLiveDx11(IFeature_Dx11* feature, unsigned int handleId, NVSDK_NGX_Parameter* InParameters)
++{
++    State& state = State::Instance();
++
++    struct VelaHandle
++    {
++        VelaLive::Model model = VelaLive::Model::Unset;
++        int lossy = 1;
++        int npu = 0;
++        int tries = 0;
++        bool noDepthLogged = false;
++    };
++    static ankerl::unordered_dense::map<unsigned int, VelaHandle> velaHandles;
++    const VelaLive::Values& lv = VelaLive::Poll();
++    const VelaLive::Model m = lv.model;
++    const int lossy = m == VelaLive::Model::Fsr4Lite ? lv.lossy : 1;
++    const int npu = m == VelaLive::Model::Fsr4Lite || VelaLive::IsFsr4Full(m) ? lv.npu : 0;
++    static VelaLive::Model lastModel = VelaLive::Model::Unset;
++    static bool fsr4DownLogged = false;
++    if (m != lastModel)
++    {
++        VelaLive::Fsr4Failed() = false;
++        fsr4DownLogged = false;
++        lastModel = m;
++    }
++    const bool isFsr4 = VelaLive::IsFsr4Full(m) || m == VelaLive::Model::Fsr4Lite;
++    const bool fsr4Down = isFsr4 && VelaLive::Fsr4Failed();
++    if (fsr4Down && !fsr4DownLogged)
++    {
++        fsr4DownLogged = true;
++        LOG_WARN("Vela live: {0} cannot run in this game; SGSR 2 instead", VelaLive::ModelName(m));
++    }
++    ID3D11Resource* velaDepth = nullptr;
++    if (InParameters->Get(NVSDK_NGX_Parameter_Depth, &velaDepth) != NVSDK_NGX_Result_Success)
++        InParameters->Get(NVSDK_NGX_Parameter_Depth, (void**) &velaDepth);
++    const bool noDepth = isFsr4 && !fsr4Down && velaDepth == nullptr;
++    const Upscaler iniUp = Config::Instance()->Dx11Upscaler.value_or_default();
++    const Upscaler want = m == VelaLive::Model::Sgsr2 || fsr4Down || noDepth ? Upscaler::SGSR2_on12
++                          : m == VelaLive::Model::Fsr3                       ? Upscaler::FFX_on12
++                          : isFsr4                                           ? Upscaler::SGSR3_on12
++                          : iniUp == Upscaler::SGSR3_on12                    ? Upscaler::SGSR2_on12
++                                                                             : iniUp;
++    const bool seen = velaHandles.contains(handleId);
++    auto& h = velaHandles[handleId];
++    if (noDepth && !h.noDepthLogged)
++    {
++        h.noDepthLogged = true;
++        LOG_INFO("Vela live: handle {0} has no depth buffer: SGSR 2 on this context, the others keep {1}", handleId,
++                 VelaLive::ModelName(m));
++    }
++    bool change = false;
++    if (seen && (h.model != m || h.lossy != lossy || h.npu != npu))
++    {
++        h.tries = 0;
++        change = true;
++    }
++    else if (feature->GetUpscalerType() != want && h.tries < (fsr4Down || noDepth ? 3 : 2) &&
++             (m != VelaLive::Model::Unset || seen))
++        change = true;
++    h.model = m;
++    h.lossy = lossy;
++    h.npu = npu;
++    if (change)
++    {
++        h.tries++;
++        unsigned int sw = 0, sh = 0;
++        InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &sw);
++        InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &sh);
++        VelaLive::SubW = sw;
++        VelaLive::SubH = sh;
++        LOG_INFO("Vela live: handle {0} model {1} -> {2} (the game draws {3}x{4})", handleId, VelaLive::ModelName(m),
++                 UpscalerDisplayName(want), sw, sh);
++        state.newBackend = want;
++        state.changeBackend[handleId] = true;
++        return;
++    }
++
++    // The game keeps its DLSS feature and draws another subrect (dynamic resolution): SGSR 2 / SGSR 3 are made for one
++    // render size, re-created at the subrect once that size held for 30 frames (once per size and handle)
++    const Upscaler type = feature->GetUpscalerType();
++    if (type != Upscaler::SGSR3_on12 && type != Upscaler::SGSR2_on12)
++        return;
++    struct VelaSub
++    {
++        unsigned int w = 0, h = 0, held = 0;
++    };
++    static ankerl::unordered_dense::map<unsigned int, VelaSub> velaSubs;
++    auto& vs = velaSubs[handleId];
++    unsigned int sw = 0, sh = 0;
++    if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &sw) == NVSDK_NGX_Result_Success &&
++        InParameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &sh) == NVSDK_NGX_Result_Success &&
++        sw > 0 && sh > 0 && (sw != feature->RenderWidth() || sh != feature->RenderHeight()))
++    {
++        vs.held = (sw == vs.w && sh == vs.h) ? vs.held + 1 : 0;
++        vs.w = sw;
++        vs.h = sh;
++        if (vs.held == 30)
++        {
++            LOG_INFO("Vela live: the game draws {0}x{1}, {2} made for {3}x{4}: re-created", sw, sh,
++                     UpscalerDisplayName(type), feature->RenderWidth(), feature->RenderHeight());
++            VelaLive::SubW = sw;
++            VelaLive::SubH = sh;
++            state.newBackend = type;
++            state.changeBackend[handleId] = true;
++        }
++    }
++    else
++        vs.held = 0;
++}
++
+ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext* InDevCtx,
+                                                                const NVSDK_NGX_Handle* InFeatureHandle,
+                                                                NVSDK_NGX_Parameter* InParameters,
+@@ -750,6 +874,9 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
+     IFeature_Dx11* deviceContext = nullptr;
+     auto activeContext = &Dx11Contexts[handleId];
+ 
++    if (activeContext->feature != nullptr && !state.changeBackend[handleId])
++        VelaLiveDx11(activeContext->feature.get(), handleId, InParameters);
++
+     if (state.changeBackend[handleId])
+     {
+         UpscalerInputsDx11wDx12::Reset();
+@@ -821,10 +948,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceConte
+     auto upscaler = deviceContext->GetUpscalerType();
+     if (!upscaleResult && !deviceContext->IsInited() &&
+         (upscaler == Upscaler::XeSS || upscaler == Upscaler::XeSS_on12 || upscaler == Upscaler::DLSS ||
+-         upscaler == Upscaler::DLSS_on12 || upscaler == Upscaler::FFX_on12))
++         upscaler == Upscaler::DLSS_on12 || upscaler == Upscaler::FFX_on12 || upscaler == Upscaler::SGSR3_on12))
+     {
+         ImGui::InsertNotification({ ImGuiToastType::Error, 10000, "Upscaler failed to run!" });
+-        state.newBackend = Upscaler::FSR22;
++        state.newBackend = VelaDx11Fallback(upscaler);
+         state.changeBackend[handleId] = true;
+     }
+ 
+diff --git a/OptiScaler/upscalers/FeatureProvider_Dx11.cpp b/OptiScaler/upscalers/FeatureProvider_Dx11.cpp
+index 213720c8..8705d873 100644
+--- a/OptiScaler/upscalers/FeatureProvider_Dx11.cpp
++++ b/OptiScaler/upscalers/FeatureProvider_Dx11.cpp
+@@ -1,5 +1,6 @@
+ #include <pch.h>
+ #include "sgsr2/SGSR2Feature_Dx11on12.h"
++#include "sgsr3/SGSR3Feature_Dx11on12.h"
+ #include "FeatureProvider_Dx11.h"
+ 
+ #include "Util.h"
+@@ -42,6 +43,10 @@ bool FeatureProvider_Dx11::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
+         *feature = std::make_unique<SGSR2FeatureDx11on12>(handleId, parameters);
+         break;
+ 
++    case Upscaler::SGSR3_on12:
++        *feature = std::make_unique<SGSR3FeatureDx11on12>(handleId, parameters);
++        break;
++
+     case Upscaler::XeSS_on12:
+         *feature = std::make_unique<XeSSFeatureDx11on12>(handleId, parameters);
+         break;
+@@ -261,9 +266,16 @@ bool FeatureProvider_Dx11::ChangeFeature(Upscaler upscaler, ID3D11Device* device
+ 
+             if (state.newBackend != Upscaler::DLSSD)
+             {
+-                state.newBackend = Upscaler::FSR22;
++                // Vela 0027: on Adreno a DX11 backend that cannot start goes to SGSR 2 over the bridge (FSR 2.2 when
++                // SGSR 2 itself failed)
++                const bool toSgsr2 =
++                    IsAdrenoGpu(IdentifyGpu::getPrimaryGpu()) && state.newBackend != Upscaler::SGSR2_on12;
++                LOG_WARN("Vela live: {0} did not start; {1} instead", UpscalerDisplayName(state.newBackend),
++                         toSgsr2 ? "SGSR 2" : "FSR 2.2");
++                state.newBackend = toSgsr2 ? Upscaler::SGSR2_on12 : Upscaler::FSR22;
+                 state.changeBackend[handleId] = true;
+-                ImGui::InsertNotification({ ImGuiToastType::Warning, 10000, "Falling back to FSR 2.2" });
++                ImGui::InsertNotification(
++                    { ImGuiToastType::Warning, 10000, toSgsr2 ? "Falling back to SGSR 2" : "Falling back to FSR 2.2" });
+             }
+             else
+             {
+diff --git a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx11on12.cpp b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx11on12.cpp
+new file mode 100644
+index 00000000..035a0855
+--- /dev/null
++++ b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx11on12.cpp
+@@ -0,0 +1,11 @@
++#include <pch.h>
++
++#include "SGSR3Feature_Dx11on12.h"
++#include "SGSR3Feature_Dx12.h"
++
++SGSR3FeatureDx11on12::SGSR3FeatureDx11on12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters)
++    : IFeature_Dx11wDx12(InHandleId, InParameters), IFeature_Dx11(InHandleId, InParameters),
++      IFeature(InHandleId, InParameters)
++{
++    dx12Feature = std::make_unique<SGSR3FeatureDx12>(InHandleId, InParameters);
++}
+diff --git a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx11on12.h b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx11on12.h
+new file mode 100644
+index 00000000..f674b332
+--- /dev/null
++++ b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx11on12.h
+@@ -0,0 +1,13 @@
++#pragma once
++#include <upscalers/IFeature_Dx11wDx12.h>
++
++// Vela patch 0027: SGSR 3 (with its FSR 4 VK bridge, FSR 4 Fast and the NPU path) driven from a D3D11 game. Like
++// SGSR2FeatureDx11on12: the bridge shares the game's D3D11 colour, depth, motion vectors and output into D3D12, the
++// ordinary SGSR3FeatureDx12 evaluates, and the bridge copies the result back to the game's D3D11 output.
++class SGSR3FeatureDx11on12 : public IFeature_Dx11wDx12
++{
++  public:
++    Upscaler GetUpscalerType() const final { return Upscaler::SGSR3_on12; }
++
++    SGSR3FeatureDx11on12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters);
++};
+-- 
+2.54.0.windows.1
+

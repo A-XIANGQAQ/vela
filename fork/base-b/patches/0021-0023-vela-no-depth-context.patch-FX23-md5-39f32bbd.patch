@@ -1,0 +1,88 @@
+From 68e7ed36d7bccab51ac6f430a6f9d50b124661de Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 11:09:36 +0100
+Subject: [PATCH 21/65] 0023-vela-no-depth-context.patch (FX23, md5 39f32bbd)
+
+(cherry picked from commit f85bdc8969d0bbc5a02681c77f3cd3ccc2c801a1)
+---
+ OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp         | 22 +++++++++++++++++--
+ .../upscalers/sgsr3/SGSR3Feature_Dx12.cpp     | 10 ++++++++-
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 233c3f42..25a439c8 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -1059,6 +1059,7 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
+             int lossy = 1;
+             int npu = 0;
+             int tries = 0;
++            bool noDepthLogged = false;
+         };
+         static ankerl::unordered_dense::map<unsigned int, VelaHandle> velaHandles;
+         const VelaLive::Values& lv = VelaLive::Poll();
+@@ -1086,21 +1087,38 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
+             fsr4DownLogged = true;
+             LOG_WARN("Vela live: {0} cannot run in this game; SGSR 2 instead", VelaLive::ModelName(m));
+         }
++        // Vela 0.8.22: a context with no depth buffer (Manor Lords: a service context next to the real one) cannot feed
++        // FSR 4. SGSR 2 for this handle only, the game's other contexts still try FSR 4. Read every frame: a handle that
++        // gets depth later goes to FSR 4, inside the limit on tries below
++        bool noDepth = false;
++        if (isFsr4 && !fsr4Down)
++        {
++            ID3D12Resource* velaDepth = nullptr;
++            if (InParameters->Get(NVSDK_NGX_Parameter_Depth, &velaDepth) != NVSDK_NGX_Result_Success)
++                InParameters->Get(NVSDK_NGX_Parameter_Depth, (void**) &velaDepth);
++            noDepth = velaDepth == nullptr;
++        }
+         const Upscaler iniUp = cfg.Dx12Upscaler.value_or_default();
+-        const Upscaler want = m == VelaLive::Model::Sgsr2 || fsr4Down ? Upscaler::SGSR2
++        const Upscaler want = m == VelaLive::Model::Sgsr2 || fsr4Down || noDepth ? Upscaler::SGSR2
+                               : m == VelaLive::Model::Fsr3            ? Upscaler::FFX
+                               : isFsr4                                ? Upscaler::SGSR3
+                               : iniUp == Upscaler::SGSR3              ? Upscaler::SGSR2
+                                                                       : iniUp;
+         const bool seen = velaHandles.contains(handleId);
+         auto& h = velaHandles[handleId];
++        if (noDepth && !h.noDepthLogged)
++        {
++            h.noDepthLogged = true;
++            LOG_INFO("Vela live: handle {0} has no depth buffer: SGSR 2 on this context, the others keep {1}", handleId,
++                     VelaLive::ModelName(m));
++        }
+         bool change = false;
+         if (seen && (h.model != m || h.lossy != lossy || h.npu != npu))
+         {
+             h.tries = 0;
+             change = true;  // the panel changed the model: Vela AI <-> P2b <-> SR need a re-create on the same backend
+         }
+-        else if (feature->GetUpscalerType() != want && h.tries < (fsr4Down ? 3 : 2) &&
++        else if (feature->GetUpscalerType() != want && h.tries < (fsr4Down || noDepth ? 3 : 2) &&
+                  (m != VelaLive::Model::Unset || seen))
+             change = true;  // a new handle, or a backend change that did not take yet
+         h.model = m;
+diff --git a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
+index 7e99df97..9006dbae 100644
+--- a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
++++ b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
+@@ -687,7 +687,15 @@ bool SGSR3FeatureDx12::EvaluateFsr4(ID3D12GraphicsCommandList* cl, NVSDK_NGX_Par
+     f.fovV = cfg.FsrVerticalFov.has_value() ? OptiMath::GetRadiansFromDeg(cfg.FsrVerticalFov.value()) : 1.0472f;
+     constexpr auto SRV = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+     constexpr auto UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+-    if (depth == nullptr || !_fsr4.Evaluate(cl, { color, SRV }, { depth, SRV }, { mv, SRV }, { output, UAV }, f))
++    // Vela 0.8.22: no depth says nothing about FSR 4 in this game, so no global failure and the context stays. The handle
++    // normally went to SGSR 2 before this frame (TryEvaluateOptiFeature); this is the case where its tries ran out
++    if (depth == nullptr)
++    {
++        if (!_loggedVkFail)
++            LOG_WARN("SGSR3: no depth buffer on this frame; FSR 4 skipped on this context");
++        return false;
++    }
++    if (!_fsr4.Evaluate(cl, { color, SRV }, { depth, SRV }, { mv, SRV }, { output, UAV }, f))
+     {
+         LOG_ERROR("SGSR3: FSR 4 VK frame failed; SGSR 2 from the next frame");
+         VelaLive::Fsr4Failed() = true;
+-- 
+2.54.0.windows.1
+

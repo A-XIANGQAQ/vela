@@ -1,0 +1,836 @@
+From e6f9a083bb137270baade2ae47b8d1905e53492f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 21:32:30 +0100
+Subject: [PATCH 32/65] 0031-vela-dx11-probe: VELA_DX11_PROBE=1 reads what
+ crosses the DX11 -> DX12 bridge once per feature at its 120th Evaluate (again
+ 120 frames after each Vela live model switch): a = the game's D3D11 inputs,
+ a2 = the shared colour through D3D11, b = the shared inputs through a D3D12
+ readback, c = the shared output through D3D12, c2 = the shared output through
+ D3D11, d = the game's output after the copy back (per channel
+ min/max/mean/naninf, a texel-byte hash, the centre pixel), plus preExposure /
+ exposure and each shared texture's D3D11 and D3D12 desc, Vulkan format and
+ layouts (Ghostrunner DX11: scene white / black on FSR 4 and SGSR 2);
+ VELA_DX11_SHARED_BIND=1 (opt-in A/B, not a fix) makes the bridge's own shared
+ copies with the fewest bind flags
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit eb1afafd742532e08edd0bf62660d8f01428af3a)
+---
+ OptiScaler/upscalers/IFeature_Dx11wDx12.cpp |  79 +++
+ OptiScaler/upscalers/IFeature_Dx11wDx12.h   |   3 +
+ OptiScaler/with_dx12/dx11_with_dx12.cpp     |  31 +-
+ OptiScaler/with_dx12/vela_dx11_probe.cpp    | 550 ++++++++++++++++++++
+ OptiScaler/with_dx12/vela_dx11_probe.h      |  42 ++
+ 5 files changed, 703 insertions(+), 2 deletions(-)
+ create mode 100644 OptiScaler/with_dx12/vela_dx11_probe.cpp
+ create mode 100644 OptiScaler/with_dx12/vela_dx11_probe.h
+
+diff --git a/OptiScaler/upscalers/IFeature_Dx11wDx12.cpp b/OptiScaler/upscalers/IFeature_Dx11wDx12.cpp
+index 9cc3a82d..a2c1e9e3 100644
+--- a/OptiScaler/upscalers/IFeature_Dx11wDx12.cpp
++++ b/OptiScaler/upscalers/IFeature_Dx11wDx12.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <with_dx12/with_dx12.h>
+ #include <misc/DeferredRelease.h>
++#include <with_dx12/vela_dx11_probe.h>
+ 
+ using Microsoft::WRL::ComPtr;
+ 
+@@ -332,6 +333,9 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
+     if (dc != nullptr)
+         dc->Release();
+ 
++    // Vela 0031: VELA_DX11_PROBE=1 reads the bridge's inputs and output once, at this feature's 120th Evaluate
++    const bool velaProbe = VelaDx11Probe::Enabled() && ++_velaProbeEvals == 120;
++
+     const auto commandFrame = (UINT) (_frameCount % DX11WDX12_COMMAND_BUFFER_COUNT);
+     const auto resourceFrame = (UINT) (_frameCount % DX11_WITH_DX12_CACHED_FRAMES);
+     auto cmdList = Dx12CommandList[commandFrame];
+@@ -432,6 +436,41 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
+     // D3D11 drops an SRV whose resource is still bound as a UAV, our passes read the game's textures
+     ID3D11UnorderedAccessView* nullUAVs[D3D11_1_UAV_SLOT_COUNT] = {};
+     InDeviceContext->CSSetUnorderedAccessViews(0, uavSlots, nullUAVs, nullptr);
++    if (velaProbe)
++    {
++        float preExposure = -1.0f, exposureScale = -1.0f;
++        InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &preExposure);
++        InParameters->Get(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, &exposureScale);
++        std::string exposure = "none";
++        if (restoreParamExposure != nullptr)
++        {
++            ComPtr<ID3D11Texture2D> expTexture;
++            exposure = "not-a-2d-texture";
++            if (SUCCEEDED(restoreParamExposure->QueryInterface(IID_PPV_ARGS(&expTexture))) && expTexture != nullptr)
++            {
++                D3D11_TEXTURE2D_DESC ed = {};
++                expTexture->GetDesc(&ed);
++                exposure = std::to_string((int) ed.Format) + " " + std::to_string(ed.Width) + "x" +
++                           std::to_string(ed.Height);
++            }
++        }
++        LOG_INFO("Vela DX11 probe: preExposure {} exposure {} | exposureScale {} autoExposure {} hdr {} "
++                 "depthInverted {} upscaler {} evaluate {} flush {}",
++                 preExposure, exposure, exposureScale, AutoExposure(), IsHdr(), DepthInverted(),
++                 dx12Feature ? dx12Feature->Name() : std::string("none"), _velaProbeEvals,
++                 std::getenv("VELA_DX11_NOFLUSH") != nullptr && std::getenv("VELA_DX11_NOFLUSH")[0] == '1' ? "off"
++                                                                                                           : "on");
++
++        VelaDx11Probe::ReadD3D11(Dx11Device, InDeviceContext, restoreParamColor, "a",
++                                 "game colour (D3D11, before the bridge copy)");
++        VelaDx11Probe::ReadD3D11(Dx11Device, InDeviceContext, restoreParamMv, "a-mv",
++                                 "game motion vectors (D3D11, before the bridge copy)");
++        VelaDx11Probe::ReadD3D11(Dx11Device, InDeviceContext, restoreParamDepth, "a-depth",
++                                 "game depth (D3D11, before the bridge copy)");
++        if (restoreParamExposure != nullptr)
++            VelaDx11Probe::ReadD3D11(Dx11Device, InDeviceContext, restoreParamExposure, "a-exp",
++                                     "game exposure texture (D3D11)");
++    }
+ 
+     bool dx12EvalResult = false;
+     bool commandListRecording = false;
+@@ -587,6 +626,39 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
+         }
+     }
+ 
++    if (velaProbe && dx12EvalResult && commandListExecuted)
++    {
++        // a2: the shared colour through D3D11 (DXVK's view of the copy the bridge made)
++        VelaDx11Probe::ReadD3D11(Dx11Device, InDeviceContext, dx11Color.SharedTexture, "a2",
++                                 "shared colour read through D3D11 (after the bridge copy)");
++
++        // b / c: what the D3D12 upscaler read and wrote (vkd3d-proton's view), in the states the features leave them
++        auto& cfg = *Config::Instance();
++        const VelaDx11Probe::Dx12Target targets[] = {
++            { "b", "shared colour the D3D12 upscaler reads", dx11Color.Dx12Resource,
++              (D3D12_RESOURCE_STATES) cfg.ColorResourceBarrier.value_or(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) },
++            { "b-mv", "shared motion vectors the D3D12 upscaler reads", dx11Mv.Dx12Resource,
++              (D3D12_RESOURCE_STATES) cfg.MVResourceBarrier.value_or(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) },
++            { "b-depth", "shared depth the D3D12 upscaler reads", dx11Depth.Dx12Resource,
++              (D3D12_RESOURCE_STATES) cfg.DepthResourceBarrier.value_or(D3D12_RESOURCE_STATE_DEPTH_WRITE) },
++            { "c", "shared output the D3D12 upscaler wrote", dx11Out.Dx12Resource,
++              (D3D12_RESOURCE_STATES) cfg.OutputResourceBarrier.value_or(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) },
++        };
++        VelaDx11Probe::ReadD3D12(_dx11on12Device, Dx12CommandQueue, Dx12CommandListType, InDeviceContext,
++                                 Dx11WithDx12::GetD3D11DeviceContext(), targets, 4);
++
++        // c2: the shared output through D3D11, before the copy back (DXVK's view of what D3D12 wrote)
++        VelaDx11Probe::ReadD3D11(Dx11Device, InDeviceContext, dx11Out.SharedTexture, "c2",
++                                 "shared output read through D3D11 (before the copy back)");
++
++        VelaDx11Probe::LogShared(_dx11on12Device, "color", dx11Color);
++        VelaDx11Probe::LogShared(_dx11on12Device, "mv", dx11Mv);
++        VelaDx11Probe::LogShared(_dx11on12Device, "depth", dx11Depth);
++        VelaDx11Probe::LogShared(_dx11on12Device, "output", dx11Out);
++        if (dx11Exp.Dx12Resource != nullptr)
++            VelaDx11Probe::LogShared(_dx11on12Device, "exposure", dx11Exp);
++    }
++
+     auto evalResult = false;
+ 
+     do
+@@ -602,6 +674,13 @@ bool IFeature_Dx11wDx12::Evaluate(ID3D11DeviceContext* InDeviceContext, NVSDK_NG
+             break;
+         }
+ 
++        if (velaProbe)
++        {
++            VelaDx11Probe::ReadD3D11(Dx11Device, InDeviceContext, restoreParamOutput, "d",
++                                     "game output after the copy back (D3D11)");
++            LOG_INFO("Vela DX11 probe: done");
++        }
++
+         evalResult = true;
+ 
+     } while (false);
+diff --git a/OptiScaler/upscalers/IFeature_Dx11wDx12.h b/OptiScaler/upscalers/IFeature_Dx11wDx12.h
+index 01a2bcd1..c6841e86 100644
+--- a/OptiScaler/upscalers/IFeature_Dx11wDx12.h
++++ b/OptiScaler/upscalers/IFeature_Dx11wDx12.h
+@@ -43,6 +43,9 @@ class IFeature_Dx11wDx12 : public virtual IFeature_Dx11
+     // Per feature, sharing it between features makes them recreate each other's in-flight resources
+     Dx11WithDx12::D3D11_UPSCALER_RESOURCE_CACHE_C ResourceCache = {};
+ 
++    // Vela 0031: Evaluate calls of this feature, for VELA_DX11_PROBE (fires at the 120th)
++    int _velaProbeEvals = 0;
++
+     bool CreateD3D12Objects();
+     bool ProcessDx11Textures(const NVSDK_NGX_Parameter* InParameters);
+     bool CopyBackOutput(const D3D11_BOX* InView, UINT InDstX, UINT InDstY);
+diff --git a/OptiScaler/with_dx12/dx11_with_dx12.cpp b/OptiScaler/with_dx12/dx11_with_dx12.cpp
+index e81d12b2..ee605ba8 100644
+--- a/OptiScaler/with_dx12/dx11_with_dx12.cpp
++++ b/OptiScaler/with_dx12/dx11_with_dx12.cpp
+@@ -227,6 +227,31 @@ static bool VelaDx11Flush()
+     return on;
+ }
+ 
++// Vela 0031 (opt-in A/B, NOT a confirmed fix): VELA_DX11_SHARED_BIND=1 makes the bridge's own shared copies with the
++// fewest bind flags (inputs: shader resource only; the output: shader resource + UAV) instead of the game's. Suspect in
++// Ghostrunner DX11 (white / black scene on Turnip): DXVK creates the shared image from its D3D11 bind flags and
++// vkd3d-proton re-creates it from the shared metadata with its own usage / create flags; if the two differ, Turnip can
++// pick different layouts (UBWC on one side only). Fewer bind flags leave both sides fewer ways to differ. Depth-stencil
++// textures keep their flags.
++static void VelaSharedBind(D3D11_TEXTURE2D_DESC& desc, bool copy)
++{
++    static const bool on = []
++    {
++        const char* e = std::getenv("VELA_DX11_SHARED_BIND");
++        const bool v = e != nullptr && e[0] == '1';
++        if (v)
++            LOG_INFO("Vela DX11: shared copies with the fewest bind flags (VELA_DX11_SHARED_BIND=1)");
++        return v;
++    }();
++
++    if (!on || (desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0)
++        return;
++
++    // the output keeps the game's UAV bit (an sRGB output cannot take a new one)
++    desc.BindFlags = copy ? D3D11_BIND_SHADER_RESOURCE
++                          : (D3D11_BIND_SHADER_RESOURCE | (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS));
++}
++
+ bool Dx11WithDx12::SyncDx11ToDx12()
+ {
+     std::lock_guard<std::mutex> lock(SyncMutex);
+@@ -285,7 +310,7 @@ bool Dx11WithDx12::SyncDx12ToDx11()
+         return false;
+     }
+ 
+-    if (UseCpuWaitForDx12() || VelaDx11Flush())
++    if (UseCpuWaitForDx12())
+     {
+         // Upscaler work is short, polling avoids the event wake up latency under Wine
+         const auto spinStart = Util::MillisecondsNow();
+@@ -466,6 +491,7 @@ bool Dx11WithDx12::CopyTextureFrom11To12(ID3D11Resource* InResource, D3D11_TEXTU
+         sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+         sharedDesc.Usage = D3D11_USAGE_DEFAULT;
+         sharedDesc.CPUAccessFlags = 0;
++        VelaSharedBind(sharedDesc, InCopy);
+ 
+         const auto sharedDescCache = CaptureDesc(sharedDesc);
+         const bool sharedTextureMatches = TextureDescEquals(OutResource->Desc, sharedDescCache) &&
+@@ -596,6 +622,7 @@ bool Dx11WithDx12::CopyTextureFrom11To12(ID3D11Resource* InResource, D3D11_TEXTU
+             sharedDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+             sharedDesc.Usage = D3D11_USAGE_DEFAULT;
+             sharedDesc.CPUAccessFlags = 0;
++            VelaSharedBind(sharedDesc, InCopy);
+ 
+             const auto sharedDescCache = CaptureDesc(sharedDesc);
+             const bool sharedTextureMatches =
+@@ -1044,7 +1071,7 @@ bool Dx11WithDx12::CopyUpscalerOutputToDx11(D3D11_UPSCALER_RESOURCE_CACHE_C& cac
+         Dx11DeviceContext->CopyResource(output, shared);
+ 
+     // After a CPU wait the D3D11 queue is idle, submit right away instead of waiting for the next flush
+-    if (UseCpuWaitForDx12())
++    if (UseCpuWaitForDx12() || VelaDx11Flush())
+         Dx11DeviceContext->Flush();
+ 
+     // Games flush should be enough, so disabled for now
+diff --git a/OptiScaler/with_dx12/vela_dx11_probe.cpp b/OptiScaler/with_dx12/vela_dx11_probe.cpp
+new file mode 100644
+index 00000000..e2335ed1
+--- /dev/null
++++ b/OptiScaler/with_dx12/vela_dx11_probe.cpp
+@@ -0,0 +1,550 @@
++#include <pch.h>
++
++#include "vela_dx11_probe.h"
++
++#include "upscalers/sgsr3/SGSR3Student_Vk.h" // ID3D12DXVKInteropDevice1
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <string>
++#include <vector>
++
++using Microsoft::WRL::ComPtr;
++
++namespace
++{
++enum class Kind
++{
++    None,
++    F32,
++    F16,
++    Unorm8,
++    Bgra8,
++    Rgb10A2,
++    R11G11B10,
++    Rgb9E5,
++    D24,
++    Unorm16,
++};
++
++struct FormatInfo
++{
++    Kind kind = Kind::None;
++    int bytes = 0;
++    int channels = 0;
++};
++
++FormatInfo Info(DXGI_FORMAT f)
++{
++    switch (f)
++    {
++    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
++    case DXGI_FORMAT_R32G32B32A32_FLOAT:
++        return { Kind::F32, 16, 4 };
++    case DXGI_FORMAT_R32G32B32_TYPELESS:
++    case DXGI_FORMAT_R32G32B32_FLOAT:
++        return { Kind::F32, 12, 3 };
++    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
++    case DXGI_FORMAT_R16G16B16A16_FLOAT:
++        return { Kind::F16, 8, 4 };
++    case DXGI_FORMAT_R32G32_TYPELESS:
++    case DXGI_FORMAT_R32G32_FLOAT:
++        return { Kind::F32, 8, 2 };
++    case DXGI_FORMAT_R32G8X24_TYPELESS:
++    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
++    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
++        return { Kind::F32, 8, 1 };
++    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
++    case DXGI_FORMAT_R10G10B10A2_UNORM:
++        return { Kind::Rgb10A2, 4, 4 };
++    case DXGI_FORMAT_R11G11B10_FLOAT:
++        return { Kind::R11G11B10, 4, 3 };
++    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
++    case DXGI_FORMAT_R8G8B8A8_UNORM:
++    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++        return { Kind::Unorm8, 4, 4 };
++    case DXGI_FORMAT_B8G8R8A8_UNORM:
++    case DXGI_FORMAT_B8G8R8X8_UNORM:
++    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
++    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
++    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
++        return { Kind::Bgra8, 4, 4 };
++    case DXGI_FORMAT_R16G16_TYPELESS:
++    case DXGI_FORMAT_R16G16_FLOAT:
++        return { Kind::F16, 4, 2 };
++    case DXGI_FORMAT_R32_TYPELESS:
++    case DXGI_FORMAT_D32_FLOAT:
++    case DXGI_FORMAT_R32_FLOAT:
++        return { Kind::F32, 4, 1 };
++    case DXGI_FORMAT_R24G8_TYPELESS:
++    case DXGI_FORMAT_D24_UNORM_S8_UINT:
++    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
++        return { Kind::D24, 4, 1 };
++    case DXGI_FORMAT_R16_TYPELESS:
++    case DXGI_FORMAT_R16_FLOAT:
++        return { Kind::F16, 2, 1 };
++    case DXGI_FORMAT_D16_UNORM:
++    case DXGI_FORMAT_R16_UNORM:
++        return { Kind::Unorm16, 2, 1 };
++    case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
++        return { Kind::Rgb9E5, 4, 3 };
++    default:
++        return {};
++    }
++}
++
++float HalfToFloat(uint16_t h)
++{
++    const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 31u, m = h & 1023u;
++    float v;
++    if (e == 0)
++        v = std::ldexp((float) m, -24);
++    else if (e == 31)
++        v = m != 0 ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
++    else
++        v = std::ldexp((float) (m | 1024u), (int) e - 25);
++    return s != 0 ? -v : v;
++}
++
++// unsigned float with a 5-bit exponent (bias 15) and mbits of mantissa: R11G11B10_FLOAT's 11 / 11 / 10-bit channels
++float UFloat(uint32_t v, int mbits)
++{
++    const uint32_t m = v & ((1u << mbits) - 1u), e = (v >> mbits) & 31u;
++    if (e == 0)
++        return std::ldexp((float) m, -14 - mbits);
++    if (e == 31)
++        return m != 0 ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
++    return std::ldexp((float) (m | (1u << mbits)), (int) e - 15 - mbits);
++}
++
++void Decode(const FormatInfo& fi, const uint8_t* p, float out[4])
++{
++    uint32_t u = 0;
++    switch (fi.kind)
++    {
++    case Kind::F32:
++        for (int c = 0; c < fi.channels; c++)
++            memcpy(&out[c], p + 4 * c, 4);
++        break;
++    case Kind::F16:
++        for (int c = 0; c < fi.channels; c++)
++        {
++            uint16_t h;
++            memcpy(&h, p + 2 * c, 2);
++            out[c] = HalfToFloat(h);
++        }
++        break;
++    case Kind::Unorm8:
++        for (int c = 0; c < 4; c++)
++            out[c] = p[c] / 255.0f;
++        break;
++    case Kind::Bgra8:
++        out[0] = p[2] / 255.0f;
++        out[1] = p[1] / 255.0f;
++        out[2] = p[0] / 255.0f;
++        out[3] = p[3] / 255.0f;
++        break;
++    case Kind::Rgb10A2:
++        memcpy(&u, p, 4);
++        out[0] = (u & 1023u) / 1023.0f;
++        out[1] = ((u >> 10) & 1023u) / 1023.0f;
++        out[2] = ((u >> 20) & 1023u) / 1023.0f;
++        out[3] = ((u >> 30) & 3u) / 3.0f;
++        break;
++    case Kind::R11G11B10:
++        memcpy(&u, p, 4);
++        out[0] = UFloat(u & 2047u, 6);
++        out[1] = UFloat((u >> 11) & 2047u, 6);
++        out[2] = UFloat((u >> 22) & 1023u, 5);
++        break;
++    case Kind::Rgb9E5:
++    {
++        memcpy(&u, p, 4);
++        const int e = (int) ((u >> 27) & 31u) - 15 - 9;
++        out[0] = std::ldexp((float) (u & 511u), e);
++        out[1] = std::ldexp((float) ((u >> 9) & 511u), e);
++        out[2] = std::ldexp((float) ((u >> 18) & 511u), e);
++        break;
++    }
++    case Kind::D24:
++        memcpy(&u, p, 4);
++        out[0] = (u & 0xFFFFFFu) / 16777215.0f;
++        break;
++    case Kind::Unorm16:
++    {
++        uint16_t h;
++        memcpy(&h, p, 2);
++        out[0] = h / 65535.0f;
++        break;
++    }
++    default:
++        break;
++    }
++}
++
++void Analyse(const char* tag, const char* what, DXGI_FORMAT format, const uint8_t* data, UINT64 rowPitch, UINT width,
++             UINT height)
++{
++    const FormatInfo fi = Info(format);
++    if (fi.kind == Kind::None || data == nullptr || width == 0 || height == 0)
++    {
++        LOG_INFO("Vela DX11 probe: {} fmt {} undecoded | {}x{} | {}", tag, (int) format, width, height, what);
++        return;
++    }
++
++    double mn[4], mx[4], sum[4] = {};
++    uint64_t cnt[4] = {}, bad[4] = {};
++    for (int c = 0; c < 4; c++)
++    {
++        mn[c] = std::numeric_limits<double>::infinity();
++        mx[c] = -std::numeric_limits<double>::infinity();
++    }
++
++    uint64_t hash = 1469598103934665603ULL;
++    const size_t rowBytes = (size_t) width * fi.bytes;
++    for (UINT y = 0; y < height; y++)
++    {
++        const uint8_t* row = data + (size_t) y * rowPitch;
++        for (size_t i = 0; i < rowBytes; i++)
++        {
++            hash ^= row[i];
++            hash *= 1099511628211ULL;
++        }
++        for (UINT x = 0; x < width; x++)
++        {
++            float v[4] = {};
++            Decode(fi, row + (size_t) x * fi.bytes, v);
++            for (int c = 0; c < fi.channels; c++)
++            {
++                if (!std::isfinite(v[c]))
++                {
++                    bad[c]++;
++                    continue;
++                }
++                cnt[c]++;
++                sum[c] += v[c];
++                if (v[c] < mn[c])
++                    mn[c] = v[c];
++                if (v[c] > mx[c])
++                    mx[c] = v[c];
++            }
++        }
++    }
++
++    float centre[4] = {};
++    Decode(fi, data + (size_t) (height / 2) * rowPitch + (size_t) (width / 2) * fi.bytes, centre);
++
++    static const char names[4] = { 'R', 'G', 'B', 'A' };
++    std::string line;
++    char buf[160];
++    for (int c = 0; c < fi.channels; c++)
++    {
++        if (cnt[c] > 0)
++            snprintf(buf, sizeof(buf), " %c %.4g/%.4g/%.4g/%llu", names[c], mn[c], mx[c], sum[c] / (double) cnt[c],
++                     (unsigned long long) bad[c]);
++        else
++            snprintf(buf, sizeof(buf), " %c nan/nan/nan/%llu", names[c], (unsigned long long) bad[c]);
++        line += buf;
++    }
++    line += " | centre";
++    for (int c = 0; c < fi.channels; c++)
++    {
++        snprintf(buf, sizeof(buf), "%s%.4g", c == 0 ? " " : ",", centre[c]);
++        line += buf;
++    }
++    snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) hash);
++
++    LOG_INFO("Vela DX11 probe: {} fmt {}{} | {}x{} hash {} | {}", tag, (int) format, line, width, height, buf, what);
++}
++} // namespace
++
++bool VelaDx11Probe::Enabled()
++{
++    static const bool on = []
++    {
++        const char* e = std::getenv("VELA_DX11_PROBE");
++        const bool v = e != nullptr && e[0] == '1';
++        if (v)
++            LOG_INFO("Vela DX11 probe: on (VELA_DX11_PROBE=1), once per feature at its 120th evaluate");
++        return v;
++    }();
++    return on;
++}
++
++void VelaDx11Probe::ReadD3D11(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Resource* resource,
++                              const char* tag, const char* what)
++{
++    if (device == nullptr || context == nullptr || resource == nullptr)
++    {
++        LOG_INFO("Vela DX11 probe: {} none | {}", tag, what);
++        return;
++    }
++
++    ComPtr<ID3D11Texture2D> texture;
++    if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&texture))) || texture == nullptr)
++    {
++        LOG_INFO("Vela DX11 probe: {} not a 2D texture | {}", tag, what);
++        return;
++    }
++
++    D3D11_TEXTURE2D_DESC desc = {};
++    texture->GetDesc(&desc);
++    if (desc.SampleDesc.Count > 1)
++    {
++        LOG_INFO("Vela DX11 probe: {} fmt {} MSAA x{}, not read | {}", tag, (int) desc.Format, desc.SampleDesc.Count,
++                 what);
++        return;
++    }
++
++    D3D11_TEXTURE2D_DESC stagingDesc = desc;
++    stagingDesc.Usage = D3D11_USAGE_STAGING;
++    stagingDesc.BindFlags = 0;
++    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    stagingDesc.MiscFlags = 0;
++
++    ComPtr<ID3D11Texture2D> staging;
++    auto hr = device->CreateTexture2D(&stagingDesc, nullptr, &staging);
++    if (FAILED(hr) || staging == nullptr)
++    {
++        LOG_INFO("Vela DX11 probe: {} fmt {} staging CreateTexture2D failed {:X} | {}", tag, (int) desc.Format,
++                 (UINT) hr, what);
++        return;
++    }
++
++    context->CopyResource(staging.Get(), texture.Get());
++    context->Flush();
++
++    D3D11_MAPPED_SUBRESOURCE mapped = {};
++    hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
++    if (FAILED(hr) || mapped.pData == nullptr)
++    {
++        LOG_INFO("Vela DX11 probe: {} fmt {} Map failed {:X} | {}", tag, (int) desc.Format, (UINT) hr, what);
++        return;
++    }
++
++    Analyse(tag, what, desc.Format, (const uint8_t*) mapped.pData, mapped.RowPitch, desc.Width, desc.Height);
++    context->Unmap(staging.Get(), 0);
++}
++
++void VelaDx11Probe::ReadD3D12(ID3D12Device* device, ID3D12CommandQueue* queue, D3D12_COMMAND_LIST_TYPE type,
++                              ID3D11DeviceContext* flushA, ID3D11DeviceContext* flushB, const Dx12Target* targets,
++                              int count)
++{
++    if (device == nullptr || queue == nullptr || targets == nullptr || count <= 0)
++    {
++        LOG_INFO("Vela DX11 probe: D3D12 readback skipped (no device / queue)");
++        return;
++    }
++
++    ComPtr<ID3D12CommandAllocator> allocator;
++    ComPtr<ID3D12GraphicsCommandList> list;
++    ComPtr<ID3D12Fence> fence;
++    if (FAILED(device->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator))) ||
++        FAILED(device->CreateCommandList(0, type, allocator.Get(), nullptr, IID_PPV_ARGS(&list))) ||
++        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
++    {
++        LOG_INFO("Vela DX11 probe: D3D12 readback objects could not be made");
++        return;
++    }
++
++    struct Readback
++    {
++        ComPtr<ID3D12Resource> buffer;
++        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
++        D3D12_RESOURCE_DESC desc = {};
++        bool ok = false;
++    };
++    std::vector<Readback> rbs((size_t) count);
++
++    for (int i = 0; i < count; i++)
++    {
++        const auto& t = targets[i];
++        auto& rb = rbs[(size_t) i];
++        if (t.resource == nullptr)
++        {
++            LOG_INFO("Vela DX11 probe: {} none | {}", t.tag, t.what);
++            continue;
++        }
++
++        rb.desc = t.resource->GetDesc();
++        if (rb.desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rb.desc.SampleDesc.Count > 1)
++        {
++            LOG_INFO("Vela DX11 probe: {} fmt {} not a single-sample 2D texture, not read | {}", t.tag,
++                     (int) rb.desc.Format, t.what);
++            continue;
++        }
++
++        UINT rows = 0;
++        UINT64 rowBytes = 0, total = 0;
++        device->GetCopyableFootprints(&rb.desc, 0, 1, 0, &rb.footprint, &rows, &rowBytes, &total);
++
++        D3D12_HEAP_PROPERTIES heap = {};
++        heap.Type = D3D12_HEAP_TYPE_READBACK;
++        D3D12_RESOURCE_DESC bd = {};
++        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++        bd.Width = total;
++        bd.Height = 1;
++        bd.DepthOrArraySize = 1;
++        bd.MipLevels = 1;
++        bd.Format = DXGI_FORMAT_UNKNOWN;
++        bd.SampleDesc.Count = 1;
++        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++        auto hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
++                                                  nullptr, IID_PPV_ARGS(&rb.buffer));
++        if (FAILED(hr) || rb.buffer == nullptr)
++        {
++            LOG_INFO("Vela DX11 probe: {} readback buffer failed {:X} | {}", t.tag, (UINT) hr, t.what);
++            continue;
++        }
++
++        // An opened shared resource with simultaneous access is promoted to COPY_SOURCE implicitly
++        const bool barrier = (rb.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) == 0 &&
++                             t.state != D3D12_RESOURCE_STATE_COPY_SOURCE;
++        D3D12_RESOURCE_BARRIER b = {};
++        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b.Transition.pResource = t.resource;
++        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        if (barrier)
++        {
++            b.Transition.StateBefore = t.state;
++            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++            list->ResourceBarrier(1, &b);
++        }
++
++        D3D12_TEXTURE_COPY_LOCATION dst = {};
++        dst.pResource = rb.buffer.Get();
++        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++        dst.PlacedFootprint = rb.footprint;
++        D3D12_TEXTURE_COPY_LOCATION src = {};
++        src.pResource = t.resource;
++        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++        src.SubresourceIndex = 0;
++        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
++
++        if (barrier)
++        {
++            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++            b.Transition.StateAfter = t.state;
++            list->ResourceBarrier(1, &b);
++        }
++
++        rb.ok = true;
++    }
++
++    if (FAILED(list->Close()))
++    {
++        LOG_INFO("Vela DX11 probe: D3D12 readback list Close failed");
++        return;
++    }
++
++    ID3D12CommandList* lists[] = { list.Get() };
++    queue->ExecuteCommandLists(1, lists);
++    queue->Signal(fence.Get(), 1);
++
++    // The bridge queue waits on the D3D11 fence the bridge copies signal: make sure DXVK submitted them
++    if (flushA != nullptr)
++        flushA->Flush();
++    if (flushB != nullptr && flushB != flushA)
++        flushB->Flush();
++
++    HANDLE ev = CreateEvent(nullptr, FALSE, FALSE, nullptr);
++    bool done = fence->GetCompletedValue() >= 1;
++    if (!done && ev != nullptr && SUCCEEDED(fence->SetEventOnCompletion(1, ev)))
++        done = WaitForSingleObject(ev, 3000) == WAIT_OBJECT_0 || fence->GetCompletedValue() >= 1;
++
++    if (!done)
++    {
++        // The GPU may still use the objects: keep them alive (a one-off leak) rather than free them under it
++        LOG_INFO("Vela DX11 probe: D3D12 readback timed out (3 s), b/c not read");
++        allocator.Detach();
++        list.Detach();
++        fence.Detach();
++        for (auto& rb : rbs)
++            rb.buffer.Detach();
++        return;
++    }
++
++    if (ev != nullptr)
++        CloseHandle(ev);
++
++    for (int i = 0; i < count; i++)
++    {
++        auto& rb = rbs[(size_t) i];
++        if (!rb.ok)
++            continue;
++
++        void* data = nullptr;
++        D3D12_RANGE readRange = { 0, (SIZE_T) rb.buffer->GetDesc().Width };
++        if (FAILED(rb.buffer->Map(0, &readRange, &data)) || data == nullptr)
++        {
++            LOG_INFO("Vela DX11 probe: {} readback Map failed | {}", targets[i].tag, targets[i].what);
++            continue;
++        }
++
++        Analyse(targets[i].tag, targets[i].what, rb.desc.Format, (const uint8_t*) data + rb.footprint.Offset,
++                rb.footprint.Footprint.RowPitch, (UINT) rb.desc.Width, rb.desc.Height);
++
++        D3D12_RANGE noWrite = { 0, 0 };
++        rb.buffer->Unmap(0, &noWrite);
++    }
++}
++
++void VelaDx11Probe::LogShared(ID3D12Device* device, const char* name,
++                              const Dx11WithDx12::D3D11_TEXTURE2D_RESOURCE_C& entry)
++{
++    D3D11_TEXTURE2D_DESC sd = {};
++    if (entry.SharedTexture != nullptr)
++        entry.SharedTexture->GetDesc(&sd);
++
++    D3D12_RESOURCE_DESC rd = {};
++    if (entry.Dx12Resource != nullptr)
++        rd = entry.Dx12Resource->GetDesc();
++
++    int vkFormat = -1;
++    unsigned long long vkImage = 0;
++    int layoutCommon = -1, layoutSrv = -1, layoutUav = -1, layoutCopy = -1;
++
++    ComPtr<ID3D12DXVKInteropDevice1> interop;
++    if (device != nullptr && entry.Dx12Resource != nullptr &&
++        SUCCEEDED(device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice1), (void**) interop.GetAddressOf())) &&
++        interop != nullptr)
++    {
++        UINT64 handle = 0, offset = 0;
++        VkFormat f = VK_FORMAT_UNDEFINED;
++        if (SUCCEEDED(interop->GetVulkanResourceInfo1(entry.Dx12Resource, &handle, &offset, &f)))
++        {
++            vkFormat = (int) f;
++            vkImage = (unsigned long long) handle;
++        }
++
++        VkImageLayout l = VK_IMAGE_LAYOUT_UNDEFINED;
++        interop->GetVulkanImageLayout(entry.Dx12Resource, D3D12_RESOURCE_STATE_COMMON, &l);
++        layoutCommon = (int) l;
++        l = VK_IMAGE_LAYOUT_UNDEFINED;
++        interop->GetVulkanImageLayout(entry.Dx12Resource,
++                                      (D3D12_RESOURCE_STATES) (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
++                                                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
++                                      &l);
++        layoutSrv = (int) l;
++        l = VK_IMAGE_LAYOUT_UNDEFINED;
++        interop->GetVulkanImageLayout(entry.Dx12Resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &l);
++        layoutUav = (int) l;
++        l = VK_IMAGE_LAYOUT_UNDEFINED;
++        interop->GetVulkanImageLayout(entry.Dx12Resource, D3D12_RESOURCE_STATE_COPY_SOURCE, &l);
++        layoutCopy = (int) l;
++    }
++
++    LOG_INFO("Vela DX11 probe: shared {} dxgi {} bind 0x{:x} misc 0x{:x} vk {} | {}x{} mips {} usage {} | game dxgi {} "
++             "bind 0x{:x} misc 0x{:x} usage {} | ours {} nt {} same-as-game {} | d3d12 dxgi {} flags 0x{:x} layout {} "
++             "align {} | vk image 0x{:x} layout common {} srv {} uav {} copysrc {}",
++             name, (int) sd.Format, sd.BindFlags, sd.MiscFlags, vkFormat, sd.Width, sd.Height, sd.MipLevels,
++             (int) sd.Usage, (int) entry.SourceDesc.Format, entry.SourceDesc.BindFlags, entry.SourceDesc.MiscFlags,
++             (int) entry.SourceDesc.Usage, entry.OwnsSharedTexture ? 1 : 0, entry.UsesNTHandle ? 1 : 0,
++             entry.SharedTexture != nullptr && entry.SharedTexture == entry.SourceTexture ? 1 : 0, (int) rd.Format,
++             (UINT) rd.Flags, (int) rd.Layout, (unsigned long long) rd.Alignment, vkImage, layoutCommon, layoutSrv,
++             layoutUav, layoutCopy);
++}
+diff --git a/OptiScaler/with_dx12/vela_dx11_probe.h b/OptiScaler/with_dx12/vela_dx11_probe.h
+new file mode 100644
+index 00000000..cf5df7b5
+--- /dev/null
++++ b/OptiScaler/with_dx12/vela_dx11_probe.h
+@@ -0,0 +1,42 @@
++#pragma once
++
++// Vela 0031: VELA_DX11_PROBE=1 reads what crosses the D3D11 -> D3D12 bridge once per feature, at its 120th Evaluate
++// (a new feature is made on every "Vela live: handle" model switch, so it fires again 120 frames after a switch).
++// Lines (OptiScaler.log), all starting "Vela DX11 probe: ":
++//   a, a-mv, a-depth, a-exp  the game's D3D11 inputs, before the bridge copy (D3D11 staging read)
++//   a2                       the shared colour read back through D3D11 after the bridge copy
++//   b, b-mv, b-depth         the shared inputs as the D3D12 upscaler sees them (D3D12 readback, after the fence wait)
++//   c                        the shared output the D3D12 upscaler wrote (D3D12 readback)
++//   c2                       the shared output read back through D3D11, before the copy back
++//   d                        the game's D3D11 output after the copy back
++//   each: fmt <dxgi> <ch> min/max/mean/naninf ... | WxH hash <fnv64 of the texel bytes> centre <pixel> | what
++//   preExposure ..., shared <name> ... (descs, Vulkan format and layouts through ID3D12DXVKInteropDevice1)
++// Same hash on a and b (and on c and d) = the bytes crossed the bridge unchanged.
++
++#include <d3d11.h>
++#include <d3d12.h>
++
++#include <with_dx12/dx11_with_dx12.h>
++
++namespace VelaDx11Probe
++{
++bool Enabled();
++
++void ReadD3D11(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Resource* resource, const char* tag,
++               const char* what);
++
++struct Dx12Target
++{
++    const char* tag = nullptr;
++    const char* what = nullptr;
++    ID3D12Resource* resource = nullptr;
++    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
++};
++
++// Copies the targets into READBACK buffers on the bridge queue (after the work already on it), signals its own fence,
++// flushes the D3D11 contexts (the queue waits on the D3D11 fence) and waits for it on the CPU (3 s at most).
++void ReadD3D12(ID3D12Device* device, ID3D12CommandQueue* queue, D3D12_COMMAND_LIST_TYPE type,
++               ID3D11DeviceContext* flushA, ID3D11DeviceContext* flushB, const Dx12Target* targets, int count);
++
++void LogShared(ID3D12Device* device, const char* name, const Dx11WithDx12::D3D11_TEXTURE2D_RESOURCE_C& entry);
++} // namespace VelaDx11Probe
+-- 
+2.54.0.windows.1
+

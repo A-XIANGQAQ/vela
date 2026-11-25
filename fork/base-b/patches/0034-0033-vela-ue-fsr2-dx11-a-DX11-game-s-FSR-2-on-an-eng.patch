@@ -1,0 +1,1292 @@
+From 8d8d80692e1985fb89ca2da78758dbb32836ab39 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 22:32:57 +0100
+Subject: [PATCH 34/65] 0033-vela-ue-fsr2-dx11: a DX11 game's FSR 2 on an
+ engine FFX backend (AMD UE FSR 2 plugin, RHI backend) runs on OptiScaler's
+ DX11 path (Dx11Upscaler / Vela live: sgsr3_12, ffx_12, sgsr2_12)
+
+The UE FSR 2 plugin on D3D11 always uses its RHI backend (FSR2TemporalUpscaler.cpp Initialize: native backends only
+for D3D12 / Vulkan): FfxDevice = its FFSR2TemporalUpscaler, callbacks = ffxFsr2GetInterfaceUE, and ffxFsr2ContextDispatch
+runs while the render graph is built (FfxCommandList = FRDGBuilder*, FfxResource.resource = FRDGTexture*); the FSR 2
+jobs become render-graph compute passes that reach D3D11 later as ID3D11DeviceContext::Dispatch with the jobs' group
+counts (FSR2TemporalUpscalerSubPass.h). No native resource exists at the FFX API, so 0029 could not adopt it.
+
+0033: the DX12 FSR 2 create hooks give such a context (DX11 swapchain, FfxDevice no D3D11 / D3D12 device of the game)
+a copy of its description with wrapped fpCreatePipeline / fpScheduleGpuJob / fpExecuteGpuJobs (pass id per pipeline,
+compute job list per dispatch); its dispatch parameters are kept and the game's FSR 2 still records its passes. A
+Detours hook on ID3D11DeviceContext::Dispatch finds the passes by their group counts in job order (reconstruct pass to
+last pass), takes colour / depth / MV / exposure from the reconstruct pass SRVs and the reactive mask from the depth
+clip pass SRVs (matched to the FFX resource size / format / isDepth, unique only), the output from the last pass UAVs
+(output size / format, not an SRV of an FSR 2 pass in this or the last frame = not the ping-pong history), and right
+after that pass adopts the context on that context's device (0029 AdoptOnDevice: "context created" line) and runs
+Fsr2Dx11Dispatch (NGX DX11 feature, "Vela live: handle N model X" lines), CS shader saved and restored. Not replaced
+for 240 frames -> left to the game's FSR 2. VELA_UEFSR2=0 = old behaviour; VELA_UEFSR2_SKIP=1 = once adopted, the
+game's own FSR 2 passes from the reconstruct pass on are not dispatched (default: they run, the output is overwritten).
+DX12 games: an FfxDevice whose vtable lies in the module of its backend callbacks (UE RHI backend with
+r.FidelityFX.FSR2.UseNativeDX12=0) is left to the game instead of getting the latest D3D12 device (crash path).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 4bbae8b996aae67c24140311024e20385b491753)
+---
+ OptiScaler/inputs/FSR2_Dx11.cpp | 1069 ++++++++++++++++++++++++++++++-
+ OptiScaler/inputs/FSR2_Dx11.h   |   11 +
+ OptiScaler/inputs/FSR2_Dx12.cpp |   71 +-
+ 3 files changed, 1124 insertions(+), 27 deletions(-)
+
+diff --git a/OptiScaler/inputs/FSR2_Dx11.cpp b/OptiScaler/inputs/FSR2_Dx11.cpp
+index d0e4bec4..18210c49 100644
+--- a/OptiScaler/inputs/FSR2_Dx11.cpp
++++ b/OptiScaler/inputs/FSR2_Dx11.cpp
+@@ -529,28 +529,10 @@ static bool IsGameD3D11Device(ID3D11Device* device)
+     return device != nullptr && state.currentD3D11Device == device;
+ }
+ 
+-bool Fsr2Dx11AdoptContext(void* ctx, const void* desc)
++static bool AdoptOnDevice(FfxFsr2Context* context, const FfxFsr2ContextDescription* contextDescription,
++                          ID3D11Device* bDevice)
+ {
+-    auto context = (FfxFsr2Context*) ctx;
+-    auto contextDescription = (const FfxFsr2ContextDescription*) desc;
+-
+-    if (context == nullptr || contextDescription == nullptr || contextDescription->device == nullptr)
+-        return false;
+-
+-    if (!Config::Instance()->UseFsr2Inputs.value_or_default())
+-        return false;
+-
+     auto& state = State::Instance();
+-    auto bDevice = (ID3D11Device*) contextDescription->device;
+-
+-    // Only a D3D11 device the game created (seen by hkD3D11CreateDevice): an engine backend (UE RHI) passes its
+-    // own object as FfxDevice, its resources are not ID3D11Resource; those stay with the game's FSR 2
+-    if (!IsGameD3D11Device(bDevice))
+-    {
+-        LOG_INFO("FSR 2 context {:X}: device {:X} is not a D3D11 device of the game ({} known, current {:X})",
+-                 (size_t) context, (size_t) bDevice, state.d3d11Devices.size(), (size_t) state.currentD3D11Device);
+-        return false;
+-    }
+ 
+     if (!state.nvngxDx11Inited)
+     {
+@@ -591,10 +573,38 @@ bool Fsr2Dx11AdoptContext(void* ctx, const void* desc)
+     return true;
+ }
+ 
++bool Fsr2Dx11AdoptContext(void* ctx, const void* desc)
++{
++    auto context = (FfxFsr2Context*) ctx;
++    auto contextDescription = (const FfxFsr2ContextDescription*) desc;
++
++    if (context == nullptr || contextDescription == nullptr || contextDescription->device == nullptr)
++        return false;
++
++    if (!Config::Instance()->UseFsr2Inputs.value_or_default())
++        return false;
++
++    auto& state = State::Instance();
++    auto bDevice = (ID3D11Device*) contextDescription->device;
++
++    // Only a D3D11 device the game created (seen by hkD3D11CreateDevice): an engine backend (UE RHI) passes its
++    // own object as FfxDevice, its resources are not ID3D11Resource; those go to the 0033 path or stay with the game
++    if (!IsGameD3D11Device(bDevice))
++    {
++        LOG_INFO("FSR 2 context {:X}: device {:X} is not a D3D11 device of the game ({} known, current {:X})",
++                 (size_t) context, (size_t) bDevice, state.d3d11Devices.size(), (size_t) state.currentD3D11Device);
++        return false;
++    }
++
++    return AdoptOnDevice(context, contextDescription, bDevice);
++}
++
+ void Fsr2Dx11ForgetContext(void* ctx)
+ {
+     auto context = (FfxFsr2Context*) ctx;
+ 
++    Fsr2UeDx11Forget(ctx); // Vela 0033
++
+     if (context == nullptr || !_nvParams.contains(context))
+         return;
+ 
+@@ -653,3 +663,1022 @@ std::optional<int32_t> Fsr2Dx11Dispatch(void* ctx, const void* desc)
+ 
+     return (int32_t) EvaluateAdopted(context, dispatchDescription);
+ }
++
++// ---------------------------------------------------------------- Vela 0033: FSR 2 on an engine backend (UE RHI) in DX11
++// AMD's UE FSR 2 plugin (2.x, FSR2TemporalUpscaler.cpp, EFSR2TemporalUpscalerAPI::Unreal = the only backend on D3D11)
++// creates its context with FfxDevice = its FFSR2TemporalUpscaler object and callbacks = ffxFsr2GetInterfaceUE
++// (FSR2TemporalUpscalerRHIBackend.cpp). Its ffxFsr2ContextDispatch runs while the render graph is built:
++// FfxCommandList = FRDGBuilder*, every FfxResource.resource = FRDGTexture* (ffxGetResourceFromUEResource); the FSR 2
++// jobs become render-graph compute passes (FlushRenderJobs_UE -> IFSR2SubPass::Dispatch -> FComputeShaderUtils::Dispatch
++// with job->computeJobDescriptor.dimensions). No native resource exists at that point. The jobs reach D3D11 later as
++// ID3D11DeviceContext::Dispatch calls with exactly those group counts, in job order, with the inputs bound as SRVs and
++// the output as a UAV. 0033 records the job list of every FSR 2 dispatch (wrapped fpCreatePipeline / fpScheduleGpuJob /
++// fpExecuteGpuJobs: FFX API, no engine type), finds the passes in the D3D11 Dispatch stream by their group counts,
++// takes colour / depth / MV / exposure from the SRVs of the reconstruct pass and the reactive mask from the depth clip
++// pass (matched to the FFX resource descriptions), the output from the UAVs of the last pass, and runs the 0029 DX11
++// adoption (AdoptOnDevice / Fsr2Dx11Dispatch) right after that pass. VELA_UEFSR2=0: old behaviour (left to the game);
++// VELA_UEFSR2_SKIP=1: once adopted, the game's own FSR 2 passes from the reconstruct pass on are not dispatched.
++#include <algorithm>
++#include <atomic>
++#include <format>
++#include <deque>
++#include <mutex>
++#include <unordered_set>
++#include <vector>
++#include <wrl/client.h>
++
++namespace
++{
++constexpr uint32_t UE_PASS_UNKNOWN = 0xFFFFFFFFu;
++constexpr UINT UE_SRV_SLOTS = 32;
++constexpr UINT UE_UAV_SLOTS = 8;
++constexpr uint32_t UE_GIVE_UP_FRAMES = 240;
++
++struct UeJob
++{
++    uint32_t pass = UE_PASS_UNKNOWN;
++    UINT x = 0, y = 0, z = 0;
++};
++
++struct UeBackend // per FfxFsr2Interface scratch buffer of the engine backend; never erased
++{
++    FfxFsr2CreatePipelineFunc oCreatePipeline = nullptr;
++    FfxFsr2ScheduleGpuJobFunc oScheduleGpuJob = nullptr;
++    FfxFsr2ExecuteGpuJobsFunc oExecuteGpuJobs = nullptr;
++    std::unordered_map<void*, uint32_t> passByPipeline;
++    std::vector<UeJob> jobs;
++    FfxFsr2Context* context = nullptr;
++};
++
++struct UeContext
++{
++    FfxFsr2ContextDescription desc {};
++    FfxFsr2DispatchDescription lastDispatch {};
++    bool hasDispatch = false;
++    bool adopted = false;
++    bool givenUp = false;
++    bool loggedJobs = false;
++    uint32_t missStreak = 0;
++    uint32_t failLogs = 0;
++    uint64_t replaced = 0;
++    std::unordered_set<ID3D11Resource*> seenNow;  // bound as SRV in an FSR 2 pass of this frame
++    std::unordered_set<ID3D11Resource*> seenPrev; // ... of the frame before (ping-pong history textures)
++};
++
++struct UeFrame
++{
++    FfxFsr2Context* context = nullptr;
++    FfxFsr2DispatchDescription params {};
++    std::vector<UeJob> jobs; // from the reconstruct pass to the last pass
++    size_t cursor = 0;
++    uint32_t foreign = 0;
++    Microsoft::WRL::ComPtr<ID3D11Resource> color, depth, mv, exposure, reactive;
++    bool inputsOk = false;
++};
++
++struct UeTex
++{
++    ID3D11Resource* res = nullptr;
++    UINT w = 0, h = 0;
++    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
++};
++
++std::recursive_mutex _ueMutex;
++std::unordered_map<void*, UeBackend> _ueBackends;
++std::unordered_map<FfxFsr2Context*, UeContext> _ueContexts;
++std::deque<UeFrame> _ueFrames;
++std::atomic<bool> _uePending { false };
++FfxFsr2CreatePipelineFunc _ueLastCreatePipeline = nullptr;
++FfxFsr2ScheduleGpuJobFunc _ueLastScheduleGpuJob = nullptr;
++FfxFsr2ExecuteGpuJobsFunc _ueLastExecuteGpuJobs = nullptr;
++
++typedef void(STDMETHODCALLTYPE* PFN_UeDispatch)(ID3D11DeviceContext* This, UINT x, UINT y, UINT z);
++PFN_UeDispatch o_UeDispatch = nullptr;
++thread_local bool _ueInternal = false;
++
++bool UeEnv(const char* name, char value)
++{
++    auto e = std::getenv(name);
++    return e != nullptr && e[0] == value;
++}
++
++bool UeReadable(const void* p, size_t n)
++{
++    MEMORY_BASIC_INFORMATION mbi {};
++
++    if (p == nullptr || VirtualQuery(p, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT)
++        return false;
++
++    if ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
++        return false;
++
++    return (uintptr_t) p + n <= (uintptr_t) mbi.BaseAddress + mbi.RegionSize;
++}
++
++HMODULE UeModuleOf(const void* address)
++{
++    HMODULE module = nullptr;
++
++    if (address == nullptr ||
++        !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                            (LPCWSTR) address, &module))
++        return nullptr;
++
++    return module;
++}
++
++std::string UeModuleName(const void* address)
++{
++    auto module = UeModuleOf(address);
++
++    if (module == nullptr)
++        return "no module";
++
++    char path[MAX_PATH] {};
++    GetModuleFileNameA(module, path, MAX_PATH);
++    std::string s(path);
++    auto pos = s.find_last_of("\\/");
++    return pos == std::string::npos ? s : s.substr(pos + 1);
++}
++
++// The vtable of FfxDevice lies in the module of the backend callbacks: the device is an object of the backend itself
++// (UE: FFSR2TemporalUpscaler next to ffxFsr2GetInterfaceUE), not an API device (d3d11 / d3d12 / proxy DLLs)
++bool UeDeviceIsBackendObject(const void* device, const void* callback)
++{
++    if (!UeReadable(device, sizeof(void*)))
++        return false;
++
++    auto vtable = *(void* const*) device;
++
++    if (!UeReadable(vtable, sizeof(void*)))
++        return false;
++
++    auto vtModule = UeModuleOf(vtable);
++    return vtModule != nullptr && vtModule == UeModuleOf(callback);
++}
++
++int UeDxgiFamily(DXGI_FORMAT f)
++{
++    switch (f)
++    {
++    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
++    case DXGI_FORMAT_R32G32B32A32_FLOAT:
++    case DXGI_FORMAT_R32G32B32A32_UINT:
++    case DXGI_FORMAT_R32G32B32A32_SINT:
++        return 12;
++    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
++    case DXGI_FORMAT_R16G16B16A16_FLOAT:
++    case DXGI_FORMAT_R16G16B16A16_UNORM:
++    case DXGI_FORMAT_R16G16B16A16_UINT:
++    case DXGI_FORMAT_R16G16B16A16_SNORM:
++    case DXGI_FORMAT_R16G16B16A16_SINT:
++        return 1;
++    case DXGI_FORMAT_R32G32_TYPELESS:
++    case DXGI_FORMAT_R32G32_FLOAT:
++    case DXGI_FORMAT_R32G32_UINT:
++    case DXGI_FORMAT_R32G32_SINT:
++        return 6;
++    case DXGI_FORMAT_R32G8X24_TYPELESS:
++    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
++    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
++    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
++        return 9;
++    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
++    case DXGI_FORMAT_R10G10B10A2_UNORM:
++    case DXGI_FORMAT_R10G10B10A2_UINT:
++        return 3;
++    case DXGI_FORMAT_R11G11B10_FLOAT:
++        return 2;
++    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
++    case DXGI_FORMAT_R8G8B8A8_UNORM:
++    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++    case DXGI_FORMAT_R8G8B8A8_UINT:
++    case DXGI_FORMAT_R8G8B8A8_SNORM:
++    case DXGI_FORMAT_R8G8B8A8_SINT:
++    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
++    case DXGI_FORMAT_B8G8R8A8_UNORM:
++    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
++    case DXGI_FORMAT_B8G8R8X8_UNORM:
++    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
++        return 4;
++    case DXGI_FORMAT_R16G16_TYPELESS:
++    case DXGI_FORMAT_R16G16_FLOAT:
++    case DXGI_FORMAT_R16G16_UNORM:
++    case DXGI_FORMAT_R16G16_UINT:
++    case DXGI_FORMAT_R16G16_SNORM:
++    case DXGI_FORMAT_R16G16_SINT:
++        return 5;
++    case DXGI_FORMAT_R32_TYPELESS:
++    case DXGI_FORMAT_D32_FLOAT:
++    case DXGI_FORMAT_R32_FLOAT:
++    case DXGI_FORMAT_R32_UINT:
++    case DXGI_FORMAT_R32_SINT:
++        return 7;
++    case DXGI_FORMAT_R24G8_TYPELESS:
++    case DXGI_FORMAT_D24_UNORM_S8_UINT:
++    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
++    case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
++        return 8;
++    case DXGI_FORMAT_R8G8_TYPELESS:
++    case DXGI_FORMAT_R8G8_UNORM:
++    case DXGI_FORMAT_R8G8_UINT:
++    case DXGI_FORMAT_R8G8_SNORM:
++    case DXGI_FORMAT_R8G8_SINT:
++        return 13;
++    case DXGI_FORMAT_R16_TYPELESS:
++    case DXGI_FORMAT_R16_FLOAT:
++    case DXGI_FORMAT_D16_UNORM:
++    case DXGI_FORMAT_R16_UNORM:
++    case DXGI_FORMAT_R16_UINT:
++    case DXGI_FORMAT_R16_SNORM:
++    case DXGI_FORMAT_R16_SINT:
++        return 11;
++    case DXGI_FORMAT_R8_TYPELESS:
++    case DXGI_FORMAT_R8_UNORM:
++    case DXGI_FORMAT_R8_UINT:
++    case DXGI_FORMAT_R8_SNORM:
++    case DXGI_FORMAT_R8_SINT:
++    case DXGI_FORMAT_A8_UNORM:
++        return 10;
++    default:
++        return 0;
++    }
++}
++
++int UeFfxFamily(uint32_t f)
++{
++    switch (f)
++    {
++    case FFX_SURFACE_FORMAT_R32G32B32A32_TYPELESS:
++    case FFX_SURFACE_FORMAT_R32G32B32A32_FLOAT:
++        return 12;
++    case FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT:
++    case FFX_SURFACE_FORMAT_R16G16B16A16_UNORM:
++        return 1;
++    case FFX_SURFACE_FORMAT_R32G32_FLOAT:
++        return 6;
++    case FFX_SURFACE_FORMAT_R32_UINT:
++    case FFX_SURFACE_FORMAT_R32_FLOAT:
++        return 7;
++    case FFX_SURFACE_FORMAT_R8G8B8A8_TYPELESS:
++    case FFX_SURFACE_FORMAT_R8G8B8A8_UNORM:
++        return 4;
++    case FFX_SURFACE_FORMAT_R11G11B10_FLOAT:
++        return 2;
++    case FFX_SURFACE_FORMAT_R16G16_FLOAT:
++    case FFX_SURFACE_FORMAT_R16G16_UINT:
++        return 5;
++    case FFX_SURFACE_FORMAT_R16_FLOAT:
++    case FFX_SURFACE_FORMAT_R16_UINT:
++    case FFX_SURFACE_FORMAT_R16_UNORM:
++    case FFX_SURFACE_FORMAT_R16_SNORM:
++        return 11;
++    case FFX_SURFACE_FORMAT_R8_UNORM:
++    case FFX_SURFACE_FORMAT_R8_UINT:
++        return 10;
++    case FFX_SURFACE_FORMAT_R8G8_UNORM:
++        return 13;
++    default:
++        return 0; // unknown to FFX (e.g. R10G10B10A2): size and uniqueness decide
++    }
++}
++
++bool UeMatches(const FfxResource& r, const UeTex& t)
++{
++    if (t.w != r.description.width || t.h != r.description.height)
++        return false;
++
++    auto d = UeDxgiFamily(t.fmt);
++
++    if (r.isDepth)
++        return d == 7 || d == 8 || d == 9 || d == 11;
++
++    auto e = UeFfxFamily(r.description.format);
++    return e == 0 || e == d;
++}
++
++bool UeTexOf(ID3D11Resource* res, UeTex& out)
++{
++    if (res == nullptr)
++        return false;
++
++    D3D11_RESOURCE_DIMENSION dim {};
++    res->GetType(&dim);
++
++    if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
++        return false;
++
++    D3D11_TEXTURE2D_DESC desc {};
++    ((ID3D11Texture2D*) res)->GetDesc(&desc);
++    out.res = res;
++    out.w = desc.Width;
++    out.h = desc.Height;
++    out.fmt = desc.Format;
++    return true;
++}
++
++// The distinct textures bound to the CS stage (SRVs or UAVs); references held in keep
++std::vector<UeTex> UeBoundSrvs(ID3D11DeviceContext* ctx, std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>>& keep)
++{
++    std::vector<UeTex> out;
++    ID3D11ShaderResourceView* srvs[UE_SRV_SLOTS] {};
++    ctx->CSGetShaderResources(0, UE_SRV_SLOTS, srvs);
++
++    for (UINT i = 0; i < UE_SRV_SLOTS; i++)
++    {
++        if (srvs[i] == nullptr)
++            continue;
++
++        Microsoft::WRL::ComPtr<ID3D11Resource> res;
++        srvs[i]->GetResource(res.GetAddressOf());
++        srvs[i]->Release();
++        UeTex t {};
++
++        if (!UeTexOf(res.Get(), t))
++            continue;
++
++        bool dup = false;
++
++        for (auto& o : out)
++            dup = dup || o.res == t.res;
++
++        if (!dup)
++        {
++            out.push_back(t);
++            keep.push_back(res);
++        }
++    }
++
++    return out;
++}
++
++std::vector<UeTex> UeBoundUavs(ID3D11DeviceContext* ctx, std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>>& keep)
++{
++    std::vector<UeTex> out;
++    ID3D11UnorderedAccessView* uavs[UE_UAV_SLOTS] {};
++    ctx->CSGetUnorderedAccessViews(0, UE_UAV_SLOTS, uavs);
++
++    for (UINT i = 0; i < UE_UAV_SLOTS; i++)
++    {
++        if (uavs[i] == nullptr)
++            continue;
++
++        Microsoft::WRL::ComPtr<ID3D11Resource> res;
++        uavs[i]->GetResource(res.GetAddressOf());
++        uavs[i]->Release();
++        UeTex t {};
++
++        if (UeTexOf(res.Get(), t))
++        {
++            out.push_back(t);
++            keep.push_back(res);
++        }
++    }
++
++    return out;
++}
++
++std::string UeDescribe(const std::vector<UeTex>& list)
++{
++    std::string s;
++
++    for (auto& t : list)
++        s += std::format(" {:X} {}x{} fmt {};", (size_t) t.res, t.w, t.h, (UINT) t.fmt);
++
++    return s.empty() ? " none" : s;
++}
++
++// Unique match of an FFX input among the bound textures, skipping those already taken
++ID3D11Resource* UePick(const FfxResource& r, const std::vector<UeTex>& list, std::vector<ID3D11Resource*>& taken)
++{
++    if (r.resource == nullptr)
++        return nullptr;
++
++    ID3D11Resource* found = nullptr;
++    int count = 0;
++
++    for (auto& t : list)
++    {
++        if (std::find(taken.begin(), taken.end(), t.res) != taken.end() || !UeMatches(r, t))
++            continue;
++
++        found = t.res;
++        count++;
++    }
++
++    if (count != 1)
++        return nullptr;
++
++    taken.push_back(found);
++    return found;
++}
++
++bool UeLogFail(UeContext& uc)
++{
++    uc.failLogs++;
++    return uc.failLogs <= 3 || (uc.failLogs % 600) == 0;
++}
++
++// Under _ueMutex. Returns the context to forget (give up) or nullptr
++FfxFsr2Context* UePushFrame(UeBackend& b)
++{
++    auto it = _ueContexts.find(b.context);
++
++    if (b.context == nullptr || it == _ueContexts.end() || it->second.givenUp || !it->second.hasDispatch)
++        return nullptr;
++
++    auto& uc = it->second;
++    size_t recon = b.jobs.size();
++
++    for (size_t i = 0; i < b.jobs.size(); i++)
++    {
++        if (b.jobs[i].pass == FFX_FSR2_PASS_RECONSTRUCT_PREVIOUS_DEPTH)
++        {
++            recon = i;
++            break;
++        }
++    }
++
++    if (!uc.loggedJobs)
++    {
++        uc.loggedJobs = true;
++        std::string s;
++
++        for (auto& j : b.jobs)
++            s += std::format(" {}:{}x{}x{}", j.pass == UE_PASS_UNKNOWN ? -1 : (int) j.pass, j.x, j.y, j.z);
++
++        LOG_INFO("UE FSR 2 context {:X}: {} FSR 2 compute jobs per dispatch (pass:groups){}", (size_t) b.context,
++                 b.jobs.size(), s);
++    }
++
++    if (recon >= b.jobs.size() || recon + 1 >= b.jobs.size())
++    {
++        LOG_WARN("UE FSR 2 context {:X}: no reconstruct pass among its FSR 2 jobs, left to the game's FSR 2",
++                 (size_t) b.context);
++        uc.givenUp = true;
++        return b.context;
++    }
++
++    // Frames of this context that never met their passes in the D3D11 stream
++    size_t pending = 0;
++
++    for (auto& f : _ueFrames)
++        pending += f.context == b.context ? 1 : 0;
++
++    while (pending >= 2)
++    {
++        for (auto f = _ueFrames.begin(); f != _ueFrames.end(); ++f)
++        {
++            if (f->context == b.context)
++            {
++                _ueFrames.erase(f);
++                break;
++            }
++        }
++
++        pending--;
++        uc.missStreak++;
++    }
++
++    if (uc.missStreak >= UE_GIVE_UP_FRAMES)
++    {
++        LOG_WARN("UE FSR 2 context {:X}: its FSR 2 passes were not replaced for {} frames (not found among the D3D11 "
++                 "dispatches, or inputs / output not matched), left to the game's FSR 2",
++                 (size_t) b.context, uc.missStreak);
++        uc.givenUp = true;
++        return b.context;
++    }
++
++    UeFrame frame {};
++    frame.context = b.context;
++    frame.params = uc.lastDispatch;
++    frame.jobs.assign(b.jobs.begin() + recon, b.jobs.end());
++    _ueFrames.push_back(std::move(frame));
++
++    while (_ueFrames.size() > 8)
++        _ueFrames.pop_front();
++
++    _uePending.store(true, std::memory_order_release);
++    return nullptr;
++}
++
++UeBackend* UeFind(FfxFsr2Interface* bi)
++{
++    if (bi == nullptr)
++        return nullptr;
++
++    auto it = _ueBackends.find(bi->scratchBuffer);
++    return it == _ueBackends.end() ? nullptr : &it->second;
++}
++
++FfxErrorCode UeCreatePipeline(FfxFsr2Interface* bi, FfxFsr2Pass pass, const FfxPipelineDescription* pd,
++                              FfxPipelineState* out)
++{
++    FfxFsr2CreatePipelineFunc orig = _ueLastCreatePipeline;
++
++    {
++        std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++
++        if (auto b = UeFind(bi); b != nullptr && b->oCreatePipeline != nullptr)
++            orig = b->oCreatePipeline;
++    }
++
++    if (orig == nullptr)
++        return FFX_ERROR_INVALID_POINTER;
++
++    auto result = orig(bi, pass, pd, out);
++
++    if (result == FFX_OK && out != nullptr && out->pipeline != nullptr)
++    {
++        std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++
++        if (auto b = UeFind(bi); b != nullptr)
++            b->passByPipeline[out->pipeline] = (uint32_t) pass;
++    }
++
++    return result;
++}
++
++FfxErrorCode UeScheduleGpuJob(FfxFsr2Interface* bi, const FfxGpuJobDescription* job)
++{
++    FfxFsr2ScheduleGpuJobFunc orig = _ueLastScheduleGpuJob;
++
++    {
++        std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++
++        if (auto b = UeFind(bi); b != nullptr)
++        {
++            if (b->oScheduleGpuJob != nullptr)
++                orig = b->oScheduleGpuJob;
++
++            if (job != nullptr && job->jobType == FFX_GPU_JOB_COMPUTE && b->jobs.size() < 64)
++            {
++                UeJob j {};
++                auto p = b->passByPipeline.find(job->computeJobDescriptor.pipeline.pipeline);
++                j.pass = p == b->passByPipeline.end() ? UE_PASS_UNKNOWN : p->second;
++                j.x = job->computeJobDescriptor.dimensions[0];
++                j.y = job->computeJobDescriptor.dimensions[1];
++                j.z = job->computeJobDescriptor.dimensions[2];
++                b->jobs.push_back(j);
++            }
++        }
++    }
++
++    if (orig == nullptr)
++        return FFX_ERROR_INVALID_POINTER;
++
++    return orig(bi, job);
++}
++
++FfxErrorCode UeExecuteGpuJobs(FfxFsr2Interface* bi, FfxCommandList commandList)
++{
++    FfxFsr2ExecuteGpuJobsFunc orig = _ueLastExecuteGpuJobs;
++    FfxFsr2Context* forget = nullptr;
++
++    {
++        std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++
++        if (auto b = UeFind(bi); b != nullptr)
++        {
++            if (b->oExecuteGpuJobs != nullptr)
++                orig = b->oExecuteGpuJobs;
++
++            forget = UePushFrame(*b);
++            b->jobs.clear();
++        }
++    }
++
++    if (forget != nullptr)
++        Fsr2Dx11ForgetContext(forget);
++
++    if (orig == nullptr)
++        return FFX_ERROR_INVALID_POINTER;
++
++    return orig(bi, commandList);
++}
++
++struct UeEval
++{
++    FfxFsr2Context* context = nullptr;
++    FfxFsr2DispatchDescription nd {};
++    FfxFsr2ContextDescription desc {};
++    bool adopt = false;
++    std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>> keep;
++};
++
++void UeEvaluate(ID3D11DeviceContext* This, UeEval& ev);
++
++void STDMETHODCALLTYPE hkUeDispatch(ID3D11DeviceContext* This, UINT x, UINT y, UINT z)
++{
++    if (_ueInternal || !_uePending.load(std::memory_order_acquire))
++    {
++        o_UeDispatch(This, x, y, z);
++        return;
++    }
++
++    bool skip = false;
++    bool evaluate = false;
++    UeEval ev {};
++
++    {
++        std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++
++        if (_ueFrames.empty())
++        {
++            _uePending.store(false, std::memory_order_release);
++        }
++        else
++        {
++            auto& f = _ueFrames.front();
++            size_t idx = SIZE_MAX;
++
++            if (f.cursor < f.jobs.size() && f.jobs[f.cursor].x == x && f.jobs[f.cursor].y == y &&
++                f.jobs[f.cursor].z == z)
++            {
++                idx = f.cursor++;
++                f.foreign = 0;
++            }
++            else if (f.jobs[0].x == x && f.jobs[0].y == y && f.jobs[0].z == z)
++            {
++                idx = 0;
++                f.cursor = 1;
++                f.foreign = 0;
++            }
++            else if (f.cursor > 0 && ++f.foreign > 8)
++            {
++                f.cursor = 0;
++                f.foreign = 0;
++            }
++
++            auto it = _ueContexts.find(f.context);
++
++            if (idx != SIZE_MAX && it != _ueContexts.end() && !it->second.givenUp)
++            {
++                auto& uc = it->second;
++                auto pass = f.jobs[idx].pass;
++                const bool last = idx + 1 == f.jobs.size();
++                std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>> keep;
++                auto srvs = UeBoundSrvs(This, keep);
++
++                for (auto& t : srvs)
++                    uc.seenNow.insert(t.res);
++
++                if (idx == 0) // reconstruct pass: colour, depth, MV, exposure
++                {
++                    std::vector<ID3D11Resource*> taken;
++                    auto depth = UePick(f.params.depth, srvs, taken);
++                    auto exposure = UePick(f.params.exposure, srvs, taken);
++                    auto mv = UePick(f.params.motionVectors, srvs, taken);
++                    auto color = UePick(f.params.color, srvs, taken);
++                    f.depth = depth;
++                    f.exposure = exposure;
++                    f.mv = mv;
++                    f.color = color;
++                    f.reactive.Reset();
++                    f.inputsOk = color != nullptr && depth != nullptr && mv != nullptr;
++
++                    if (!f.inputsOk && UeLogFail(uc))
++                        LOG_WARN("UE FSR 2 context {:X}: reconstruct pass inputs not matched (colour {:X} {}x{} fmt {}, "
++                                 "depth {:X}, MV {:X} {}x{} fmt {}, exposure {:X}); bound:{}",
++                                 (size_t) f.context, (size_t) color, f.params.color.description.width,
++                                 f.params.color.description.height, (UINT) f.params.color.description.format,
++                                 (size_t) depth, (size_t) mv, f.params.motionVectors.description.width,
++                                 f.params.motionVectors.description.height,
++                                 (UINT) f.params.motionVectors.description.format, (size_t) exposure,
++                                 UeDescribe(srvs));
++                }
++                else if (pass == FFX_FSR2_PASS_DEPTH_CLIP && f.params.reactive.resource != nullptr)
++                {
++                    std::vector<ID3D11Resource*> taken { f.color.Get(), f.depth.Get(), f.mv.Get(), f.exposure.Get() };
++                    f.reactive = UePick(f.params.reactive, srvs, taken);
++                }
++
++                if (last)
++                {
++                    ID3D11Resource* output = nullptr;
++                    int candidates = 0;
++                    auto uavs = UeBoundUavs(This, keep);
++
++                    for (auto& t : uavs)
++                    {
++                        if (uc.seenNow.contains(t.res) || uc.seenPrev.contains(t.res) || !UeMatches(f.params.output, t))
++                            continue;
++
++                        output = t.res;
++                        candidates++;
++                    }
++
++                    if (f.inputsOk && candidates == 1)
++                    {
++                        evaluate = true;
++                        ev.context = f.context;
++                        ev.adopt = !uc.adopted;
++                        ev.desc = uc.desc;
++                        ev.nd = f.params;
++                        ev.nd.commandList = (FfxCommandList) This;
++                        ev.nd.color.resource = f.color.Get();
++                        ev.nd.depth.resource = f.depth.Get();
++                        ev.nd.motionVectors.resource = f.mv.Get();
++                        ev.nd.exposure.resource = f.exposure.Get();
++                        ev.nd.reactive.resource = f.reactive.Get();
++                        ev.nd.transparencyAndComposition.resource = nullptr;
++                        ev.nd.output.resource = output;
++                        ev.keep = keep;
++                        ev.keep.push_back(f.color);
++                        ev.keep.push_back(f.depth);
++                        ev.keep.push_back(f.mv);
++                        ev.keep.push_back(f.exposure);
++                        ev.keep.push_back(f.reactive);
++                        uc.adopted = true;
++                    }
++                    else
++                    {
++                        uc.missStreak++;
++
++                        if (f.inputsOk && UeLogFail(uc))
++                            LOG_WARN("UE FSR 2 context {:X}: output not matched in the last pass ({} candidates for "
++                                     "{}x{} fmt {}); UAVs:{}",
++                                     (size_t) f.context, candidates, f.params.output.description.width,
++                                     f.params.output.description.height, (UINT) f.params.output.description.format,
++                                     UeDescribe(uavs));
++                    }
++
++                    uc.seenPrev = std::move(uc.seenNow);
++                    uc.seenNow.clear();
++                    _ueFrames.pop_front();
++                    _uePending.store(!_ueFrames.empty(), std::memory_order_release);
++                }
++
++                skip = uc.adopted && !ev.adopt && UeEnv("VELA_UEFSR2_SKIP", '1');
++            }
++        }
++    }
++
++    if (!skip)
++        o_UeDispatch(This, x, y, z);
++
++    if (evaluate)
++        UeEvaluate(This, ev);
++}
++
++bool UeHookDispatch()
++{
++    if (o_UeDispatch != nullptr)
++        return true;
++
++    auto& state = State::Instance();
++    ID3D11Device* device = state.currentD3D11Device;
++
++    if (device == nullptr && !state.d3d11Devices.empty())
++        device = state.d3d11Devices.back();
++
++    if (device == nullptr)
++        return false;
++
++    ID3D11DeviceContext* context = nullptr;
++    device->GetImmediateContext(&context);
++
++    if (context == nullptr)
++        return false;
++
++    auto vtable = *(PVOID**) context;
++    o_UeDispatch = (PFN_UeDispatch) vtable[41];
++    context->Release();
++
++    DetourTransactionBegin();
++    DetourUpdateThread(GetCurrentThread());
++    DetourAttach(&(PVOID&) o_UeDispatch, hkUeDispatch);
++    auto result = DetourTransactionCommit();
++
++    if (result != NO_ERROR)
++    {
++        LOG_ERROR("UE FSR 2: ID3D11DeviceContext::Dispatch hook failed {:X}", (UINT) result);
++        o_UeDispatch = nullptr;
++        return false;
++    }
++
++    LOG_INFO("UE FSR 2: ID3D11DeviceContext::Dispatch hooked (device {:X}, {})", (size_t) device,
++             UeModuleName(vtable[41]));
++    return true;
++}
++} // namespace
++
++namespace
++{
++void UeEvaluate(ID3D11DeviceContext* This, UeEval& ev)
++{
++    if (ev.adopt)
++    {
++        Microsoft::WRL::ComPtr<ID3D11Device> device;
++        This->GetDevice(device.GetAddressOf());
++
++        LOG_INFO("UE FSR 2 context {:X}: passes found in the D3D11 dispatches: colour {:X}, depth {:X}, MV {:X}, "
++                 "exposure {:X}, reactive {:X}, output {:X} ({}x{}), device {:X}",
++                 (size_t) ev.context, (size_t) ev.nd.color.resource, (size_t) ev.nd.depth.resource,
++                 (size_t) ev.nd.motionVectors.resource, (size_t) ev.nd.exposure.resource,
++                 (size_t) ev.nd.reactive.resource, (size_t) ev.nd.output.resource,
++                 ev.nd.output.description.width, ev.nd.output.description.height, (size_t) device.Get());
++
++        if (device == nullptr || !AdoptOnDevice(ev.context, &ev.desc, device.Get()))
++        {
++            LOG_WARN("UE FSR 2 context {:X}: DX11 adoption failed, left to the game's FSR 2", (size_t) ev.context);
++
++            {
++                std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++
++                if (auto it = _ueContexts.find(ev.context); it != _ueContexts.end())
++                    it->second.givenUp = true;
++            }
++
++            Fsr2Dx11ForgetContext(ev.context);
++            return;
++        }
++    }
++
++    // Our evaluate binds its own compute shader (depth transfer); the engine's state cache expects its own back
++    Microsoft::WRL::ComPtr<ID3D11ComputeShader> cs;
++    ID3D11ClassInstance* instances[256] {};
++    UINT numInstances = 256;
++    This->CSGetShader(cs.GetAddressOf(), instances, &numInstances);
++
++    _ueInternal = true;
++    auto result = Fsr2Dx11Dispatch(ev.context, &ev.nd);
++    _ueInternal = false;
++
++    This->CSSetShader(cs.Get(), numInstances > 0 ? instances : nullptr, numInstances);
++
++    for (UINT i = 0; i < numInstances && i < 256; i++)
++    {
++        if (instances[i] != nullptr)
++            instances[i]->Release();
++    }
++
++    std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++    auto it = _ueContexts.find(ev.context);
++
++    if (it == _ueContexts.end())
++        return; // Fsr2Dx11Dispatch gave the context back to the game (it logged why)
++
++    auto& uc = it->second;
++
++    if (!result.has_value() || result.value() != FFX_OK)
++    {
++        uc.missStreak++;
++
++        if (UeLogFail(uc))
++            LOG_WARN("UE FSR 2 context {:X}: DX11 evaluate failed {:X}", (size_t) ev.context,
++                     (UINT) result.value_or(-1));
++
++        return;
++    }
++
++    uc.missStreak = 0;
++    uc.replaced++;
++
++    if (uc.replaced == 1 || (uc.replaced % 600) == 0)
++        LOG_INFO("UE FSR 2 context {:X}: {} frames upscaled by OptiScaler instead of the game's FSR 2 ({}x{} -> {}x{})",
++                 (size_t) ev.context, uc.replaced, ev.nd.renderSize.width, ev.nd.renderSize.height,
++                 ev.nd.output.description.width, ev.nd.output.description.height);
++}
++} // namespace
++
++bool Fsr2UeDx11PrepareCreate(void* desc)
++{
++    auto contextDescription = (FfxFsr2ContextDescription*) desc;
++
++    if (contextDescription == nullptr || contextDescription->device == nullptr || UeEnv("VELA_UEFSR2", '0'))
++        return false;
++
++    if (!Config::Instance()->UseFsr2Inputs.value_or_default())
++        return false;
++
++    auto& state = State::Instance();
++    auto device = contextDescription->device;
++
++    if (IsGameD3D11Device((ID3D11Device*) device) || device == (void*) state.currentD3D12Device)
++        return false;
++
++    for (size_t i = 0; i < state.d3d12Devices.size(); i++)
++    {
++        if ((void*) state.d3d12Devices[i] == device)
++            return false;
++    }
++
++    auto& cb = contextDescription->callbacks;
++
++    if (cb.scratchBuffer == nullptr || cb.fpCreatePipeline == nullptr || cb.fpScheduleGpuJob == nullptr ||
++        cb.fpExecuteGpuJobs == nullptr || cb.fpExecuteGpuJobs == UeExecuteGpuJobs)
++        return false;
++
++    const bool backendObject = UeDeviceIsBackendObject(device, (const void*) cb.fpExecuteGpuJobs);
++
++    {
++        std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++        auto& b = _ueBackends[cb.scratchBuffer];
++        b.oCreatePipeline = cb.fpCreatePipeline;
++        b.oScheduleGpuJob = cb.fpScheduleGpuJob;
++        b.oExecuteGpuJobs = cb.fpExecuteGpuJobs;
++        b.passByPipeline.clear();
++        b.jobs.clear();
++        b.context = nullptr;
++        _ueLastCreatePipeline = cb.fpCreatePipeline;
++        _ueLastScheduleGpuJob = cb.fpScheduleGpuJob;
++        _ueLastExecuteGpuJobs = cb.fpExecuteGpuJobs;
++    }
++
++    LOG_INFO("FSR 2 context description: FfxDevice {:X} is no D3D11 / D3D12 device of the game ({} D3D11 known, "
++             "current {:X}), backend callbacks in {} ({}): an engine FFX backend (UE FSR 2 plugin RHI backend), its "
++             "FSR 2 jobs are followed to the D3D11 dispatches (Vela 0033)",
++             (size_t) device, state.d3d11Devices.size(), (size_t) state.currentD3D11Device,
++             UeModuleName((const void*) cb.fpExecuteGpuJobs),
++             backendObject ? "FfxDevice is an object of that module" : "FfxDevice from another module");
++
++    cb.fpCreatePipeline = UeCreatePipeline;
++    cb.fpScheduleGpuJob = UeScheduleGpuJob;
++    cb.fpExecuteGpuJobs = UeExecuteGpuJobs;
++    return true;
++}
++
++bool Fsr2UeDx11Register(void* ctx, const void* desc)
++{
++    auto context = (FfxFsr2Context*) ctx;
++    auto contextDescription = (const FfxFsr2ContextDescription*) desc;
++
++    if (context == nullptr || contextDescription == nullptr)
++        return false;
++
++    std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++
++    if (!UeHookDispatch())
++    {
++        LOG_WARN("FSR 2 context {:X}: no D3D11 immediate context to follow its passes, left to the game",
++                 (size_t) context);
++        return false;
++    }
++
++    if (auto b = _ueBackends.find(contextDescription->callbacks.scratchBuffer); b != _ueBackends.end())
++        b->second.context = context;
++
++    UeContext uc {};
++    uc.desc.flags = contextDescription->flags;
++    uc.desc.maxRenderSize = contextDescription->maxRenderSize;
++    uc.desc.displaySize = contextDescription->displaySize;
++    _ueContexts[context] = std::move(uc);
++
++    LOG_INFO("FSR 2 context {:X}: UE RHI backend (FfxDevice = engine object, command list = render graph, resources "
++             "= render-graph textures), adopted at the D3D11 dispatches of its passes (max render {}x{}, display "
++             "{}x{}, flags {:X})",
++             (size_t) context, contextDescription->maxRenderSize.width, contextDescription->maxRenderSize.height,
++             contextDescription->displaySize.width, contextDescription->displaySize.height,
++             (UINT) contextDescription->flags);
++    return true;
++}
++
++bool Fsr2UeDx11NoteDispatch(void* ctx, const void* desc)
++{
++    if (ctx == nullptr || desc == nullptr)
++        return false;
++
++    std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++    auto it = _ueContexts.find((FfxFsr2Context*) ctx);
++
++    if (it == _ueContexts.end())
++        return false;
++
++    memcpy(&it->second.lastDispatch, desc, sizeof(FfxFsr2DispatchDescription));
++    it->second.hasDispatch = true;
++    return true;
++}
++
++void Fsr2UeDx11Forget(void* ctx)
++{
++    std::lock_guard<std::recursive_mutex> lock(_ueMutex);
++    auto context = (FfxFsr2Context*) ctx;
++
++    if (_ueContexts.erase(context) == 0)
++        return;
++
++    for (auto it = _ueFrames.begin(); it != _ueFrames.end();)
++        it = it->context == context ? _ueFrames.erase(it) : it + 1;
++
++    for (auto& b : _ueBackends)
++    {
++        if (b.second.context == context)
++            b.second.context = nullptr;
++    }
++
++    _uePending.store(!_ueFrames.empty(), std::memory_order_release);
++    LOG_INFO("UE FSR 2 context {:X}: no longer followed", (size_t) context);
++}
++
++bool Fsr2IsEngineBackendDevice(const void* desc)
++{
++    auto contextDescription = (const FfxFsr2ContextDescription*) desc;
++
++    if (contextDescription == nullptr || contextDescription->callbacks.fpExecuteGpuJobs == nullptr)
++        return false;
++
++    return UeDeviceIsBackendObject(contextDescription->device,
++                                   (const void*) contextDescription->callbacks.fpExecuteGpuJobs);
++}
+diff --git a/OptiScaler/inputs/FSR2_Dx11.h b/OptiScaler/inputs/FSR2_Dx11.h
+index 362b91ef..51c79ed2 100644
+--- a/OptiScaler/inputs/FSR2_Dx11.h
++++ b/OptiScaler/inputs/FSR2_Dx11.h
+@@ -12,3 +12,14 @@ void FSR2Dx11DeviceDestroyed(IUnknown* device);
+ bool Fsr2Dx11AdoptContext(void* context, const void* contextDescription);
+ std::optional<int32_t> Fsr2Dx11Dispatch(void* context, const void* dispatchDescription);
+ void Fsr2Dx11ForgetContext(void* context);
++
++// Vela 0033: FSR 2 on an engine FFX backend in a DX11 game (AMD UE FSR 2 plugin, RHI backend: FfxDevice = the plugin's
++// upscaler object, command list = FRDGBuilder, resources = FRDGTexture). PrepareCreate wraps the job callbacks of a
++// copy of the context description before the game's ffxFsr2ContextCreate; Register follows the context to its D3D11
++// dispatches; NoteDispatch keeps the dispatch parameters (true = such a context: the game's FSR 2 must record its jobs).
++bool Fsr2UeDx11PrepareCreate(void* contextDescription);
++bool Fsr2UeDx11Register(void* context, const void* contextDescription);
++bool Fsr2UeDx11NoteDispatch(void* context, const void* dispatchDescription);
++void Fsr2UeDx11Forget(void* context);
++// The FfxDevice is an object of the module of its backend callbacks (an engine backend, not an API device)
++bool Fsr2IsEngineBackendDevice(const void* contextDescription);
+diff --git a/OptiScaler/inputs/FSR2_Dx12.cpp b/OptiScaler/inputs/FSR2_Dx12.cpp
+index 1cf2368a..e9a87478 100644
+--- a/OptiScaler/inputs/FSR2_Dx12.cpp
++++ b/OptiScaler/inputs/FSR2_Dx12.cpp
+@@ -379,10 +379,15 @@ static Fsr212::FfxErrorCode ffxFsr2ContextCreate_Dx12(Fsr212::FfxFsr2Context* co
+     _skipCreate = true;
+ 
+     Fsr212::FfxErrorCode ccResult = Fsr212::FFX_OK;
++
++    // Vela 0033: a DX11 game's FSR 2 on an engine backend (UE FSR 2 plugin RHI backend) gets its job callbacks
++    // wrapped on a copy of the description, so that its passes can be found among the D3D11 dispatches
++    Fsr212::FfxFsr2ContextDescription ueDescription = *contextDescription;
++    const bool ueCandidate = state.swapchainApi == API::DX11 && Fsr2UeDx11PrepareCreate(&ueDescription);
+     {
+         ScopedSkipHeapCapture skipHeapCapture {};
+ 
+-        ccResult = o_ffxFsr2ContextCreate_Dx12(context, contextDescription);
++        ccResult = o_ffxFsr2ContextCreate_Dx12(context, ueCandidate ? &ueDescription : contextDescription);
+         _skipCreate = false;
+ 
+         if (ccResult != Fsr212::FFX_OK)
+@@ -407,14 +412,34 @@ static Fsr212::FfxErrorCode ffxFsr2ContextCreate_Dx12(Fsr212::FfxFsr2Context* co
+     // and its dispatch would then treat the D3D11 command list as ID3D12GraphicsCommandList
+     if (_d3d12Device == nullptr && state.swapchainApi == API::DX11)
+     {
++        // Vela 0033: an engine backend (UE FSR 2 plugin RHI backend) -> followed to the D3D11 dispatches of its passes
++        if (ueCandidate && Fsr2UeDx11Register(context, &ueDescription))
++            return ccResult;
++
+         // Vela 0029: a D3D11 device of the game -> OptiScaler's DX11 FSR 2 input (FeatureProvider_Dx11)
+-        if (Fsr2Dx11AdoptContext(context, contextDescription))
++        if (!ueCandidate && Fsr2Dx11AdoptContext(context, contextDescription))
+             return ccResult;
+ 
+         LOG_INFO("FSR 2 context {:X} in a DX11 game, device is not D3D12: left to the game", (size_t) context);
+         return ccResult;
+     }
+ 
++    // Vela 0033: an FfxDevice that is an object of the game's own FSR 2 backend (UE FSR 2 plugin RHI backend in a DX12
++    // game, r.FidelityFX.FSR2.UseNativeDX12=0: FFSR2TemporalUpscaler, command list = FRDGBuilder) is no D3D12 device;
++    // the fallbacks below would hand the context the latest D3D12 device and its dispatch would crash
++    if (_d3d12Device == nullptr && Fsr2IsEngineBackendDevice(contextDescription))
++    {
++        LOG_INFO("FSR 2 context {:X}: FfxDevice {:X} is an object of the game's FSR 2 backend, not a D3D12 device: "
++                 "left to the game",
++                 (size_t) context, (size_t) contextDescription->device);
++        return ccResult;
++    }
++
++    // if still no device use latest created one
++    // Might fixed TLOU but FMF2 still crashes
++    if (_d3d12Device == nullptr && state.d3d12Devices.size() > 0)
++        _d3d12Device = state.d3d12Devices[state.d3d12Devices.size() - 1];
++
+     if (_d3d12Device == nullptr)
+         _d3d12Device = state.currentD3D12Device;
+ 
+@@ -475,10 +500,15 @@ static Fsr212::FfxErrorCode ffxFsr2ContextCreate_Pattern_Dx12(Fsr212::FfxFsr2Con
+     auto& state = State::Instance();
+ 
+     Fsr212::FfxErrorCode ccResult = Fsr212::FFX_OK;
++
++    // Vela 0033 (see ffxFsr2ContextCreate_Dx12); not when the export hook is already creating this context
++    Fsr212::FfxFsr2ContextDescription ueDescription = *contextDescription;
++    const bool ueCandidate =
++        !_skipCreate && state.swapchainApi == API::DX11 && Fsr2UeDx11PrepareCreate(&ueDescription);
+     {
+         ScopedSkipHeapCapture skipHeapCapture {};
+ 
+-        ccResult = o_ffxFsr2ContextCreate_Pattern_Dx12(context, contextDescription);
++        ccResult = o_ffxFsr2ContextCreate_Pattern_Dx12(context, ueCandidate ? &ueDescription : contextDescription);
+ 
+         if (_skipCreate)
+             return ccResult;
+@@ -505,14 +535,34 @@ static Fsr212::FfxErrorCode ffxFsr2ContextCreate_Pattern_Dx12(Fsr212::FfxFsr2Con
+     // and its dispatch would then treat the D3D11 command list as ID3D12GraphicsCommandList
+     if (_d3d12Device == nullptr && state.swapchainApi == API::DX11)
+     {
++        // Vela 0033: an engine backend (UE FSR 2 plugin RHI backend) -> followed to the D3D11 dispatches of its passes
++        if (ueCandidate && Fsr2UeDx11Register(context, &ueDescription))
++            return ccResult;
++
+         // Vela 0029: a D3D11 device of the game -> OptiScaler's DX11 FSR 2 input (FeatureProvider_Dx11)
+-        if (Fsr2Dx11AdoptContext(context, contextDescription))
++        if (!ueCandidate && Fsr2Dx11AdoptContext(context, contextDescription))
+             return ccResult;
+ 
+         LOG_INFO("FSR 2 context {:X} in a DX11 game, device is not D3D12: left to the game", (size_t) context);
+         return ccResult;
+     }
+ 
++    // Vela 0033: an FfxDevice that is an object of the game's own FSR 2 backend (UE FSR 2 plugin RHI backend in a DX12
++    // game, r.FidelityFX.FSR2.UseNativeDX12=0: FFSR2TemporalUpscaler, command list = FRDGBuilder) is no D3D12 device;
++    // the fallbacks below would hand the context the latest D3D12 device and its dispatch would crash
++    if (_d3d12Device == nullptr && Fsr2IsEngineBackendDevice(contextDescription))
++    {
++        LOG_INFO("FSR 2 context {:X}: FfxDevice {:X} is an object of the game's FSR 2 backend, not a D3D12 device: "
++                 "left to the game",
++                 (size_t) context, (size_t) contextDescription->device);
++        return ccResult;
++    }
++
++    // if still no device use latest created one
++    // Might fixed TLOU but FMF2 still crashes
++    if (_d3d12Device == nullptr && state.d3d12Devices.size() > 0)
++        _d3d12Device = state.d3d12Devices[state.d3d12Devices.size() - 1];
++
+     if (_d3d12Device == nullptr)
+         _d3d12Device = state.currentD3D12Device;
+ 
+@@ -579,9 +629,15 @@ static Fsr212::FfxErrorCode ffxFsr2ContextDispatch_Dx12(Fsr212::FfxFsr2Context*
+         return ffxFsr20ContextDispatch_Dx12(context, (FfxFsr20DispatchDescription*) dispatchDescription);
+     }
+ 
++    // Vela 0033: a UE RHI backend context: its parameters are kept for its D3D11 passes, the game's FSR 2 records them
++    const bool ueContext = Fsr2UeDx11NoteDispatch(context, dispatchDescription);
++
+     // Vela 0029: a context adopted by the DX11 FSR 2 input
+-    if (auto dx11Result = Fsr2Dx11Dispatch(context, dispatchDescription); dx11Result.has_value())
+-        return (Fsr212::FfxErrorCode) dx11Result.value();
++    if (!ueContext)
++    {
++        if (auto dx11Result = Fsr2Dx11Dispatch(context, dispatchDescription); dx11Result.has_value())
++            return (Fsr212::FfxErrorCode) dx11Result.value();
++    }
+ 
+     // Skip OptiScaler stuff
+     // A context OptiScaler did not adopt (its create hook found no D3D12 device, e.g. a DX11 game's
+@@ -653,7 +709,8 @@ ffxFsr2ContextDispatch_Pattern_Dx12(Fsr212::FfxFsr2Context* context,
+     LOG_DEBUG("");
+ 
+     // Vela 0029: a context adopted by the DX11 FSR 2 input
+-    if (!_skipDispatch)
++    // Vela 0033: a UE RHI backend context goes to the game's FSR 2 (its jobs are followed to D3D11)
++    if (!_skipDispatch && !Fsr2UeDx11NoteDispatch(context, dispatchDescription))
+     {
+         if (auto dx11Result = Fsr2Dx11Dispatch(context, dispatchDescription); dx11Result.has_value())
+             return (Fsr212::FfxErrorCode) dx11Result.value();
+-- 
+2.54.0.windows.1
+

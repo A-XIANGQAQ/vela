@@ -1,0 +1,84 @@
+From cb4b9b23dd5436b6f7cfb5a5f6c543d423794fa9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 16:41:21 +0100
+Subject: [PATCH 47/65] 0050-vela-anf-model: wire ANF into SGSR3Feature_Dx12
+ (Init, Evaluate, EvaluateAnf)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit e973f3b82a7212cde5c1de60aa242d243757018e)
+---
+ .../upscalers/sgsr3/SGSR3Feature_Dx12.cpp     | 44 ++++++++++++++++++-
+ 1 file changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
+index 331e978e..a1423f58 100644
+--- a/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
++++ b/OptiScaler/upscalers/sgsr3/SGSR3Feature_Dx12.cpp
+@@ -324,6 +324,15 @@ bool SGSR3FeatureDx12::CreatePipelines(ID3D12Device* device)
+                 Fsr4VkBridge::NpuShown() = true;
+             }
+         }
++        else if (lm == VelaLive::Model::Anf)
++        {
++            if (!_anf.Init(device, RenderWidth(), RenderHeight(), TargetWidth(), TargetHeight(), DepthInverted(), IsHdr(), LowResMV(),
++                           JitteredMV()))
++            {
++                LOG_WARN("SGSR3: ANF is not available here; SGSR 2 instead");
++                VelaLive::Fsr4Failed() = true;
++            }
++        }
+         else if ((VelaLive::IsFsr4Full(lm) || lm == VelaLive::Model::Fsr4Lite) &&
+             !_fsr4.Init(device, RenderWidth(), RenderHeight(), TargetWidth(), TargetHeight(), DepthInverted(), IsHdr(),
+                         LowResMV(), JitteredMV(), lm == VelaLive::Model::Fsr4Lite,
+@@ -708,6 +717,37 @@ bool SGSR3FeatureDx12::EvaluateFsr4(ID3D12GraphicsCommandList* cl, NVSDK_NGX_Par
+     return true;
+ }
+ 
++// anf1: ANF (AnfVkBridge.h): same inputs as FSR 4, own passes + the NPU layer
++bool SGSR3FeatureDx12::EvaluateAnf(ID3D12GraphicsCommandList* cl, NVSDK_NGX_Parameter* p, ID3D12Resource* color, ID3D12Resource* depth,
++                                   ID3D12Resource* mv, ID3D12Resource* output)
++{
++    AnfVkBridge::Frame f;
++    p->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &f.jitterX);
++    p->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &f.jitterY);
++    if (p->Get(NVSDK_NGX_Parameter_MV_Scale_X, &f.mvScaleX) != NVSDK_NGX_Result_Success ||
++        p->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &f.mvScaleY) != NVSDK_NGX_Result_Success)
++        f.mvScaleX = f.mvScaleY = 1.0f;
++    int reset = 0;
++    p->Get(NVSDK_NGX_Parameter_Reset, &reset);
++    f.reset = reset != 0 || _constants.reset != 0.0f;
++    constexpr auto SRV = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    constexpr auto UAV = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++    if (depth == nullptr)
++    {
++        if (!_loggedVkFail)
++            LOG_WARN("SGSR3: no depth buffer on this frame; ANF skipped on this context");
++        return false;
++    }
++    if (!_anf.Evaluate(cl, { color, SRV }, { depth, SRV }, { mv, SRV }, { output, UAV }, f))
++    {
++        LOG_ERROR("SGSR3: ANF frame failed; SGSR 2 from the next frame");
++        VelaLive::Fsr4Failed() = true;
++        _anf.Release();
++        return false;
++    }
++    return true;
++}
++
+ // 0039: the far plane in the game's convention (0 when inverted; the bridge flips a non-inverted depth, so 1 -> 0 there
+ // too). The texture stays in NON_PIXEL_SHADER_RESOURCE after its clear.
+ ID3D12Resource* SGSR3FeatureDx12::FlatDepth(ID3D12GraphicsCommandList* cl)
+@@ -1217,7 +1257,9 @@ bool SGSR3FeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList
+             if (_timingEnabled)
+                 InCommandList->EndQuery(_timestampHeap, D3D12_QUERY_TYPE_TIMESTAMP,
+                                         _ringIndex * TimestampsPerFrame + 2);
+-            const bool ok = _fsr4.Ready() && _fsr4.SizesMatch(rwNow, rhNow, dwNow, dhNow)
++            const bool ok = _anf.Ready() && _anf.SizesMatch(rwNow, rhNow, dwNow, dhNow)
++                ? EvaluateAnf(InCommandList, InParameters, paramColor, useDepth ? paramDepth : nullptr, paramVelocity, paramOutput)
++                : _fsr4.Ready() && _fsr4.SizesMatch(rwNow, rhNow, dwNow, dhNow)
+                 ? EvaluateFsr4(InCommandList, InParameters, paramColor, useDepth ? paramDepth : nullptr, paramVelocity,
+                                paramOutput)
+                 : _student.Evaluate(
+-- 
+2.54.0.windows.1
+

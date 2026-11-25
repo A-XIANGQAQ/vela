@@ -1,0 +1,88 @@
+From f29f1367691d503db9a85d7c12df62c0f4ffb8f1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 21:51:47 +0100
+Subject: [PATCH 33/65] 0032-vela-dx11-shared-rt: every D3D11-on-12 shared copy
+ (inputs, depth transfer, output) also gets D3D11_BIND_RENDER_TARGET
+ (VELA_DX11_SHARED_RT=0 = old). 0031 probe, Ghostrunner DX11 on Turnip: shared
+ images with the render-target flag crossed intact (same hash on both sides),
+ every one without it read as garbage on the other side (motion vectors,
+ depth, output): DXVK and vkd3d-proton chose different layouts
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 7176c3684f634053761c670103b7914dd6c827c5)
+---
+ OptiScaler/shaders/depth_transfer/DT_Dx11.cpp |  5 ++-
+ OptiScaler/with_dx12/dx11_with_dx12.cpp       | 34 +++++++++++++++++++
+ 2 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/OptiScaler/shaders/depth_transfer/DT_Dx11.cpp b/OptiScaler/shaders/depth_transfer/DT_Dx11.cpp
+index 52e306ca..18e6293c 100644
+--- a/OptiScaler/shaders/depth_transfer/DT_Dx11.cpp
++++ b/OptiScaler/shaders/depth_transfer/DT_Dx11.cpp
+@@ -7,13 +7,16 @@
+ 
+ #include <Config.h>
+ 
++bool VelaSharedRt(); // Vela 0032 (with_dx12/dx11_with_dx12.cpp): shared copies take the render-target bind flag
++
+ bool DepthTransfer_Dx11::CreateBufferResource(ID3D11Device* InDevice, ID3D11Resource* InResource)
+ {
+     return CreateBufferResourceCommon(InDevice, InResource, _buffer,
+                                       [](D3D11_TEXTURE2D_DESC& desc)
+                                       {
+                                           desc.Format = DXGI_FORMAT_R32_FLOAT;
+-                                          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
++                                          desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS |
++                                                           (VelaSharedRt() ? D3D11_BIND_RENDER_TARGET : 0);
+                                           desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+                                       });
+ }
+diff --git a/OptiScaler/with_dx12/dx11_with_dx12.cpp b/OptiScaler/with_dx12/dx11_with_dx12.cpp
+index ee605ba8..12591f8f 100644
+--- a/OptiScaler/with_dx12/dx11_with_dx12.cpp
++++ b/OptiScaler/with_dx12/dx11_with_dx12.cpp
+@@ -233,7 +233,41 @@ static bool VelaDx11Flush()
+ // vkd3d-proton re-creates it from the shared metadata with its own usage / create flags; if the two differ, Turnip can
+ // pick different layouts (UBWC on one side only). Fewer bind flags leave both sides fewer ways to differ. Depth-stencil
+ // textures keep their flags.
++// Vela 0032 (default on; VELA_DX11_SHARED_RT=0 = old behaviour): every shared copy also gets D3D11_BIND_RENDER_TARGET.
++// Measured with the 0031 probe (Ghostrunner DX11, Turnip, 2026-11-21): shared images whose D3D12 side had the render-target
++// flag crossed intact (colour, same hash on both sides), every shared image without it (motion vectors, depth, the
++// output, and colour made SRV-only) read as garbage on the other side (+-6.5e4 / NaN): DXVK and vkd3d-proton picked
++// different layouts for non-render-target images. With the render-target bit both sides take the same layout.
++bool VelaSharedRt()
++{
++    static const bool on = []
++    {
++        const char* e = std::getenv("VELA_DX11_SHARED_RT");
++        const bool v = !(e != nullptr && e[0] == '0');
++        LOG_INFO("Vela DX11: shared copies {} the render-target bind flag (VELA_DX11_SHARED_RT)", v ? "with" : "without");
++        return v;
++    }();
++    return on;
++}
++
++static void VelaSharedRtFlag(D3D11_TEXTURE2D_DESC& desc)
++{
++    // depth-stencil and typeless depth formats cannot be render targets; everything the bridge shares otherwise can
++    if (!VelaSharedRt() || (desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0 || desc.Format == DXGI_FORMAT_R24G8_TYPELESS ||
++        desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
++        return;
++    desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
++}
++
++static void VelaSharedBindImpl(D3D11_TEXTURE2D_DESC& desc, bool copy);
++
+ static void VelaSharedBind(D3D11_TEXTURE2D_DESC& desc, bool copy)
++{
++    VelaSharedBindImpl(desc, copy);
++    VelaSharedRtFlag(desc);
++}
++
++static void VelaSharedBindImpl(D3D11_TEXTURE2D_DESC& desc, bool copy)
+ {
+     static const bool on = []
+     {
+-- 
+2.54.0.windows.1
+

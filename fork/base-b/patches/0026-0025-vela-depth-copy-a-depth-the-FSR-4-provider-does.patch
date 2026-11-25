@@ -1,0 +1,216 @@
+From 81420ff4aa6c29569c6c488987f522216df8d5eb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 21 Nov 2026 16:22:50 +0100
+Subject: [PATCH 26/65] 0025-vela-depth-copy: a depth the FSR 4 provider does
+ not take (D24S8, D16) goes to it as an R32F copy (1 - (1 - d) by two DI_Dx12
+ passes for inverted depth, one 1 - d pass otherwise); SRVs of non-typeless
+ depth formats (VELA-H78NGE Kingdom Come II: VkFormat 129); VELA_DEPTH_COPY=1
+ forces the copy for a test
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit d14dfc954698503e96c84ca6f719b19233085696)
+---
+ OptiScaler/shaders/Shader_Dx12.cpp        |   9 ++
+ OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h | 102 ++++++++++++++++++----
+ 2 files changed, 96 insertions(+), 15 deletions(-)
+
+diff --git a/OptiScaler/shaders/Shader_Dx12.cpp b/OptiScaler/shaders/Shader_Dx12.cpp
+index 908f2d78..8c60cdbb 100644
+--- a/OptiScaler/shaders/Shader_Dx12.cpp
++++ b/OptiScaler/shaders/Shader_Dx12.cpp
+@@ -58,6 +58,15 @@ DXGI_FORMAT Shader_Dx12::TranslateTypelessFormats(DXGI_FORMAT format)
+     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+         return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+ 
++    // Vela 0025: depth resources made with a depth format (not typeless) read as their colour twin (D24S8 / D16 / D32)
++    case DXGI_FORMAT_D24_UNORM_S8_UINT:
++        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
++
++    case DXGI_FORMAT_R16_TYPELESS:
++    case DXGI_FORMAT_D16_UNORM:
++        return DXGI_FORMAT_R16_UNORM;
++
++    case DXGI_FORMAT_D32_FLOAT:
+     case DXGI_FORMAT_R32_TYPELESS:
+     case DXGI_FORMAT_D32_FLOAT:
+         return DXGI_FORMAT_R32_FLOAT;
+diff --git a/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h b/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h
+index a0db0d6d..9e62e615 100644
+--- a/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h
++++ b/OptiScaler/upscalers/sgsr3/Fsr4VkBridge.h
+@@ -318,6 +318,7 @@ class Fsr4VkBridge
+         _mvDisplay = !lowResMv;
+         _mvJittered = jitteredMv;
+         _mvForce = EnvOn("VELA_MV_PASS");
++        _copyForce = EnvOn("VELA_DEPTH_COPY");
+         _mvFfxDiv = EnvOn("VELA_MV_FFXDIV");
+         if (_mvDisplay || _mvJittered || _mvForce)
+             LOG_INFO("Vela FSR 4 VK: motion vectors {}{} (depthInverted {}): the MV pass makes render-size, non-jittered "
+@@ -471,6 +472,15 @@ class Fsr4VkBridge
+                 return false;
+             dep = { _flip, _flipState };
+         }
++        else if (NeedsDepthCopy(depth))
++        {
++            // 0025 (VELA-H78NGE, Kingdom Come II: depth VkFormat 129 = D24_UNORM_S8_UINT): the provider takes R32F / D32
++            // depth only. Inverted depth (no flip wanted) is copied as 1 - (1 - d): two passes of the same DI_Dx12 shader
++            // into R32F; VELA_DEPTH_COPY=1 forces this path for a D32 game (test of the copy on the console)
++            if (!CopyDepth(cl, depth))
++                return false;
++            dep = { _flip2, _flip2State };
++        }
+         Img in[3], out;
+         if (!Get(color, in[0], false) || !Get(dep, in[1], true) || !Get(mv, in[2], false) || !Get(output, out, false))
+             return false;
+@@ -565,7 +575,14 @@ class Fsr4VkBridge
+             _flip->Release();
+             _flip = nullptr;
+         }
++        if (_flip2)
++        {
++            _flip2->Release();
++            _flip2 = nullptr;
++        }
+         _di.reset();
++        _di2.reset();
++        _copyLogged = false;
+         MvRelease();
+         _flipDepth = false;
+         _heapLogged = false;
+@@ -1040,20 +1057,70 @@ class Fsr4VkBridge
+         _mvDisplay = _mvJittered = _mvForce = _mvFfxDiv = false;
+     }
+ 
++    // 0025: true when the game's depth is a format the provider does not take (FfxFormat 0), or VELA_DEPTH_COPY=1
++    bool NeedsDepthCopy(const Tex& depth)
++    {
++        Img probe;
++        if (!Get(depth, probe, true))
++            return false;
++        const bool need = FfxFormat(probe.fmt) == 0 || _copyForce;
++        if (need && !_copyLogged)
++        {
++            _copyLogged = true;
++            LOG_INFO("Vela FSR 4 VK: depth VkFormat {} goes to the provider as an R32F copy (1 - (1 - d)){}", (int) probe.fmt,
++                     _copyForce ? " (VELA_DEPTH_COPY)" : "");
++        }
++        return need;
++    }
++
++    // 0025: d into _flip2 (R32F): 1 - d into _flip, then 1 - that into _flip2, both by DI_Dx12 (one instance per pass, each
++    // with its own descriptor heaps)
++    bool CopyDepth(ID3D12GraphicsCommandList* cl, const Tex& depth)
++    {
++        ID3D12Device* dev = nullptr;
++        if (FAILED(depth.res->GetDevice(IID_PPV_ARGS(&dev))) || !dev)
++            return false;
++        if (!_di)
++            _di = std::make_unique<DI_Dx12>("VelaFsr4DepthFlip", dev);
++        if (!_di2)
++            _di2 = std::make_unique<DI_Dx12>("VelaFsr4DepthCopy", dev);
++        dev->Release();
++        if (!_di->IsInit() || !_di2->IsInit())
++        {
++            if (_failLogged++ < 3)
++                LOG_ERROR("Vela FSR 4 VK: the depth copy shaders did not start");
++            return false;
++        }
++        if (!FlipDepth(cl, depth))
++            return false;
++        return FlipInto(cl, _di2.get(), _flip, _flip2, _flip2State, L"VelaFsr4DepthCopy");
++    }
++
+     // 1 - d of the game's depth into an R32F texture of the depth's size, left in NON_PIXEL_SHADER_RESOURCE
+     bool FlipDepth(ID3D12GraphicsCommandList* cl, const Tex& depth)
+     {
++        return FlipInto(cl, _di.get(), depth.res, _flip, _flipState, L"VelaFsr4DepthFlip");
++    }
++
++    // 1 - src into dst (R32F, src's size; made / remade here), dst left in NON_PIXEL_SHADER_RESOURCE
++    bool FlipInto(ID3D12GraphicsCommandList* cl, DI_Dx12* di, ID3D12Resource* src, ID3D12Resource*& dst,
++                  D3D12_RESOURCE_STATES& dstState, const wchar_t* name)
++    {
++        struct
++        {
++            ID3D12Resource* res;
++        } depth { src };
+         const auto dd = depth.res->GetDesc();
+-        if (_flip)
++        if (dst)
+         {
+-            const auto fd = _flip->GetDesc();
++            const auto fd = dst->GetDesc();
+             if (fd.Width != dd.Width || fd.Height != dd.Height)
+             {
+-                _flip->Release();
+-                _flip = nullptr;
++                dst->Release();
++                dst = nullptr;
+             }
+         }
+-        if (!_flip)
++        if (!dst)
+         {
+             ID3D12Device* dev = nullptr;
+             if (FAILED(depth.res->GetDevice(IID_PPV_ARGS(&dev))) || !dev)
+@@ -1070,34 +1137,34 @@ class Fsr4VkBridge
+             rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+             const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+-                                                            IID_PPV_ARGS(&_flip));
++                                                            IID_PPV_ARGS(&dst));
+             dev->Release();
+-            if (FAILED(hr) || !_flip)
++            if (FAILED(hr) || !dst)
+             {
+                 LOG_ERROR("Vela FSR 4 VK: depth flip texture {}x{} failed", (uint64_t) dd.Width, dd.Height);
+-                _flip = nullptr;
++                dst = nullptr;
+                 return false;
+             }
+-            _flip->SetName(L"VelaFsr4DepthFlip");
+-            _flipState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++            dst->SetName(name);
++            dstState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+             LOG_INFO("Vela FSR 4 VK: depth flip {}x{} (game depth DXGI format {})", (uint64_t) dd.Width, dd.Height,
+                      (int) dd.Format);
+         }
+         auto barrier = [&](D3D12_RESOURCE_STATES to)
+         {
+-            if (_flipState == to)
++            if (dstState == to)
+                 return;
+             D3D12_RESOURCE_BARRIER b {};
+             b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-            b.Transition.pResource = _flip;
+-            b.Transition.StateBefore = _flipState;
++            b.Transition.pResource = dst;
++            b.Transition.StateBefore = dstState;
+             b.Transition.StateAfter = to;
+             b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+             cl->ResourceBarrier(1, &b);
+-            _flipState = to;
++            dstState = to;
+         };
+         barrier(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+-        if (!_di->Dispatch(cl, depth.res, _flip))
++        if (!di || !di->Dispatch(cl, depth.res, dst))
+         {
+             if (_failLogged++ < 3)
+                 LOG_ERROR("Vela FSR 4 VK: depth flip dispatch failed");
+@@ -1127,7 +1194,12 @@ class Fsr4VkBridge
+     bool _flipDepth = false;
+     bool _heapLogged = false;
+     std::unique_ptr<DI_Dx12> _di;
++    std::unique_ptr<DI_Dx12> _di2;  // 0025: second pass of the depth copy
+     ID3D12Resource* _flip = nullptr;
++    ID3D12Resource* _flip2 = nullptr;
++    D3D12_RESOURCE_STATES _flip2State = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++    bool _copyForce = false;
++    bool _copyLogged = false;
+     D3D12_RESOURCE_STATES _flipState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+     ID3D12DescriptorHeap* _dummyHeap[2] = { nullptr, nullptr };
+     // Vela 0.8.16 MV pass
+-- 
+2.54.0.windows.1
+

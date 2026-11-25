@@ -1,0 +1,82 @@
+From 16ff6be53ca90afcdd272d7c208b8d1fc52e6a73 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 24 Nov 2026 23:55:22 +0100
+Subject: [PATCH 65/65] round 8: link fixes (CRT_UUID_DECL for
+ FlipMeterSwapChain, ReprojectionDXGISwapChain, IAmdExtFlipMeter,
+ ID3D12Device11; -lsetupapi)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ OptiScaler/framegen/flipmeter/FlipMeterSwapChain.h            | 4 ++++
+ .../framegen/reprojection/swapchain/reprojectionSwapchain.h   | 4 ++++
+ OptiScaler/hooks/AmdExtFlipMeter.h                            | 4 ++++
+ arm64ec/build.sh                                              | 2 +-
+ compat/arm64ec/opti_d3d12_agility.h                           | 4 ++++
+ 5 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/OptiScaler/framegen/flipmeter/FlipMeterSwapChain.h b/OptiScaler/framegen/flipmeter/FlipMeterSwapChain.h
+index 3d963d33..f95196d2 100644
+--- a/OptiScaler/framegen/flipmeter/FlipMeterSwapChain.h
++++ b/OptiScaler/framegen/flipmeter/FlipMeterSwapChain.h
+@@ -283,3 +283,7 @@ class DECLSPEC_UUID("6d0a3c0e-4c6b-4a5e-9d3f-0c5d1f6f1b77") FlipMeterSwapChain f
+     INT64 _averageFrameQpc = 0;    // Smoothed time between game presents
+     bool _discontinuity = true;    // The previous game present had no generated frames
+ };
++
++#if !defined(_MSC_VER) && defined(__CRT_UUID_DECL)
++__CRT_UUID_DECL(FlipMeterSwapChain, 0x6d0a3c0e, 0x4c6b, 0x4a5e, 0x9d, 0x3f, 0x0c, 0x5d, 0x1f, 0x6f, 0x1b, 0x77)
++#endif
+diff --git a/OptiScaler/framegen/reprojection/swapchain/reprojectionSwapchain.h b/OptiScaler/framegen/reprojection/swapchain/reprojectionSwapchain.h
+index 001eabae..07dee3e8 100644
+--- a/OptiScaler/framegen/reprojection/swapchain/reprojectionSwapchain.h
++++ b/OptiScaler/framegen/reprojection/swapchain/reprojectionSwapchain.h
+@@ -93,3 +93,7 @@ class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c267") ReprojectionDXGISwap
+ 
+     HWND _handle = nullptr;
+ };
++
++#if !defined(_MSC_VER) && defined(__CRT_UUID_DECL)
++__CRT_UUID_DECL(ReprojectionDXGISwapChain, 0x3af622a3, 0x82d0, 0x49cd, 0x99, 0x4f, 0xcc, 0xe0, 0x51, 0x22, 0xc2, 0x67)
++#endif
+diff --git a/OptiScaler/hooks/AmdExtFlipMeter.h b/OptiScaler/hooks/AmdExtFlipMeter.h
+index 2f91b54c..55b6f8ec 100644
+--- a/OptiScaler/hooks/AmdExtFlipMeter.h
++++ b/OptiScaler/hooks/AmdExtFlipMeter.h
+@@ -163,3 +163,7 @@ IAmdExtFlipMeter : public IUnknown
+     // status is AmdExtFlipMeterStatus, FSR initializes it to NotAvailable.
+     virtual HRESULT Present(ID3D12Resource * backBuffer, const AmdExtFlipMeterPresentInfo* info, uint32_t* status) = 0;
+ };
++
++#if !defined(_MSC_VER) && defined(__CRT_UUID_DECL)
++__CRT_UUID_DECL(IAmdExtFlipMeter, 0x543820DD, 0x06C9, 0x4F7E, 0xA3, 0xD0, 0xCA, 0x26, 0x0D, 0x79, 0x4A, 0xDD)
++#endif
+diff --git a/arm64ec/build.sh b/arm64ec/build.sh
+index abf20288..9a932455 100755
+--- a/arm64ec/build.sh
++++ b/arm64ec/build.sh
+@@ -175,7 +175,7 @@ echo ">> linking"
+   ${FSR2_LIB:+"$FSR2_LIB"} \
+   -L"$OUT" -L"$OUT/freetype" -ldetours -lfreetype -lvulkan-1 -ld3d12_extra \
+   -ld3d11 -ld3d12 -ldxgi -ldxguid -ld3dcompiler -lwinhttp -ldbghelp -ldwmapi \
+-  -lgdi32 -limm32 -lshell32 -luser32 -lversion -lole32 -loleaut32 -luuid \
++  -lgdi32 -limm32 -lshell32 -luser32 -lversion -lole32 -loleaut32 -luuid -lsetupapi \
+   -static-libgcc -static-libstdc++ -Wl,--error-limit=0
+ 
+ echo
+diff --git a/compat/arm64ec/opti_d3d12_agility.h b/compat/arm64ec/opti_d3d12_agility.h
+index 65259b21..c88e5f75 100644
+--- a/compat/arm64ec/opti_d3d12_agility.h
++++ b/compat/arm64ec/opti_d3d12_agility.h
+@@ -121,5 +121,9 @@ ID3D12Device11 : public ID3D12Device
+     virtual void STDMETHODCALLTYPE CreateSampler2(const D3D12_SAMPLER_DESC2* pDesc,
+                                                   D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) = 0;
+ };
++
++#if !defined(_MSC_VER) && defined(__CRT_UUID_DECL)
++__CRT_UUID_DECL(ID3D12Device11, 0x5405c344, 0xd457, 0x444e, 0xb4, 0xdd, 0x23, 0x66, 0xe9, 0xa4, 0xf9, 0xa2)
++#endif
+ #endif
+ #endif /* OPTISCALER_COMPAT_D3D12_AGILITY_H */
+-- 
+2.54.0.windows.1
+

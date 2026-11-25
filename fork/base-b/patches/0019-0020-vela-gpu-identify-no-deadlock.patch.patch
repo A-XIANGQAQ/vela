@@ -1,0 +1,146 @@
+From 53f2ac4c1dc2dfa6f608b993ad8b56b74dd15d72 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 19:21:54 +0100
+Subject: [PATCH 19/65] 0020-vela-gpu-identify-no-deadlock.patch
+
+(cherry picked from commit 89be17ca37964e577f917694a84f04c00f46191d)
+---
+ OptiScaler/Config.cpp           |  6 +++++
+ OptiScaler/dllmain.cpp          |  3 +++
+ OptiScaler/misc/IdentifyGpu.cpp | 45 ++++++++++++++++++++++++++++-----
+ OptiScaler/misc/IdentifyGpu.h   |  5 ++++
+ 4 files changed, 53 insertions(+), 6 deletions(-)
+
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+index 7f9600b4..67cb9bc3 100644
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -46,6 +46,12 @@ Config::Config()
+ {
+     absoluteFileName = Util::DllPath().parent_path() / fileName;
+     Reload(absoluteFileName);
++
++    if (const char* level = std::getenv("VELA_OPTI_LOGLEVEL");
++        level != nullptr && level[0] >= '0' && level[0] <= '6' && level[1] == '\0')
++    {
++        LogLevel.set_volatile_value(level[0] - '0');
++    }
+ }
+ 
+ bool Config::Reload(std::filesystem::path iniPath)
+diff --git a/OptiScaler/dllmain.cpp b/OptiScaler/dllmain.cpp
+index e8a001cf..12405d2e 100644
+--- a/OptiScaler/dllmain.cpp
++++ b/OptiScaler/dllmain.cpp
+@@ -2164,6 +2164,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+         spdlog::info("---------------------------------------------");
+         spdlog::info("");
+ 
++        if (const char* gpuThread = std::getenv("VELA_OPTI_GPUTHREAD"); gpuThread != nullptr && strcmp(gpuThread, "0") == 0)
++            spdlog::info("Early GPU identification disabled by VELA_OPTI_GPUTHREAD=0");
++        else
+         if (o_ExeEntry == nullptr)
+             CreateThread(nullptr, 0, getGpuInfo, GetDllNameWModule(&dx12NamesW), 0, nullptr);
+ 
+diff --git a/OptiScaler/misc/IdentifyGpu.cpp b/OptiScaler/misc/IdentifyGpu.cpp
+index 6101531c..1deda2b6 100644
+--- a/OptiScaler/misc/IdentifyGpu.cpp
++++ b/OptiScaler/misc/IdentifyGpu.cpp
+@@ -352,19 +352,43 @@ std::vector<GpuInformation> IdentifyGpu::getAllGpus()
+     if (isFetching)
+         return {};
+ 
+-    std::scoped_lock lock(mutex);
+-
+-    if (!cache.empty() && cache.front().deviceId != VendorId::Invalid)
+     {
+-        return cache;
++        std::unique_lock lock(mutex);
++
++        if (!cache.empty() && cache.front().vendorId != VendorId::Invalid)
++            return cache;
++
++        // checkGpuInfo calls into dxgi / vulkan, which can wait on locks held by the game's own device creation.
++        // Running it under our lock would make every other caller wait on that, so wait for it with a limit instead.
++        if (fetching)
++        {
++            if (!fetchDone.wait_for(lock, std::chrono::milliseconds(2000), [] { return !fetching; }))
++            {
++                LOG_WARN("GPU identification is still running, continuing without GPU info");
++                return {};
++            }
++
++            if (!cache.empty() && cache.front().vendorId != VendorId::Invalid)
++                return cache;
++        }
++
++        fetching = true;
+     }
+ 
+     isFetching = true;
+-    cache = checkGpuInfo();
++    auto gpus = checkGpuInfo();
+     isFetching = false;
+ 
++    {
++        std::scoped_lock lock(mutex);
++        cache = gpus;
++        fetching = false;
++    }
++
++    fetchDone.notify_all();
++
+     // TODO: try to reactivate DxgiSpoofing if was auto on Nvidia cards without DLSS
+-    return cache;
++    return gpus;
+ }
+ 
+ bool IdentifyGpu::isDetecting() { return isFetching; }
+@@ -392,6 +416,15 @@ GpuInformation IdentifyGpu::getPrimaryGpu()
+ bool IdentifyGpu::gameUsesDxvk() { return State::Instance().api == DX11 && getPrimaryGpu().dxgiIsDxvk; }
+ 
+ bool IdentifyGpu::gameUsesVkd3dProton() { return State::Instance().api == DX12 && getPrimaryGpu().d3d12IsVkd3dProton; }
++GpuInformation IdentifyGpu::tryGetPrimaryGpu()
++{
++    std::unique_lock lock(mutex, std::try_to_lock);
++
++    if (!lock.owns_lock() || cache.empty())
++        return GpuInformation {};
++
++    return cache.front();
++}
+ 
+ void IdentifyGpu::updateD3d12Capabilities(D3d12Proxy::PFN_D3D12CreateDevice o_D3D12CreateDevice)
+ {
+diff --git a/OptiScaler/misc/IdentifyGpu.h b/OptiScaler/misc/IdentifyGpu.h
+index 8fe45a12..c9a7b811 100644
+--- a/OptiScaler/misc/IdentifyGpu.h
++++ b/OptiScaler/misc/IdentifyGpu.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <algorithm>
++#include <condition_variable>
+ #include <cctype>
+ #include <string_view>
+ 
+@@ -114,6 +115,8 @@ class IdentifyGpu
+ {
+     inline static bool hasD3d12Capabilities = false;
+     inline static std::mutex mutex {};
++    inline static std::condition_variable fetchDone {};
++    inline static bool fetching = false;
+     inline static std::vector<GpuInformation> cache {};
+     inline static thread_local bool isFetching = false;
+     inline static std::atomic<bool> nvidiaHint { false };
+@@ -142,6 +145,8 @@ class IdentifyGpu
+     static bool gameUsesDxvk();
+     static bool gameUsesVkd3dProton();
+ 
++    // Cached primary GPU or an empty one, never waits for the identification
++    static GpuInformation tryGetPrimaryGpu();
+     static void updateD3d12Capabilities(D3d12Proxy::PFN_D3D12CreateDevice o_D3D12CreateDevice = nullptr);
+     static void updateInt8Support(bool sdkSupportsInt8, bool driverSupportsInt8);
+ 
+-- 
+2.54.0.windows.1
+
