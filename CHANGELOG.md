@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.10.0 — 2026-11-25
+
+Vela 0.10.0 makes FSR 4 in Vulkan games really run on the NPU, updates OptiScaler to the current upstream, and adds ANF for Snapdragon 8 Gen 3.
+
+New
+- **FSR 4 in Vulkan games now runs on the NPU.** In 0.9.0 the FSR 4 network did not get any work in games that draw with Vulkan (for example Unity games started with -force-vulkan) and the picture was about SGSR 2 quality. Now the work reaches the NPU: in Haste (Vulkan) FSR 4 runs at 43.2 fps on the NPU, SGSR 2 at 49.8 fps. The NPU did 14 160 frames in our run with no errors.
+- **OptiScaler updated to the current upstream.** Changes you can notice: fixes in the DirectX 11 path (copying and clearing of images, compute-shader state), XeSS depth and motion vectors in Unreal games, OptiSharpen, DLSS sub-rectangle cropping in the DirectX 12, DirectX 11 and Vulkan backends, Vulkan frame-generation fixes. Our own changes are carried over. Speed is the same as before in our tests (Deep Rock Galactic, Bright Memory: Infinite, Manor Lords).
+- **ANF on Snapdragon 8 Gen 3.** ANF (Adreno Neural Fusion, Qualcomm's upscaler, run by Vela on the NPU) can now be offered on Snapdragon 8 Gen 3 units too, after you run the NPU installer once (see How to update). The installer checks that every ANF graph gives the right result on your unit, and Vela shows ANF only if it does. **We could not test this on a Snapdragon 8 Gen 3 device. If you have one, please try it and tell us how it went.**
+
+Fixed
+- **Crash in games with DLSS on Proton 11 ARM64.** A Wine bug made the game crash when it checked the DLSS library's signature (seen in Manor Lords with the updated OptiScaler). Vela now clears the stack in those checks so the Wine bug has nothing to hit. Manor Lords runs with FSR 4 and ANF (59 fps, the game's limit) and writes no crash dump.
+- **Panel wording for ANF.** The panel now says ANF is Adreno Neural Fusion (Qualcomm) on the NPU.
+
+Steam games, our Retroid Pocket 6, average fps, same scene in both versions:
+
+| game | model | 0.9.0 | 0.10.0 |
+|---|---|---|---|
+| Deep Rock Galactic, DirectX 12 | FSR 4 | 38.8 | 38.8 |
+| Deep Rock Galactic, DirectX 12 | ANF | 41.5 | 41.5 |
+| Deep Rock Galactic, DirectX 12 | SGSR 2 | 43.9 | 43.8 |
+| Haste, Vulkan | FSR 4 | not working, see the 0.9.0 notes | 43.2 (on the NPU) |
+| Haste, Vulkan | SGSR 2 | 49.9 | 49.8 |
+| Bright Memory: Infinite, DirectX 11 | FSR 3 | 42.8 | 41.2 (a game's second launch is about 4 fps faster, so this is not a loss) |
+| Manor Lords, DirectX 12 | FSR 4 / ANF | 59.5 | 59.2 / 59.3 (the game's 60 fps limit) |
+
+Known issues
+- ANF on Snapdragon 8 Gen 3 is untested on a real device (see above). On other chips it is not shown.
+- Vela shows itself as an NVIDIA GPU to native Vulkan games so they offer DLSS. We tested this end to end in one game (Haste); if a game misbehaves, tell us.
+- DirectX 12 through Engine.ini (#5) is covered by tests only; we have no Unreal game from a launcher on our device. Please report how it goes.
+- FSR 3 and DittoSR in native Vulkan games don't start on our device; Vela uses SGSR 2 there.
+- On an AYN Odin 3 (Snapdragon 8 Elite, #7) the NPU check fails, so FSR 4 runs on the GPU there; we are looking into it.
+- On some Retroid Pocket 6 units the NPU gives wrong results even with the smaller graphs (#2); there the NPU stays off and FSR 4 runs on the GPU. The installer says so.
+- Scenes without a depth buffer still use FSR 1.
+- FSR 4 Fast: black rectangles in some games on 8 Elite. We don't see them on 8 Gen 2.
+
 ## 0.9.0 — 2026-11-24
 
 Vela 0.9.0 adds ANF (Adreno Neural Fusion, Qualcomm's upscaler), now running on the NPU, and offers FSR 4 in Vulkan games. It also fixes the DirectX 11 crash in Unreal games.

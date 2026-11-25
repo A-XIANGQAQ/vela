@@ -35,10 +35,10 @@ It replaces a game's own upscaler (DLSS, FSR 2/3 or XeSS) with **FSR 4**, which 
 
 | model | what it is |
 |---|---|
-| **FSR 4** | AMD's FSR 4 network. Runs on the NPU when the Vela NPU part is installed, otherwise on the GPU. Also in native Vulkan games since 0.9.0 |
+| **FSR 4** | AMD's FSR 4 network. Runs on the NPU when the Vela NPU part is installed, otherwise on the GPU. Also in native Vulkan games (the network runs on the NPU there since 0.10.0) |
 | **FSR 4 Fast** | the same network in a lighter mode, faster |
 | **FSR 3** | AMD FSR 3.1 |
-| **ANF** | Vela's ANF model: a small network that runs on the NPU (Snapdragon 8 Gen 2 only for now), between SGSR 2 and FSR 4 in quality and faster than FSR 4. Needs NPU package 18 |
+| **ANF** | Vela's ANF model: a small network that runs on the NPU (Snapdragon 8 Gen 2; offered on Snapdragon 8 Gen 3 since 0.10.0 after the NPU installer's check passes, not yet tested by us on a Gen 3 device), between SGSR 2 and FSR 4 in quality and faster than FSR 4. Needs NPU package 18 |
 | **DittoSR** | Vancete's DittoSR, a sharp upscaler without a neural network, about as fast as SGSR 2 (DirectX 12 and 11 games) |
 | **SGSR 2** | Qualcomm Snapdragon Game Super Resolution 2, the lightest |
 | **Off** | the game as it was |
