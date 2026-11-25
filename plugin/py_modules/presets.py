@@ -15,9 +15,9 @@ Pure functions; main.py applies them.
 # the fork / the RE4 interceptor run it like fsr4 and re-create the context on fsr4 <-> fsr4fast. Same NPU graphs as fsr4.
 # DITTO (0.8.23, owner 2026-11-22): dittosr = DittoSR 0.5.4 (MIT), a FidelityFX-API upscaler without a neural network, loaded
 # by the fork's FFX backend like FSR 3 (FSR 3 is its fallback); OptiScaler games only (the RE4 interceptor has no DittoSR)
-# ANF (0.8.28 candidate, branch anf-model): "ANF" = Vela's own small NPU upscaler (fork patch 0050+: two GPU passes around a network of
+# ANF (0.10.0): "ANF" = Adreno Neural Fusion (Qualcomm) on the NPU (fork patch 0050+: two GPU passes around a network of
 # ours on the NPU, one graph family per canvas, 32 jitter-phase graphs each). Offered only where the NPU is ready, the system package carries
-# the ANF families (npu.Npu.service()["anf_graphs"]), the plugin's DLL has the model (VERSION.json "anf_live") and the chip is the SM8550
+# the ANF families (npu.Npu.service()["anf_graphs"]), the plugin's DLL has the model (VERSION.json "anf_live") and the chip is the SM8550 (SM8650: after the installer's family check, npu.read_anf_check)
 # the families were measured on; hidden otherwise. DX12 / DX11 (the bridge) games of OptiScaler kits only: not in a Vulkan or static game.
 MODELS = ("fsr4", "fsr4fast", "anf", "fsr3", "dittosr", "sgsr2")
 FSR4_MODELS = ("fsr4", "fsr4fast")

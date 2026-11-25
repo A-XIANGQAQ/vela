@@ -59,6 +59,26 @@ GRAPH_DIR = "/usr/lib64/vela-npu"
 # 360, 480, 540, 648, 720), graph files <family>.bin next to the FSR 4 graphs, 32 phase graphs each; a family loads when the game asks for it
 # (--max-loaded-graphs 48). The graph files tell package 18 from 17.
 ANF_FAMILIES = ("anf360s32", "anf480s32", "anf540s32", "anf648s32", "anf720s32")
+# 0.9.1: the installer's check of the ANF families (install-vela-npu.sh, package 18, SM8550 and SM8650): ~/.local/share/vela/npu_anf_check,
+# one line "<family> ok|FAILED <hash>" per family, plus "chip SM8650". Needed to offer ANF on a chip the families were not measured on
+ANF_CHECK_FILE = os.path.join(".local", "share", "vela", "npu_anf_check")
+
+
+def read_anf_check(home):
+    """{"chip": str|None, "ok": [families that passed], "bad": [families that failed]} of the installer's file, or None (no file)."""
+    try:
+        with open(os.path.join(home, ANF_CHECK_FILE), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    out = {"chip": None, "ok": [], "bad": []}
+    for ln in lines:
+        w = ln.split()
+        if len(w) >= 2 and w[0] == "chip":
+            out["chip"] = w[1]
+        elif len(w) >= 2 and w[0] in ANF_FAMILIES:
+            out["ok" if w[1] == "ok" else "bad"].append(w[0])
+    return out
 K1H450_GRAPH = "nf4_k1h_450.bin"
 # 0.8.14: FSR 4 Ultra Performance (render 1/3 of the window) runs its own graphs nf4up_k1h / _450 / _360 (sockets
 # fsr4npud_nf4up_k1h*). The graph file tells v9 from v8.
@@ -224,6 +244,7 @@ class Npu:
                          "up_running": {o: socket_listening(self._proc, s) for o, s in UP_SOCKETS.items()},
                          "anf_graphs": [f for f in ANF_FAMILIES if os.path.isfile(os.path.join(self._graph_dir, f + ".bin"))],
                          "anf_running": [f for f in ANF_FAMILIES if socket_listening(self._proc, "fsr4npud_" + f)],
+                         "anf_check": read_anf_check(self.home),
                          **units, "sizes_graph": pkg14,
                          "size_running": {o: socket_listening(self._proc, s) for o, s in SIZE_SOCKETS.items()}}
             self._svc_at = now

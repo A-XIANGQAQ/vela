@@ -67,7 +67,7 @@ en_json = open(os.path.join(ROOT, "src", "i18n", "en.json"), encoding="utf-8").r
 assert '"reason.godot": "a Godot game: its FSR 2 is built into the engine' in en_json
 strings = open(os.path.join(ROOT, "src", "strings.ts"), encoding="utf-8").read()
 pkg = json.load(open(os.path.join(ROOT, "package.json"), encoding="utf-8"))
-assert pkg["version"] == "0.9.0", pkg["version"]
+assert pkg["version"] == "0.10.0", pkg["version"]
 assert f'export const VERSION = "{pkg["version"]}";' in strings  # build_zip.py refuses a zip where they differ
 dist = os.path.join(ROOT, "dist", "index.js")
 if os.path.isfile(dist):  # built: the bundle carries the Godot text

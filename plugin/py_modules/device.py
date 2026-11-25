@@ -81,8 +81,11 @@ def policy(dev, v79_dirs=V79_DIRS):
     fsr4: FSR 4 is offered at all (not on chips without a supported NPU); fsr4fast: FSR 4 Fast is offered; unavailable: English lines (logged, in game_state["device"]); note: one line, or None."""
     soc = dev.get("soc")
     if soc in (SM8550, SM8650):  # SM8650: the v73 graphs on the V75 runtime
-        # anf: the ANF families were built for HTP v73 and measured on the SM8550 only
-        return {"npu": True, "npu_graphs": "v73", "fsr4": True, "fsr4fast": True, "anf": soc == SM8550, "unavailable": [], "note": None}
+        # anf: the ANF families are HTP v73 graphs, measured on the SM8550; on the SM8650 they run on the V75 runtime like FSR 4's
+        # (0.9.1: same rule), but ANF is offered there only after the NPU installer's check of the five families' output hashes
+        # passed on this unit (anf_check: npu.read_anf_check, the file the installer writes)
+        return {"npu": True, "npu_graphs": "v73", "fsr4": True, "fsr4fast": True, "anf": True, "anf_check": soc == SM8650,
+                "unavailable": [], "note": None}
     if soc == SM8750:
         d = v79_graphs(v79_dirs)
         if d:

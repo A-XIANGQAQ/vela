@@ -520,12 +520,19 @@ class Plugin:
         return v
 
     def _anf_offered(self, s3, chip):
-        """ANF: the plugin's DLL has it, this chip may (SM8550, v73 graphs), the NPU is ready and the system package carries an ANF
-        family (package 18 or newer). Anything else: not in the panel at all."""
+        """ANF: the plugin's DLL has it, this chip may (SM8550 / SM8650, v73 graphs), the NPU is ready and the system package carries an ANF
+        family (package 18 or newer). SM8650 (v73 graphs on the V75 runtime): also the installer's check file says every family
+        installed passed its output-hash check on this unit; a failed family, or no file, hides ANF. Anything else: not in the panel at all."""
         if not s3.get("anf_available") or chip is None or not chip.get("anf") or not chip.get("fsr4", True):
             return False
         st = s3.get("npu")
-        return bool(presets.npu_ready(st) and ((st or {}).get("service") or {}).get("anf_graphs"))
+        svc = (st or {}).get("service") or {}
+        if not (presets.npu_ready(st) and svc.get("anf_graphs")):
+            return False
+        if chip.get("anf_check"):
+            chk = svc.get("anf_check") or {}
+            return bool(chk.get("ok") and not chk.get("bad") and set(svc["anf_graphs"]) <= set(chk["ok"]))
+        return True
 
     def _models(self, kind, s3, vulkan=False, appid=None):
         # VK1: vulkan = a native Vulkan game (gamecheck verdict "vulkan"): FSR 4 is offered there too (DLSS path)

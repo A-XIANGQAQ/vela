@@ -1,5 +1,5 @@
 """ANF (branch anf-model): the panel model "anf". Offered only with all of: the plugin's DLL has it (VERSION.json "anf_live"), the chip is the
-SM8550, the NPU is ready and the system package carries an ANF family (package 18: fsr4npud_anf<canvas>s32 graph files / sockets).
+SM8550 (or the SM8650 once the installer's check file says all families passed), the NPU is ready and the system package carries an ANF family (package 18: fsr4npud_anf<canvas>s32 graph files / sockets).
 Not in a Vulkan or a static (RE4 interceptor) game. live npu=2 / npuexact=1 like FSR 4. DX11 runs it on the sgsr3_12 bridge.
 The status line reads "Vela ANF: ready" of the fork's log. A fresh temp folder per run. Run: python -I tests/test_anf.py"""
 import os
@@ -35,7 +35,8 @@ assert not presets.npu_runs({"model": "anf"}, {"npu": {"state": "on"}}, READY, "
 # ---- the DLL key and the chip
 assert sgsr3.dx11_upscaler("anf") == "sgsr3_12" and sgsr3.VULKAN_UPSCALER["anf"] == "sgsr2"
 assert device.policy({"soc": "SM8550"}, ())["anf"] is True
-assert device.policy({"soc": "SM8650"}, ())["anf"] is False, "measured on the SM8550 only"
+assert device.policy({"soc": "SM8550"}, ())["anf_check"] is False, "SM8550: as before, no check file needed"
+assert device.policy({"soc": "SM8650"}, ())["anf"] is True and device.policy({"soc": "SM8650"}, ())["anf_check"] is True, "v73 graphs on the V75 runtime, after the check"
 assert not device.policy({"soc": "SM8750"}, ()).get("anf") and not device.policy({"soc": "SM8250"}, ()).get("anf")
 assert device.state({"soc": "SM8550"}, device.policy({"soc": "SM8550"}, ()))["anf"] is True
 
@@ -80,9 +81,34 @@ assert [m for m, ok in P._models("fsr4", s3) if ok][:3] == ["fsr4", "fsr4fast", 
 for name, patch in (("the DLL has no ANF", {"anf_available": False}), ("package 17", {"npu": {**npu_ok, "service": {"installed": True, "anf_graphs": []}}}),
                     ("no layer", {"npu": {**npu_ok, "layer_found": False}}), ("no NPU part", {"npu": None})):
     assert dict(P._models("fsr4", {**s3, **patch}))["anf"] is False, name
-for soc in ("SM8650", "SM8750"):
-    P.chip = device.policy({"soc": soc}, ())
-    assert dict(P._models("fsr4", s3))["anf"] is False, soc
+P.chip = device.policy({"soc": "SM8750"}, ())
+assert dict(P._models("fsr4", s3))["anf"] is False, "SM8750"
+# SM8650 (0.9.1): ANF only with the installer's check file: every installed family ok, none failed
+P.chip = device.policy({"soc": "SM8650"}, ())
+def chk(ok, bad=()):
+    return {**s3, "npu": {**npu_ok, "service": {"installed": True, "anf_graphs": ["anf540s32", "anf360s32"], "anf_check": {"chip": "SM8650", "ok": list(ok), "bad": list(bad)}}}}
+assert dict(P._models("fsr4", chk(npu.ANF_FAMILIES)))["anf"] is True, "all five families passed"
+assert dict(P._models("fsr4", chk(["anf540s32", "anf360s32"])))["anf"] is True, "both installed families passed"
+assert dict(P._models("fsr4", chk(["anf540s32"])))["anf"] is False, "an installed family was not checked"
+assert dict(P._models("fsr4", chk(["anf540s32", "anf360s32"], ["anf720s32"])))["anf"] is False, "a failed family hides ANF"
+assert dict(P._models("fsr4", chk([])))["anf"] is False, "empty check"
+assert dict(P._models("fsr4", s3))["anf"] is False, "no check file on an SM8650"
+assert dict(P._models("fsr4", {**s3, "npu": {**npu_ok, "layer_found": False}}))["anf"] is False
+assert dict(P._models("fsr4", {**chk(npu.ANF_FAMILIES), "anf_available": False}))["anf"] is False
+# the installer's file
+home = tempfile.mkdtemp(dir=tmp)
+assert npu.read_anf_check(home) is None
+os.makedirs(os.path.join(home, ".local", "share", "vela"))
+with open(os.path.join(home, npu.ANF_CHECK_FILE), "w") as fh:
+    fh.write("chip SM8650\npackage 18\nanf360s32 ok 45c31095dabc20bf\nanf480s32 ok 576f25a7bd307737\nanf540s32 FAILED 0000\nother ok x\n")
+assert npu.read_anf_check(home) == {"chip": "SM8650", "ok": ["anf360s32", "anf480s32"], "bad": ["anf540s32"]}, npu.read_anf_check(home)
+d2 = tempfile.mkdtemp(dir=tmp)
+os.makedirs(os.path.join(d2, "g"))
+open(os.path.join(d2, "g", "anf540s32.bin"), "w").close()
+open(os.path.join(d2, "unix"), "w").write(HDR)
+svc = npu.Npu(d2, home, d2, log=lambda m: None, proc_net_unix=os.path.join(d2, "unix"), systemctl=lambda u: "inactive", graph_dir=os.path.join(d2, "g")).service(fresh=True)
+assert svc["anf_check"]["bad"] == ["anf540s32"], svc["anf_check"]
+P.chip = device.policy({"soc": "SM8750"}, ())
 P.chip = chip
 assert dict(P._models("static", s3))["anf"] is False
 assert dict(P._models("fsr4", s3, vulkan=True))["anf"] is False
@@ -103,4 +129,9 @@ ts = open(os.path.join(ROOT, "src", "strings.ts"), encoding="utf-8").read()
 en = open(os.path.join(ROOT, "src", "i18n", "en.json"), encoding="utf-8").read()
 st = open(os.path.join(ROOT, "src", "status.ts"), encoding="utf-8").read()
 assert 'anf: "ANF"' in ts and '"model.note.anf": "' in en and 'L.mode === "anf"' in st
+# 0.10.0: ANF is Qualcomm's Adreno Neural Fusion on the NPU, never "Vela's own" (panel note, presets comment, VERSION.json)
+assert "Adreno Neural Fusion (Qualcomm)" in en and "own" not in [l for l in en.splitlines() if "model.note.anf" in l][0]
+for f in (os.path.join("py_modules", "presets.py"), os.path.join("assets", "sgsr3", "VERSION.json"), os.path.join("src", "strings.ts")):
+    t = open(os.path.join(ROOT, f), encoding="utf-8").read()
+    assert "Vela's own NPU upscaler" not in t and "Vela's own small NPU upscaler" not in t, f
 print("test_anf OK")

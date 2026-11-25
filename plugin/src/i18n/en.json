@@ -1,7 +1,7 @@
 {
   "model.note.fsr4": "AMD neural network · best image",
   "model.note.fsr4fast": "AMD neural network · twice as fast",
-  "model.note.anf": "Vela's own NPU upscaler · between SGSR 2 and FSR 4",
+  "model.note.anf": "Adreno Neural Fusion (Qualcomm) on the NPU · between SGSR 2 and FSR 4",
   "model.note.fsr3": "No neural network",
   "model.note.dittosr": "No neural network · sharp, as fast as SGSR 2",
   "model.note.sgsr2": "The lightest",
