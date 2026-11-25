@@ -98,7 +98,7 @@ static void worker_live(long jobs) {
 #define VELA_NPU_ACK_ERROR_TIMEOUT 5u   /* layer-private final status: GPU/HTP timeout or device lost (provider reason "error") */
 
 #define VL_EXPORT extern "C" __attribute__((visibility("default")))
-#define VL_BUILD 25u   /* layer build number: reported in every ack and in the log; the manifest's implementation_version is the same number */
+#define VL_BUILD 26u   /* layer build number: reported in every ack and in the log; the manifest's implementation_version is the same number */
 #define VL_BUILD_PREV 12u   /* previous shipped layer build number (13 = PUB/lay13, not shipped) */
 #define NSLOT 8
 #define KSTEP 11   /* steps of the bounded wait (111 << k iterations, k = 0..10: 227k in all) */
@@ -127,6 +127,12 @@ static void vlog(const char* f, ...) {
   va_list a; va_start(a, f); vfprintf(o, f, a); va_end(a); fputc(10, o); fflush(o);
 }
 
+// Build 26: per-job events (kick recorded, executed secondary buffers merged, submit queued, worker got the job, E1 seen, kick sent, daemon done, WAIT recorded).
+// On with VELA_NPU_JOBLOG=1, or with VELA_VK_FSR4=1 (the Vulkan path the plugin sets); first 40 seqs and every 600th, plus every abnormal event (<= 200).
+static bool jl_env() { static const int on = [] { const char* v = getenv("VELA_NPU_JOBLOG"); if (v && *v) return v[0] != '0' ? 1 : 0; const char* f = getenv("VELA_VK_FSR4"); return f && !strcmp(f, "1") ? 1 : 0; }(); return on != 0; }
+static bool jl_seq(uint64_t seq) { return jl_env() && (seq <= 40 || seq % 600 == 0); }
+static std::atomic<int> g_jlBad{0};
+static bool jl_bad() { return jl_env() && g_jlBad.fetch_add(1) < 200; }
 // ---------------------------------------------------------------- state
 // Contract: vela_npu_abi.h v1 + vela_npu_ext.h:
 //   UPSCALE + F_TENSORS: color = HTP input, output = out0, motion = out1 (R32_UINT, GENERAL; word j at pixel (j%w, j/w)).
@@ -168,7 +174,7 @@ struct Dev {
   F(QueueSubmit) F(QueueSubmit2) F(QueueSubmit2KHR) F(BeginCommandBuffer) F(AllocateCommandBuffers) F(FreeCommandBuffers)
   F(ResetCommandPool) F(DeviceWaitIdle) F(GetBufferDeviceAddress)
   F(CreateShaderModule) F(DestroyShaderModule) F(CreatePipelineLayout) F(DestroyPipelineLayout) F(CreateComputePipelines) F(DestroyPipeline)
-  F(CmdBindPipeline) F(CmdDispatchIndirect)
+  F(CmdBindPipeline) F(CmdDispatchIndirect) F(CmdExecuteCommands)
   F(CmdDispatch) F(EndCommandBuffer) F(CmdBeginRenderPass) F(CmdBeginRenderPass2) F(CmdBeginRenderPass2KHR) F(CmdEndRenderPass) F(CmdEndRenderPass2) F(CmdEndRenderPass2KHR)
   F(CmdBeginRendering) F(CmdBeginRenderingKHR) F(CmdEndRendering) F(CmdEndRenderingKHR) F(CmdPipelineBarrier2) F(CmdPipelineBarrier2KHR) F(UpdateDescriptorSets) F(CmdPushDescriptorSetKHR)
 #undef F
@@ -464,7 +470,7 @@ static bool ctx_init(Dev* d) {  // d->mtx held; first PROBE: status buffer, even
     VkEventCreateInfo ec{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
     if (d->CreateEvent(d->dev, &ec, nullptr, &s.e1) != VK_SUCCESS || d->CreateEvent(d->dev, &ec, nullptr, &s.e2) != VK_SUCCESS) return false;
   }
-  for (int i = 0; i < NSLOT; i++) { d->st[i * 16 + 4] = 0; d->st[i * 16 + 5] = 1; d->st[i * 16 + 6] = 1; }   // indirect dispatch args (x, 1, 1)
+  for (int i = 0; i < NSLOT; i++) { d->st[i * 16 + 0] = VELA_NPU_ACK_ERROR_TIMEOUT; d->st[i * 16 + 1] = 0; d->st[i * 16 + 4] = 0; d->st[i * 16 + 5] = 1; d->st[i * 16 + 6] = 1; }   // build 26: status NOT-OK until a worker job completes (a slot nobody wrote used to read as OK); indirect dispatch args (x, 1, 1)
   bw_init(d);             // bounded wait setup
   install_exit_hooks();   // E2 release at process end
   g_poll = g_poll_env = npu_poll_cfg(getenv("VELA_NPU_E1_SLEEP_PCT"), getenv("VELA_NPU_E1_STEP_US"));   // CPUW (PWR1 row 5)
@@ -585,6 +591,7 @@ static void worker_main(Dev* d) {
       if (spin > npu_tight_polls(g_poll, j.async)) { timespec ts{0, npu_step_ns(g_poll, j.async)}; nanosleep(&ts, nullptr); }   // tight, then steps (CPUW: async step VELA_NPU_E1_STEP_US)
     }
     double tE1 = now_ms(); int st = S_OK; uint32_t ack; bool slow = false;
+    if (jl_seq(j.seq) || (!seen && jl_bad())) vlog("job seq %llu slot %d: worker got it, E1 %s after %.2f ms (submit->E1), %ld polls", (unsigned long long)j.seq, j.slot, seen ? "seen" : "NOT seen", tE1 - j.tSubmit, polls);
     if (seen) d->ResetEvent(d->dev, s.e1);
     if (!seen || j.released) ack = VELA_NPU_ACK_ERROR_TIMEOUT;
     else if (!npu) ack = VELA_NPU_ACK_NODAEMON;
@@ -598,6 +605,7 @@ static void worker_main(Dev* d) {
            }
            ack = st == S_OK && !slow ? VELA_NPU_ACK_OK : st == E_DISCONNECTED || st == E_PROTO ? VELA_NPU_ACK_NODAEMON : VELA_NPU_ACK_ERROR_TIMEOUT; }
     double tDone = now_ms(), np = tDone - tE1;
+    if (jl_seq(j.seq) || (ack != VELA_NPU_ACK_OK && jl_bad())) vlog("job seq %llu slot %d: kick sent, daemon %s after %.3f ms, ack %u (%s)", (unsigned long long)j.seq, j.slot, st == S_OK ? "exec done" : fsr4npu_strerror(st), np, ack, ack == VELA_NPU_ACK_OK ? "OK, status written" : "NOT OK");
     put_status(d, j.slot, ack, ack == VELA_NPU_ACK_OK ? uint32_t(np * 1000.0) : 0);   // coherent host memory, before the event
     put_done(d, j.slot);                                                          // the bounded wait's x = 0 (after the status)
     d->SetEvent(d->dev, s.e2);                                                    // ALWAYS: the GPU never waits on a dead or hung daemon
@@ -727,10 +735,12 @@ static void record_marker(Dev* d, VkCommandBuffer cb, const VelaNpuCmd* c, VkBuf
   } else if (c->op == VELA_NPU_OP_WAIT) {
     std::lock_guard<std::mutex> l(d->mtx);
     int si = d->lastKick;
-    if (si < 0 || d->slots[si].seq != c->seq || d->slots[si].gen != d->gen || d->state != 1) a.status = VELA_NPU_ACK_NODAEMON;   // nothing kicked for this seq
+    if (si < 0 || d->slots[si].seq != c->seq || d->slots[si].gen != d->gen || d->state != 1) { a.status = VELA_NPU_ACK_NODAEMON;   // nothing kicked for this seq
+      if (jl_bad()) vlog("WAIT seq %llu in cb %p: nothing kicked for it (lastKick %d, state %d) -> NODAEMON", (unsigned long long)c->seq, (void*)cb, si, d->state); }
     else {
       CbRec& rec = d->recs[cb]; if (rec.jobs.empty() && rec.cons.empty()) d->nRec++;
       wait_and_copy_out(d, cb, si); rec.cons.push_back(Consumer{si, c->seq});
+      if (jl_seq(c->seq)) vlog("job seq %llu slot %d: WAIT recorded in cb %p", (unsigned long long)c->seq, si, (void*)cb);
       d->lastKick = -1; slot_unref(d, si);                                    // the GPU order now holds the slot (E2 hold)
       a.slot = si; a.status = kPending; copySlot = si;
     }
@@ -748,6 +758,8 @@ static void record_marker(Dev* d, VkCommandBuffer cb, const VelaNpuCmd* c, VkBuf
     else if (d->slow || (si = slot_take(d)) < 0) a.status = VELA_NPU_ACK_BUSY;   // slow execute running: GPU network, no kick
     else {
       Slot& s = d->slots[si]; CbRec& rec = d->recs[cb]; if (rec.jobs.empty() && rec.cons.empty()) d->nRec++;
+      put_status(d, si, VELA_NPU_ACK_ERROR_TIMEOUT, 0);   // build 26: NOT-OK before every kick; only a completed worker job writes OK
+      if (jl_seq(c->seq)) vlog("job seq %llu slot %d: kick recorded in cb %p (flags 0x%x%s)", (unsigned long long)c->seq, si, (void*)cb, c->flags, async ? " async" : " exact");
       if (d->lastKick >= 0) { slot_unref(d, d->lastKick); d->lastKick = -1; }   // an older kick nobody waited for
       // copy-in: the fork's pack wrote the input image; release everything to the HOST domain; E1
       if (zc) mbar(d, cb, ALL, HOST, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);   // zero-copy: the pack wrote the dma-buf
@@ -832,6 +844,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL vl_ResetCommandPool(VkDevice dev, VkComman
   }
   return d->ResetCommandPool(dev, pool, f);
 }
+// Build 26: the Unity Vulkan path records the provider's markers into a SECONDARY command buffer that a primary one executes; the jobs and consumers
+// were keyed by the secondary and never seen at vkQueueSubmit (kit e2ehc: daemon frames 0, status slot never written = OK). vkCmdExecuteCommands moves
+// the secondary's record into the primary's. A secondary re-executed without a re-record has nothing left to move (its status then stays NOT-OK).
+static VKAPI_ATTR void VKAPI_CALL vl_CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer* secs) {
+  Dev* d = dev_of(cb);
+  if (d->nRec.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> l(d->mtx);
+    for (uint32_t i = 0; i < n; i++) {
+      auto it = d->recs.find(secs[i]); if (it == d->recs.end() || secs[i] == cb) continue;
+      CbRec src = std::move(it->second); d->recs.erase(it); d->nRec--;
+      if (src.jobs.empty() && src.cons.empty()) continue;
+      CbRec& dst = d->recs[cb]; if (dst.jobs.empty() && dst.cons.empty()) d->nRec++;
+      if (jl_env() && (jl_seq(src.jobs.empty() ? src.cons[0].seq : src.jobs[0].seq) || jl_bad()))
+        vlog("vkCmdExecuteCommands: primary cb %p took secondary cb %p: %zu jobs, %zu waits", (void*)cb, (void*)secs[i], src.jobs.size(), src.cons.size());
+      for (Job& j : src.jobs) dst.jobs.push_back(j);
+      for (Consumer& c : src.cons) dst.cons.push_back(c);
+    }
+  }
+  d->CmdExecuteCommands(cb, n, secs);
+}
 // Before the driver submit: a wait whose producer was never submitted (dropped / reused) is released now (status NODAEMON).
 // After: queue the producer jobs for the worker.
 template <class GetCb> static VkResult submit_common(Dev* d, uint32_t n, GetCb cbs, VkResult (*call)(void*), void* ctx) {
@@ -860,6 +892,7 @@ template <class GetCb> static VkResult submit_common(Dev* d, uint32_t n, GetCb c
     for (Job j : it->second.jobs)
       if (r == VK_SUCCESS) { j.tSubmit = t; j.qn = ++d->qCounter; d->slots[j.slot].refs++; d->slots[j.slot].prod = P_QUEUED;
         if (d->slow) { put_release(d, j.slot); j.released = true; }   // recorded before a slow execute began: GPU network
+        { if (jl_seq(j.seq)) vlog("job seq %llu slot %d: queued for the worker at submit (cb %p)", (unsigned long long)j.seq, j.slot, (void*)m.first); }
         d->q.push_back(j); any = true; }
     if (r == VK_SUCCESS && !it->second.submitted) { it->second.submitted = true; for (Job& j : it->second.jobs) slot_unref(d, j.slot); }
   }
@@ -1248,7 +1281,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL vl_CreateDevice(VkPhysicalDevice pd, const
   F(QueueSubmit) F(QueueSubmit2) F(QueueSubmit2KHR) F(BeginCommandBuffer) F(AllocateCommandBuffers) F(FreeCommandBuffers)
   F(ResetCommandPool) F(DeviceWaitIdle) F(GetBufferDeviceAddress)
   F(CreateShaderModule) F(DestroyShaderModule) F(CreatePipelineLayout) F(DestroyPipelineLayout) F(CreateComputePipelines) F(DestroyPipeline)
-  F(CmdBindPipeline) F(CmdDispatchIndirect)
+  F(CmdBindPipeline) F(CmdDispatchIndirect) F(CmdExecuteCommands)
   F(CmdDispatch) F(EndCommandBuffer) F(CmdBeginRenderPass) F(CmdBeginRenderPass2) F(CmdBeginRenderPass2KHR) F(CmdEndRenderPass) F(CmdEndRenderPass2) F(CmdEndRenderPass2KHR)
   F(CmdBeginRendering) F(CmdBeginRenderingKHR) F(CmdEndRendering) F(CmdEndRenderingKHR) F(CmdPipelineBarrier2) F(CmdPipelineBarrier2KHR) F(UpdateDescriptorSets) F(CmdPushDescriptorSetKHR)
 #undef F
@@ -1370,6 +1403,7 @@ static PFN_vkVoidFunction gdpa_impl(VkDevice dev, const char* name) {
 #undef HD
     }
     H("vkCmdBindPipeline", vl_CmdBindPipeline)   // remembers the app's compute pipeline
+    if (d->CmdExecuteCommands && !strcmp(name, "vkCmdExecuteCommands")) return (PFN_vkVoidFunction)vl_CmdExecuteCommands;   // build 26
     H("vkAllocateCommandBuffers", vl_AllocateCommandBuffers) H("vkFreeCommandBuffers", vl_FreeCommandBuffers) H("vkResetCommandPool", vl_ResetCommandPool)
     if (!strcmp(name, "vkQueueSubmit2")) return d->QueueSubmit2 ? (PFN_vkVoidFunction)vl_QueueSubmit2 : nullptr;
     if (!strcmp(name, "vkQueueSubmit2KHR")) return d->QueueSubmit2KHR ? (PFN_vkVoidFunction)vl_QueueSubmit2KHR : nullptr;

@@ -6,7 +6,7 @@ of the Snapdragon 8 Elite (SM8750, HTP v79: the AYN Odin 3 and other devices wit
 
 ## Install (Desktop mode → Konsole, game closed)
 
-1. Run: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.9.0/install-vela-npu.sh | sudo sh`
+1. Run: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.10.0/install-vela-npu.sh | sudo sh`
    Nothing else to download: the image carries the Qualcomm QNN runtime; the installer reads 3 DSP files from your device.
 2. It ends with `Vela NPU: OK - all NPU graphs checked work` or `Vela NPU: FAILED - <reason>`. Start the game again; the Vela
    panel shows "on the NPU".
@@ -15,7 +15,7 @@ When the NPU service starts, it checks one graph with a known input (the start s
 it switches to the `low4/` graphs, which are planned for a smaller memory window. If those are wrong too, the NPU stays off and
 Vela runs FSR 4 on the GPU. Details and the environment variables: sections "Package 17" and "Package 18" below. If the check fails on both sets, the installer says so ("Vela NPU: off on this unit ...", exit code 3) instead of "FAILED".
 
-Remove: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.9.0/uninstall-vela-npu.sh | sudo sh`
+Remove: `curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/download/v0.10.0/uninstall-vela-npu.sh | sudo sh`
 
 ## Game resolutions on the NPU
 

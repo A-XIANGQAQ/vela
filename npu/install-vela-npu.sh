@@ -14,8 +14,8 @@
 set -u
 umask 022
 VER=18
-# TAG: the release that carries vela-npu-sysext-18.raw (the Vela 0.9.0 candidate; check it against the real release before publishing)
-TAG=v0.9.0
+# TAG: the release that carries vela-npu-sysext-18.raw (Vela 0.10.0; the image is attached to that release as an asset)
+TAG=v0.10.0
 BASE_URL="https://github.com/zrprod9-cmyk/vela/releases/download/$TAG"
 IMAGE=vela-npu-sysext-$VER.raw
 IMAGE_SHA256=b4f2f260be4fc2f9339411fafe480ac7ee505caa34e3e9428550a0754e700807
@@ -69,7 +69,7 @@ fsr4npud_nf4_k1h_324 8b967666e675804b
 fsr4npud_nf4up_k1h_324 0cfda9f2b7cabc25
 fsr4npud_nf4_k1h_270 501dbf44d6b0410d
 fsr4npud_nf4up_k1h_270 a71e9b4f04112039"
-# ANF (package 18), HTP v73 graphs, checked on the Snapdragon 8 Gen 2 only: the output hash of phase 0 of each graph family on the
+# ANF (package 18), HTP v73 graphs, checked on the Snapdragon 8 Gen 2 and 8 Gen 3 (the v73 graphs on the HTP v75 runtime): the output hash of phase 0 of each graph family on the
 # fixed ramp input (fsr4npu-check, no --phases). These are the x86 HTP simulator's hashes; the 8 Gen 2 device gave the same hash in
 # every phase of every family it ran (ANF/IMPL1.md, "Device vs simulator").
 ANF_GRAPHS="anf360s32 anf480s32 anf540s32 anf648s32 anf720s32"
@@ -212,8 +212,10 @@ for g in $GRAPHS; do s=fsr4npud_$g; w=$(echo "$WANT" | sed -n "s/^$s //p")
     say "  ok $g (runs on the NPU, hash $h, no reference hash)"; nohash=$((nohash + 1))
   else say "  FAILED $g (service $up, hash ${h:-none}, expected ${w:-any})"; bad=$((bad + 1)); fi
 done
-if [ "$CHIP" = SM8550 ]; then
+if [ "$CHIP" = SM8550 ] || [ "$CHIP" = SM8650 ]; then
   say "  ANF graph families (Vela's own upscaler; a family loads on its first use, so a check is tried again for a few seconds)"
+  ANF_FILE="$USER_HOME/.local/share/vela/npu_anf_check"; ANF_TXT="chip $CHIP
+package $VER"
   for g in $ANF_GRAPHS; do s=fsr4npud_$g; w=$(echo "$WANT_ANF" | sed -n "s/^$s //p"); ok=0; tries=0; h=""
     while [ $tries -lt 6 ]; do tries=$((tries + 1))
       o=$(runuser -u "$USER_NAME" -- /usr/lib64/vela-npu/fsr4npu-check --name "$s" --runs 20 2>&1) || true
@@ -221,9 +223,14 @@ if [ "$CHIP" = SM8550 ]; then
       if [ "$(systemctl is-active "$UNIT")" = active ] && echo "$o" | grep -q "RESULT OK" && [ -n "$w" ] && [ "$h" = "$w" ]; then ok=1; break; fi
       sleep 1
     done
-    if [ $ok = 1 ]; then say "  ok $g"; else say "  FAILED $g (service $(systemctl is-active "$UNIT"), hash ${h:-none}, expected $w)"; bad=$((bad + 1)); fi
+    if [ $ok = 1 ]; then say "  ok $g"; ANF_TXT="$ANF_TXT
+$g ok $h"
+    else say "  FAILED $g (service $(systemctl is-active "$UNIT"), hash ${h:-none}, expected $w)"; bad=$((bad + 1)); ANF_TXT="$ANF_TXT
+$g FAILED ${h:-none}"; fi
   done
-else say "  ANF graphs are not checked on $CHIP (Vela's ANF runs on the Snapdragon 8 Gen 2 only for now)"; fi
+  # the Vela panel reads this file: on the Snapdragon 8 Gen 3 it offers ANF only when every family passed on this unit
+  if mkdir -p "$(dirname "$ANF_FILE")" 2>/dev/null && printf '%s\n' "$ANF_TXT" > "$ANF_FILE" 2>/dev/null; then chown "$USER_NAME" "$(dirname "$ANF_FILE")" "$ANF_FILE" 2>/dev/null || true; fi
+else say "  ANF graphs are not checked on $CHIP (Vela's ANF runs on the Snapdragon 8 Gen 2 and 8 Gen 3 only for now)"; fi
 [ $nohash = 0 ] || say "  $nohash graphs have no reference hash yet"
 if [ $bad = 0 ]; then
   say ""; say "Vela NPU: OK - all NPU graphs checked work. Start your game again; the Vela panel shows \"on the NPU\"."
