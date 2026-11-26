@@ -35,6 +35,8 @@ def tree(name, compatible, soc_id, machine, gpu):
 rp6 = tree("rp6", ["retroidpocket,rp6", "qcom,qcs8550", "qcom,sm8550"], 603, "QCS8550", "43050a01")
 odin3 = tree("odin3", ["ayntec,odin3", "qcom,sm8750"], 618, "SM8750", "44050001")
 sid_only = tree("sid", ["vendor,board"], 618, "SM8750", None)  # no gpu node, no qcom compatible: soc_id decides
+canoe = tree("canoe", ["vendor,canoe", "qcom,canoe"], 661, "CANOEP", "840.0")
+sm8850_sid = tree("sm8850sid", ["vendor,board"], 660, "SM8850", None)  # no gpu node, no qcom compatible: soc_id decides
 tb321fu = tree("tb321fu", ["lenovo,tb321fu", "qcom,sm8650"], 577, "Lenovo Legion Y700 (2025) / TB321FU", "43051401")
 sm8650_sid = tree("sm8650sid", ["vendor,board"], 557, "SM8650", None)  # no gpu node, no qcom compatible: soc_id decides
 other = tree("other", ["vendor,x", "qcom,sm8450"], 457, "SM8450", "730.1")  # Linux sm8450.dtsi "qcom,adreno-730.1"
@@ -47,6 +49,10 @@ d8 = device.detect(odin3)
 assert d8["soc"] == "SM8750" and d8["gpu"] == "Adreno 830" and d8["npu_arch"] == "v79" and d8["gpu_chip"] == "44050001", d8
 ds = device.detect(sid_only)
 assert ds["soc"] == "SM8750" and ds["gpu"] == "Adreno 830" and ds["gpu_chip"] is None, ds
+d88 = device.detect(canoe)
+assert d88["soc"] == "SM8850" and d88["gpu"] == "Adreno 840" and d88["npu_arch"] == "v81" and d88["gpu_chip"] == "840.0", d88
+ds88 = device.detect(sm8850_sid)
+assert ds88["soc"] == "SM8850" and ds88["gpu"] == "Adreno 840" and ds88["npu_arch"] == "v81" and ds88["gpu_chip"] is None, ds88
 dt = device.detect(tb321fu)
 assert dt["soc"] == "SM8650" and dt["gpu"] == "Adreno 750" and dt["npu_arch"] == "v75" and dt["soc_id"] == 577, dt
 d65 = device.detect(sm8650_sid)
@@ -67,6 +73,14 @@ assert not device.policy(d8, (v79,))["npu"]  # an empty folder is no graph set
 write(os.path.join(v79, "nf4_k1h.bin"), b"graph")
 p8g = device.policy(d8, (os.path.join(tmp, "nope"), v79))
 assert p8g["npu"] and p8g["fsr4fast"] and p8g["npu_graphs"] == "v79" and p8g["graph_dir"] == v79, p8g
+v81 = os.path.join(tmp, "v81")
+p88 = device.policy(d88, (v79,), (v81,))
+assert not p88["npu"] and not p88["fsr4fast"] and p88["npu_graphs"] is None and "v81" in p88["note"], p88
+os.makedirs(v81)
+assert not device.policy(d88, (v79,), (v81,))["npu"]
+write(os.path.join(v81, "nf4_k1h.bin"), b"graph")
+p88g = device.policy(d88, (v79,), (os.path.join(tmp, "nope"), v81))
+assert p88g["npu"] and p88g["fsr4fast"] and p88g["npu_graphs"] == "v81" and p88g["graph_dir"] == v81, p88g
 assert not device.policy(d, (v79,))["unavailable"]  # SM8550 ignores the v79 folder
 pt = device.policy(dt, (v79,))  # SM8650 = SM8550: v73 graphs, FSR 4 Fast, no note
 assert pt["npu"] and pt["fsr4"] and pt["fsr4fast"] and pt["npu_graphs"] == "v73" and pt["note"] is None and pt["unavailable"] == [], pt
@@ -77,6 +91,8 @@ assert not pe["npu"] and not pe["fsr4fast"] and "unknown chip" in pe["note"], pe
 
 st = device.state(d8, p8)
 assert st["soc"] == "SM8750" and st["gpu"] == "Adreno 830" and st["npu_arch"] == "v79" and not st["npu"], st
+st88 = device.state(d88, p88)
+assert st88["soc"] == "SM8850" and st88["gpu"] == "Adreno 840" and st88["npu_arch"] == "v81" and not st88["npu"], st88
 assert device.state(de, pe)["soc"] == "unknown"
 
 # Npu.ready(): the chip gate comes on top of the base checks; chip=None and SM8550 the same
@@ -113,8 +129,8 @@ def npu_with(chip):
     return n
 
 
-assert npu_with(None).ready() and npu_with(p).ready() and npu_with(p8g).ready()
-assert not npu_with(p8).ready() and not npu_with(pu).ready() and not npu_with(pe).ready()
+assert npu_with(None).ready() and npu_with(p).ready() and npu_with(p8g).ready() and npu_with(p88g).ready()
+assert not npu_with(p8).ready() and not npu_with(p88).ready() and not npu_with(pu).ready() and not npu_with(pe).ready()
 n0 = npu_with(p)
 n0.service = lambda fresh=False: {"installed": False}
 assert not n0.ready()  # SM8550 without the component: as without a chip gate
@@ -145,6 +161,8 @@ assert m8 == {"fsr4": True, "fsr4fast": False, "anf": False, "fsr3": True, "ditt
 assert P._default_model("fsr4", s3, {"ready": False}) == "fsr3"  # not fsr4fast
 assert P._default_model("fsr4", {"fsr4_available": True, "fsr3_available": False}, None) == "sgsr2"
 P.dev, P.chip = d8, p8g  # SM8750 with v79 graphs: all models
+assert all(ok for m, ok in P._models("fsr4", s3) if m != "anf")
+P.dev, P.chip = d88, p88g  # SM8850 with v81 graphs: all models except anf
 assert all(ok for m, ok in P._models("fsr4", s3) if m != "anf")
 P.dev, P.chip = du, pu  # unknown chip
 assert dict(P._models("fsr4", s3)) == {"fsr4": False, "fsr4fast": False, "anf": False, "fsr3": True, "dittosr": True, "sgsr2": True}  # no FSR 4

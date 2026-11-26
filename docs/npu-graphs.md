@@ -432,7 +432,16 @@ On v79 the 1080p graphs plan less traffic (spill/fill about 21.1–21.2 MB). The
   native v75 build (`soc_model 57`, `dsp_arch v75` in `htp.json`) of `nf4_k1h`, `nf4_k1h_400` and `nf4_k1h_324` gets the
   same compiler plan as v73 (same spill/fill bytes), the same output hashes and the same NPU time on the device
   (`fsr4npu-check` NPU execute p50, v73 / v75: 4.64 / 4.65 ms, 2.25 / 2.24 ms, 2.42 / 2.37 ms), so no v75 graph set is shipped.
-- **Other chips:** our notes cover only v73 (SM8550), v75 (SM8650) and v79 (SM8750). For another Hexagon generation you would change
+- **HTP v81 (Snapdragon 8 Elite Gen 5, SM8850 / Canoe):** same model library as v73/v79, with `soc_model 87`,
+  `dsp_arch v81` in `htp.json` (section 3.3), and the QAIRT 2.47.0.260601 HTP v81 runtime (`libQnnHtpV81Stub.so`,
+  `libQnnHtpV81Skel.so`, `libQairtHtpV81Skel.so`, `libQnnHtpV81.so`). On a real SM8850 device (`2612CRPFFC`, `CANOEP`,
+  `soc_id 661`, Android 17 / QAIRT 2.47.0.260601 unsigned PD), both `nf4_k1h` and `nf4up_k1h` E-BS `v81` graphs match
+  the simulator and v73 output bit for bit (`8a735e657feee21f` and `60a3d9ad466fca76`, `8,294,400 / 8,294,400` bytes,
+  0 diff bytes; `fsr4npu`-style `QnnGraph_execute` p50 `3.44–3.59 ms` at `turbo`, spill/fill `20.8 MB` and `12.5 MB`,
+  3,439 consecutive in-game dispatches with 0 errors). On armadaOS, `vela-npu-setup.service` checks
+  `/proc/device-tree/compatible` for `qcom,sm8850` / `qcom,canoe` / `qcom,canoep` and links `/run/vela-npu/graphs` to
+  `/usr/lib64/vela-npu/v81`. **[unknown: full 17-graph Linux Docker build and armadaOS sysext run not yet tested]**
+- **Other chips:** our notes cover v73 (SM8550), v75 (SM8650), v79 (SM8750) and v81 (SM8850). For another Hexagon generation you would change
   `soc_model`/`dsp_arch`, check the result on the simulator, and add that chip's runtime libraries. **[unknown: never
   built or tested by us]**
 
@@ -469,6 +478,10 @@ All graphs share one cDSP session in one process.
 | usr/lib/rfsa/adsp/libQnnHtpV75Skel.so | lib/hexagon-v75/unsigned/libQnnHtpV75Skel.so | 607be3d7ec64df053f019438ad6eea59dd3eea5d5f985001709d52d5663479ba |
 | usr/lib/rfsa/adsp/libQairtHtpV75Skel.so | lib/hexagon-v75/unsigned/libQairtHtpV75Skel.so | 1229177eb5bc53220ddb5c77bb25e4025209e4c8ea0a46712aedd92e4f4e705e |
 | usr/lib/rfsa/adsp/libQnnHtpV75.so | lib/hexagon-v75/unsigned/libQnnHtpV75.so | 14efadf5fdbac6116767d797394cb60454d252748895b284e24d2540b0560449 |
+| usr/lib64/vela-npu/libQnnHtpV81Stub.so | lib/aarch64-oe-linux-gcc11.2/libQnnHtpV81Stub.so | 8e8f8301ec2afaac62b9c607ac35cd92a62a82abf0c23aa3ccd519419ec60d7a |
+| usr/lib/rfsa/adsp/libQnnHtpV81Skel.so | lib/hexagon-v81/unsigned/libQnnHtpV81Skel.so | 0b4fa7419e7265ae33d5e57f214d49cd11abbf7302149bb7ff78d9b602903899 |
+| usr/lib/rfsa/adsp/libQairtHtpV81Skel.so | lib/hexagon-v81/unsigned/libQairtHtpV81Skel.so | 279a84ce80f1b9c3680f7f027b173978307ab2a54dc5f225735491829bd28a60 |
+| usr/lib/rfsa/adsp/libQnnHtpV81.so | lib/hexagon-v81/unsigned/libQnnHtpV81.so | 0262f2b7309fdf358dcb2b823efe549c0cb68db1b88579011a12f5d7c4b779b9 |
 
 The image also carries quic/fastrpc built from source (commit `a56e9d4`): `cdsprpcd`, `libcdsprpc.so.1.0.0` and
 `libcdsp_default_listener.so.1.0.0`. The service uses `LD_LIBRARY_PATH=/usr/lib64/vela-npu` and

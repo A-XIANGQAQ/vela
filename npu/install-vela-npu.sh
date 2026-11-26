@@ -1,6 +1,6 @@
 #!/bin/sh
 # Vela NPU system part, package 18: lets Vela run FSR 4 / FSR 4 Fast on the Hexagon NPU (Snapdragon 8 Gen 2, SM8550;
-# Snapdragon 8 Gen 3, SM8650; Snapdragon 8 Elite, SM8750, experimental).
+# Snapdragon 8 Gen 3, SM8650; Snapdragon 8 Elite, SM8750, experimental; Snapdragon 8 Elite Gen 5, SM8850).
 # Needs sudo ONCE (it adds a system extension, a udev rule and system services). Run in Desktop mode -> Konsole, game closed:
 #   curl -fsSL https://github.com/zrprod9-cmyk/vela/releases/latest/download/install-vela-npu.sh | sudo sh
 # What it does:
@@ -101,12 +101,14 @@ if [ -n "$DT" ]; then
   if echo "$compat" | grep -qx "qcom,sm8550"; then CHIP=SM8550
   elif echo "$compat" | grep -qx "qcom,sm8650"; then CHIP=SM8650
   elif echo "$compat" | grep -qx "qcom,sm8750"; then CHIP=SM8750
-  else fail "the NPU graphs are built for Snapdragon 8 Gen 2 (SM8550), 8 Gen 3 (SM8650) and 8 Elite (SM8750) only; on this chip Vela runs FSR 4 on the GPU"; fi
+  elif echo "$compat" | grep -qx "qcom,sm8850" || echo "$compat" | grep -qx "qcom,canoe" || echo "$compat" | grep -qx "qcom,canoep"; then CHIP=SM8850
+  else fail "the NPU graphs are built for Snapdragon 8 Gen 2 (SM8550), 8 Gen 3 (SM8650), 8 Elite (SM8750) and 8 Elite Gen 5 (SM8850) only; on this chip Vela runs FSR 4 on the GPU"; fi
 fi
 case $CHIP in
   SM8550) say "  chip: SM8550 (Snapdragon 8 Gen 2), HTP v73 graphs";;
   SM8650) say "  chip: SM8650 (Snapdragon 8 Gen 3), HTP v73 graphs on the HTP v75 runtime (same output hashes as SM8550)";;
   SM8750) say "  chip: Snapdragon 8 Elite (SM8750): experimental. HTP v79 graphs (/usr/lib64/vela-npu/v79)"; WANT=$WANT_SM8750;;
+  SM8850) say "  chip: SM8850 (Snapdragon 8 Elite Gen 5), HTP v81 graphs (/usr/lib64/vela-npu/v81)";;
 esac
 if [ "${VERSION_ID:-}" != 44 ] && [ $FORCE = 0 ]; then
   fail "the image is made for armadaOS VERSION_ID=44, this system has ${VERSION_ID:-?} (systemd-sysext would not load it). --force tries anyway"

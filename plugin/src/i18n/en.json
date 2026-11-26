@@ -63,6 +63,7 @@
   "hint.npu_unknown": "The NPU service is not answering and Vela cannot read its state — restart the console. If that does not help, install «Vela NPU» again: {cmd}",
   "hint.game_res": "The game outputs {got} — set {res} in its settings",
   "hint.chip_v79": "Snapdragon 8 Elite: FSR 4 on the GPU only (no NPU graphs for v79), FSR 4 Fast is not available",
+  "hint.chip_v81": "Snapdragon 8 Elite Gen 5: FSR 4 on the GPU only (no NPU graphs for v81), FSR 4 Fast is not available",
   "hint.chip_other": "Chip {chip}: FSR 4 needs the Snapdragon 8 Gen 2 or newer NPU; use FSR 3, DittoSR or SGSR 2",
   "hint.chip_unknown": "unknown chip",
   "st.off": "Off",

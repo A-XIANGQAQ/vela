@@ -15,22 +15,25 @@ Policy:
 - SM8750 (Adreno 830, Hexagon v79): the NPU only when a v79 graph set is on the system or in the plugin
   (V79_DIRS: a "v79" folder with at least one *.bin); without it FSR 4 runs on the GPU, FSR 3, DittoSR and SGSR 2 stay, FSR 4 Fast
   (tuned on the A740 + v73 NPU) is not offered, and the panel says so.
+- SM8850 (Adreno 840, Hexagon v81): as SM8750 with a v81 graph set (V81_DIRS: a "v81" folder with at least one *.bin).
 - any other chip (e.g. the SM8250 / Adreno 650 of the Retroid Pocket 5 has no HTP, and FSR 4 on its
   GPU alone is an estimated 50-80 ms per frame = unplayable): no NPU, no FSR 4, no FSR 4 Fast; FSR 3, DittoSR and SGSR 2 stay.
 """
 import glob
 import os
 
-SM8550, SM8650, SM8750 = "SM8550", "SM8650", "SM8750"
+SM8550, SM8650, SM8750, SM8850 = "SM8550", "SM8650", "SM8750", "SM8850"
 NO_FSR4 = "FSR 4 needs the Snapdragon 8 Gen 2 or newer NPU; use FSR 3, DittoSR or SGSR 2"  # = en.json model.why.chip_no_fsr4
-SOC_IDS = {519: SM8550, 603: SM8550, 557: SM8650, 577: SM8650, 618: SM8750}  # QCS8550 = the SM8550 die (IoT part number), same GPU and cDSP; 577 = SM8650P
-COMPATIBLE = {"qcom,sm8550": SM8550, "qcom,qcs8550": SM8550, "qcom,sm8650": SM8650, "qcom,sm8750": SM8750}
+SOC_IDS = {519: SM8550, 603: SM8550, 557: SM8650, 577: SM8650, 618: SM8750, 660: SM8850, 661: SM8850}  # QCS8550 = SM8550 die; 577 = SM8650P; 660 = SM8850, 661 = CANOEP
+COMPATIBLE = {"qcom,sm8550": SM8550, "qcom,qcs8550": SM8550, "qcom,sm8650": SM8650, "qcom,sm8750": SM8750,
+              "qcom,sm8850": SM8850, "qcom,canoe": SM8850, "qcom,canoep": SM8850}
 GPUS = {"43050a01": "Adreno 740", "43051401": "Adreno 750", "44050000": "Adreno 830", "44050001": "Adreno 830",
-        "650.2": "Adreno 650"}  # SM8250 (Linux arch/arm64/boot/dts/qcom/sm8250.dtsi "qcom,adreno-650.2")
-NPU_ARCH = {SM8550: "v73", SM8650: "v75", SM8750: "v79"}
-GPU_OF = {SM8550: "Adreno 740", SM8650: "Adreno 750", SM8750: "Adreno 830"}
-# where a Hexagon v79 graph set may live: the system component's graph dir, or the plugin's assets
+        "840.0": "Adreno 840", "650.2": "Adreno 650"}  # SM8250 (sm8250.dtsi "qcom,adreno-650.2"), SM8850 ("qcom,adreno-840.0")
+NPU_ARCH = {SM8550: "v73", SM8650: "v75", SM8750: "v79", SM8850: "v81"}
+GPU_OF = {SM8550: "Adreno 740", SM8650: "Adreno 750", SM8750: "Adreno 830", SM8850: "Adreno 840"}
+# where a Hexagon v79 / v81 graph set may live: the system component's graph dir, or the plugin's assets
 V79_DIRS = ("/usr/lib64/vela-npu/v79",)
+V81_DIRS = ("/usr/lib64/vela-npu/v81",)
 
 
 def _read(path, binary=False):
@@ -43,7 +46,7 @@ def _read(path, binary=False):
 
 
 def detect(root="/"):
-    """{"soc": "SM8550" | "SM8650" | "SM8750" | None, "soc_id", "machine", "gpu", "gpu_chip", "npu_arch", "compatible"}"""
+    """{"soc": "SM8550" | "SM8650" | "SM8750" | "SM8850" | None, "soc_id", "machine", "gpu", "gpu_chip", "npu_arch", "compatible"}"""
     j = lambda *p: os.path.join(root, *p)
     raw = _read(j("proc", "device-tree", "compatible"), binary=True) or b""
     compat = [c for c in raw.decode("utf-8", "replace").split("\0") if c]
@@ -76,7 +79,7 @@ def v79_graphs(dirs):
     return None
 
 
-def policy(dev, v79_dirs=V79_DIRS):
+def policy(dev, v79_dirs=V79_DIRS, v81_dirs=V81_DIRS):
     """What this chip may run. npu: the NPU path may be offered at all (the service checks still apply on top);
     fsr4: FSR 4 is offered at all (not on chips without a supported NPU); fsr4fast: FSR 4 Fast is offered; unavailable: English lines (logged, in game_state["device"]); note: one line, or None."""
     soc = dev.get("soc")
@@ -94,17 +97,25 @@ def policy(dev, v79_dirs=V79_DIRS):
               "FSR 4 Fast: tuned for the Adreno 740 and the v73 NPU"]
         return {"npu": False, "npu_graphs": None, "fsr4": True, "fsr4fast": False, "unavailable": un,
                 "note": "Snapdragon 8 Elite: FSR 4 on the GPU only (no NPU graphs for v79), FSR 4 Fast is not available"}
+    if soc == SM8850:
+        d = v79_graphs(v81_dirs)
+        if d:
+            return {"npu": True, "npu_graphs": "v81", "graph_dir": d, "fsr4": True, "fsr4fast": True, "unavailable": [], "note": None}
+        un = ["NPU: no FSR 4 graphs for the Snapdragon 8 Elite Gen 5 (Hexagon v81)",
+              "FSR 4 Fast: tuned for the Adreno 740 and the v73 NPU"]
+        return {"npu": False, "npu_graphs": None, "fsr4": True, "fsr4fast": False, "unavailable": un,
+                "note": "Snapdragon 8 Elite Gen 5: FSR 4 on the GPU only (no NPU graphs for v81), FSR 4 Fast is not available"}
     name = dev.get("machine") or dev.get("gpu") or "unknown chip"
     return {"npu": False, "npu_graphs": None, "fsr4": False, "fsr4fast": False,
             "unavailable": [f"NPU: chip {name} is not supported", f"FSR 4 and FSR 4 Fast: {NO_FSR4}"],
             "note": f"Chip {name}: {NO_FSR4}"}
 
 
-def refresh(owner, v79_dirs=V79_DIRS, log=None):
+def refresh(owner, v79_dirs=V79_DIRS, v81_dirs=V81_DIRS, log=None):
     """0.8.21: the NPU part can be installed or removed while the plugin runs. Without this the policy of the plugin's
-    start stayed: on SM8750 the NPU and FSR 4 Fast stayed off until a reboot. owner has .dev, .chip and .npu.
+    start stayed: on SM8750 / SM8850 the NPU and FSR 4 Fast stayed off until a reboot. owner has .dev, .chip and .npu.
     True when the policy changed."""
-    pol = policy(owner.dev, v79_dirs)
+    pol = policy(owner.dev, v79_dirs, v81_dirs)
     if pol == owner.chip:
         return False
     owner.chip = pol
