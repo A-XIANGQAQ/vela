@@ -47,7 +47,7 @@ for dev, name in ((d5, "SM8250"), (device.detect(os.path.join(tmp, "none")), "un
 for soc in ("SM8550", "SM8750", "SM8850"):
     p = device.policy({"soc": soc}, (), ())
     assert p["fsr4"] and device.state({"soc": soc}, p)["fsr4"], (soc, p)
-assert device.policy({"soc": "SM8550"}, ())["fsr4fast"] and not device.policy({"soc": "SM8750"}, ())["fsr4fast"] and not device.policy({"soc": "SM8850"}, (), ())["fsr4fast"]
+assert device.policy({"soc": "SM8550"}, ())["fsr4fast"] and not device.policy({"soc": "SM8750"}, ())["fsr4fast"] and device.policy({"soc": "SM8850"}, (), ())["fsr4fast"]
 
 # the plugin (fake decky module, no __init__ run)
 dk = types.ModuleType("decky")

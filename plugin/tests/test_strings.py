@@ -42,7 +42,7 @@ for fam, ids in {"model.note": ["fsr4", "fsr4fast", "fsr3", "dittosr", "sgsr2", 
                  "fb.why": list(sgsr3.FSR4_WHY),  # PANELWHY: every reason id the log summary gives has a text
                  "reason": ["anticheat", "not_installed", "non_steam", "opengl", "vulkan_native", "no_inputs", "no_exe", "godot", "start_once", "launcher", "x86"],
                  "hint": ["restart_window", "dx12_choice", "npu_missing_layer", "npu_install", "npu_update_up", "npu_update_sizes", "npu_qnn",
-                          "npu_service", "npu_failed", "npu_unknown", "game_res", "chip_v79", "chip_v81", "chip_other", "chip_unknown"]}.items():
+                          "npu_service", "npu_failed", "npu_unknown", "game_res", "chip_v79", "chip_other", "chip_unknown"]}.items():
     for i in ids:
         assert f"{fam}.{i}" in en, f"{fam}.{i}"
 # every hint id the backend can send has a text
@@ -52,7 +52,7 @@ for i in re.findall(r'\{"id": "(\w+)"', read(ROOT, "py_modules", "presets.py")):
 # PL2 (owner rule): the word "speed" is never shown; the ids speed.* stay (index.tsx builds them from the game's kind)
 assert not [k for k, v in en.items() if "speed" in v.lower()], [k for k, v in en.items() if "speed" in v.lower()]
 assert en["rp.button"] == "Report a problem" and en["off_title"] == "Off" and en["hint.chip_unknown"] == "unknown chip"
-assert len(en) == 170, len(en)  # SM8850: +hint.chip_v81  # VK allow-list: +vk.dlss  # ANF: +model.note.anf  # 0.8.26 (GitHub #3): +reason.start_once, reason.launcher, reason.x86, learned.folder, learned.confirm, learned.launcherOpen  # DITTO: +model.note.dittosr, st.dittosrFailedSub, rp.why.dittosr_fallback  # DX11FSR: -dx11.only  # PANELWHY: +st.fellBack, st.lastFellBack, fb.why.* (6), st.neverAsked, st.neverAskedSub, dx11.only, dx11.dx12Entry  # NOFG (2026-11-15): -33 (fg.* 18, fgo.* 3, any.* 10, model.note.offFg, model.note.fsr4any)  # NORIFE (2026-11-11): -fg.rife  # V03 (owner 2026-11-10): +st.notConnected, st.launchWrapped  # PL15: +fg.loopOff, fg.initFail  # PL13: +fg.genFail, fg.noLayer  # PL11: +fg.idleScreen, fg.idleTime, fg.slow, fg.slowWhy  # PL10: +fg.npu16  # PL9: +fgo.name, fgo.restart, fgo.size, model.note.offFg, fg.naFsr  # UPX1: +any.safeOffWhy, any.restart, any.liveOff, rp.why.safe_off  # PLB5: +fg.npu15  # PL7: -fg.x2 +fg.amd, fg.rife, fg.na, fg.restart  # PL6: +fg.head, fg.off, fg.x2, fg.note, fg.fps  # PL5: +pic.balanced, pic.balanced.note, pic.restart, sharp.label, sharp.off, sharp.note  # PL3: -any.window +any.setup +any.full +t.sectionPicture +pic.* (6)  # PL2: any.stretch, any.stretchWhy  # 0.8.22: model.note.fsr4any, any.window, any.pack, any.safeOff, any.npuSize  # 0.8.21: hint.npu_update_sizes, reason.non_steam, hint.npu_unknown; 0.8.20: hint.dx11_run, hint.out_format, st.dx11; incl. model.why.chip_no_fsr4 and the 20 update texts (up.*)
+assert len(en) == 169, len(en)  # VK allow-list: +vk.dlss  # ANF: +model.note.anf  # 0.8.26 (GitHub #3): +reason.start_once, reason.launcher, reason.x86, learned.folder, learned.confirm, learned.launcherOpen  # DITTO: +model.note.dittosr, st.dittosrFailedSub, rp.why.dittosr_fallback  # DX11FSR: -dx11.only  # PANELWHY: +st.fellBack, st.lastFellBack, fb.why.* (6), st.neverAsked, st.neverAskedSub, dx11.only, dx11.dx12Entry  # NOFG (2026-11-15): -33 (fg.* 18, fgo.* 3, any.* 10, model.note.offFg, model.note.fsr4any)  # NORIFE (2026-11-11): -fg.rife  # V03 (owner 2026-11-10): +st.notConnected, st.launchWrapped  # PL15: +fg.loopOff, fg.initFail  # PL13: +fg.genFail, fg.noLayer  # PL11: +fg.idleScreen, fg.idleTime, fg.slow, fg.slowWhy  # PL10: +fg.npu16  # PL9: +fgo.name, fgo.restart, fgo.size, model.note.offFg, fg.naFsr  # UPX1: +any.safeOffWhy, any.restart, any.liveOff, rp.why.safe_off  # PLB5: +fg.npu15  # PL7: -fg.x2 +fg.amd, fg.rife, fg.na, fg.restart  # PL6: +fg.head, fg.off, fg.x2, fg.note, fg.fps  # PL5: +pic.balanced, pic.balanced.note, pic.restart, sharp.label, sharp.off, sharp.note  # PL3: -any.window +any.setup +any.full +t.sectionPicture +pic.* (6)  # PL2: any.stretch, any.stretchWhy  # 0.8.22: model.note.fsr4any, any.window, any.pack, any.safeOff, any.npuSize  # 0.8.21: hint.npu_update_sizes, reason.non_steam, hint.npu_unknown; 0.8.20: hint.dx11_run, hint.out_format, st.dx11; incl. model.why.chip_no_fsr4 and the 20 update texts (up.*)
 # every reason py_modules/updater.py can give the panel has a text (network / github have their own wording)
 upd_src = read(ROOT, "py_modules", "updater.py")
 codes = set(re.findall(r'UpdateError\("(\w+)', upd_src)) | {"network", "github"}
@@ -69,11 +69,9 @@ for inputs, key, p in ((["FSR 2", "DLSS"], "menu.fsr_dlss", {"fsr": "FSR 2"}), (
 # ---- the chip note (sent as the hint id of chip_no_npu, logged, in game_state["device"]) = the panel's English text
 v79 = device.policy({"soc": "SM8750"}, ())
 assert v79["note"] == en["hint.chip_v79"], v79["note"]
-v81 = device.policy({"soc": "SM8850"}, (), ())
-assert v81["note"] == en["hint.chip_v81"], v81["note"]
 other = device.policy({"soc": "X", "machine": "Foo"}, ())
 assert other["note"] == en["hint.chip_other"].replace("{chip}", "Foo"), other["note"]
-for pol in (v79, v81, other, device.policy({}, ())):
+for pol in (v79, other, device.policy({}, ())):
     assert not any(CYR.search(s) for s in pol["unavailable"] + [pol["note"]]), pol
 
 # ---- no Cyrillic reaches the panel

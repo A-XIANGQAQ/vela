@@ -52,7 +52,7 @@ export function hintText(h: { id: string; code?: string; got?: string; res?: str
   const px = (s?: string) => (s ?? "").replace("x", "×");
   if (h.code === "chip_no_npu") {
     // 0.8.16: the id is the backend's sentence (an older panel prints it as it is); the words come from here
-    return h.soc === "SM8750" ? t("hint.chip_v79") : h.soc === "SM8850" ? t("hint.chip_v81") : t("hint.chip_other", { chip: h.chip || t("hint.chip_unknown") });
+    return h.soc === "SM8750" ? t("hint.chip_v79") : t("hint.chip_other", { chip: h.chip || t("hint.chip_unknown") });
   }
   if (h.id === "game_res") return t("hint.game_res", { got: px(h.got), res: px(h.res) });
   return tOr(`hint.${h.id}`, h.id, { cmd: NPU_INSTALL_CMD });
